@@ -92,6 +92,12 @@ AGENT_SCHEMA = SectionSchema(
     fields={
         # Direct fields on AgentConfig
         "name": FieldMapping("name", default=DEFAULT_HARBOR_AGENT_NAME),  # Maps to AgentConfig.name (Harbor AgentName)
+        # A dotted "module:Class" for an agent Harbor does not ship. Named agent_import_path because the flat harbor
+        # namespace already gives `import_path` to the ENVIRONMENT schema, and the launcher validates that one against
+        # its known environment classes. AgentConfig accepts name OR import_path, and
+        # Harbor has no mini-swe-agent implementation, so RL on the same agent an eval used can only be expressed this
+        # way. The module must be importable in the rollout process (PYTHONPATH via the recipe's extra_env).
+        "agent_import_path": FieldMapping("import_path"),
         # Agent-log push-back control (direct field on AgentConfig, read by Trial._upload_agent_logs).
         # DEFAULT True (preserves current behavior). Set false to SKIP the best-effort re-upload of
         # host-side agent logs BACK into the (non-mounted) sandbox after the agent phase — those pushed-back
@@ -105,6 +111,13 @@ AGENT_SCHEMA = SectionSchema(
         "max_timeout_sec": FieldMapping("max_timeout_sec"),
         # Kwargs fields (passed to agent.kwargs)
         "max_turns": FieldMapping("max_turns", field_type="kwargs", default=16),
+        # Kwargs of the MiniSweAgent used for every Grug eval. No defaults: absent means not forwarded, so the agent's
+        # own defaults apply and no config that omits them changes behaviour. They must be settable from a recipe or an
+        # RL run cannot reproduce the agent an eval measured.
+        "max_steps": FieldMapping("max_steps", field_type="kwargs"),
+        "max_format_errors": FieldMapping("max_format_errors", field_type="kwargs"),
+        "keep_reasoning_in_history": FieldMapping("keep_reasoning_in_history", field_type="kwargs"),
+        "command_timeout": FieldMapping("command_timeout", field_type="kwargs"),
         "enable_summarize": FieldMapping("enable_summarize", field_type="kwargs", default=True),
         "store_all_messages": FieldMapping("store_all_messages", field_type="kwargs", default=True),
         # Thinking/reasoning settings
@@ -515,7 +528,9 @@ class HarborConfigBuilder:
     # (so the schema validator doesn't flag them as "unknown"). PRM lives here
     # because it's consumed directly by _build_prm_turn_callback to construct
     # a turn_callback, not by the schema-based field-mapping pipeline.
-    SKYRL_EXTENSION_KEYS = frozenset({"prm"})
+    # SkyRL-only keys: read by dedicated accessors rather than mapped onto a Harbor field.
+    # litellm_provider selects the rollout's LiteLLM route (see get_litellm_provider).
+    SKYRL_EXTENSION_KEYS = frozenset({"prm", "litellm_provider"})
 
     def _validate_config(self) -> None:
         """Validate config and issue warnings for unknown/unsupported fields."""
@@ -848,6 +863,16 @@ class HarborConfigBuilder:
                 return int(value)
         return default
 
+    def get_litellm_provider(self, default: str = "hosted_vllm") -> str:
+        """The LiteLLM provider prefix for the rollout's model name.
+
+        The prefix selects the LiteLLM route, which decides how `tools` are sent and how tool calls and reasoning come
+        back. Agents built on native OpenAI tool calls need ``openai``; the historical default stays ``hosted_vllm`` so
+        no existing config changes behaviour.
+        """
+        value = self._harbor_cfg.get("litellm_provider")
+        return str(value) if value else default
+
     def get_collect_rollout_details(self, default: bool = False) -> bool:
         """
         Check if rollout details collection is enabled (for TIS in async training).
@@ -922,9 +947,7 @@ class HarborConfigBuilder:
         # kwargs win over the trainer values.
         if sampling_params:
             if sampling_params.get("temperature") is not None:
-                agent_kwargs.setdefault(
-                    "temperature", float(sampling_params["temperature"])
-                )
+                agent_kwargs.setdefault("temperature", float(sampling_params["temperature"]))
             if sampling_params.get("top_p") is not None:
                 call_kwargs = dict(agent_kwargs.get("llm_call_kwargs") or {})
                 call_kwargs.setdefault("top_p", float(sampling_params["top_p"]))

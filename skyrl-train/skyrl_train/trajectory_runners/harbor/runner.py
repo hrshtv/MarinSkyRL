@@ -1037,9 +1037,13 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         trial_configs: List[TrialConfig] = []
         trajectory_ids: List[TrajectoryID] = []
 
-        # Harbor expects hosted_vllm model names with exactly one '/'.
-        # Convert HuggingFace-style "org/model" to just "model" for the alias.
+        # Harbor expects a LiteLLM model name with exactly one '/', so a HuggingFace-style "org/model" becomes just
+        # "model" for the alias. The provider prefix decides which LiteLLM route serves the request, and that is not
+        # cosmetic: agents built around native OpenAI tool calls are written against `openai/`, and the
+        # MiniSweAgent every Grug eval used documents `openai/` as required and `hosted_vllm/` as wrong. Configurable
+        # via terminal_bench.harbor.litellm_provider, defaulting to the historical `hosted_vllm`.
         model_alias = self.model_name.split("/")[-1] if "/" in self.model_name else self.model_name
+        provider = self._harbor_config_builder.get_litellm_provider()
 
         for i in range(num_trials):
             prompt = input_batch["prompts"][i]
@@ -1051,7 +1055,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             trial_config = self._harbor_config_builder.build_trial_config(
                 task_path=prompt,
                 trials_dir=active_trials_dir,
-                model_name=f"hosted_vllm/{model_alias}",
+                model_name=f"{provider}/{model_alias}",
                 api_base=self._agent_api_base,
                 session_id=session_id,
                 timeout_override_sec=timeout_override,

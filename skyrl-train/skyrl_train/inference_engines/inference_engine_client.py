@@ -1141,7 +1141,11 @@ def _parse_partial_response_and_inplace_update_accum(
     choice = partial_response["choices"][0]
     finish_reason: str = choice["finish_reason"]
     stop_reason: Optional[str] = choice.get("stop_reason", None)
-    new_content: str = choice["message"]["content"]
+    # A tool-call-only completion has content=None per the OpenAI schema, and accumulating it raised
+    # TypeError on every request from an agent that uses native tool calls. Terminus-2 never hit this because it
+    # returns plain text and never sets tool_calls. tool_calls and reasoning_content are untouched here: the final
+    # response is the last base response and only content/logprobs/token_ids are overwritten.
+    new_content: str = choice["message"].get("content") or ""
 
     assert partial_response["usage"] is not None and partial_response["usage"]["completion_tokens"] is not None, (
         "partial_response['usage']['completion_tokens'] must be present"
