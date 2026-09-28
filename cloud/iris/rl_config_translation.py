@@ -499,8 +499,20 @@ def validate_engine_init_kwargs(
 # to set one value is how a Daytona run silently loses auto_snapshot.
 _BACKEND_HARBOR_INJECTIONS = {
     BackendKind.APPTAINER: (("environment_type", "kind"),),
-    BackendKind.DAYTONA: (("environment_type", "kind"), ("auto_snapshot", "auto_snapshot")),
+    BackendKind.DAYTONA: (
+        ("environment_type", "kind"),
+        ("auto_snapshot", "auto_snapshot"),
+        # An org at its snapshot quota cannot mint per-trial snapshots at all, so a recipe may instead name a snapshot
+        # that already exists and let each task's setup_files/setup.sh build itself inside it. Both must reach Hydra or
+        # harbor asks for a per-task snapshot it cannot create and every trial dies unscored.
+        ("snapshot_template_name", "snapshot_template_name"),
+        ("assume_global_snapshot", "assume_global_snapshot"),
+    ),
 }
+
+# Injections a recipe may leave unset. Everything else in _BACKEND_HARBOR_INJECTIONS is mandatory, because a missing
+# value there silently changes how sandboxes are created.
+_OPTIONAL_BACKEND_INJECTIONS = frozenset({"snapshot_template_name", "assume_global_snapshot"})
 
 # Harbor runtime settings that change results but have NO Hydra key. Two runs with
 # identical Hydra args and different values here are not comparable.
@@ -684,6 +696,8 @@ def _apply_backend_to_terminal_bench(
             )
         value = backend.kind.value if source_key == "kind" else backend.options.get(source_key)
         if value is None:
+            if source_key in _OPTIONAL_BACKEND_INJECTIONS:
+                continue
             raise ValueError(f"{config_path}: backend.{backend.kind.value}.{source_key} is required")
         injections[harbor_key] = value
 

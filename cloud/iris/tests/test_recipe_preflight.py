@@ -41,6 +41,8 @@ _KNOWN_HARBOR_FIELDS = frozenset(
         "name",
         "environment_type",
         "auto_snapshot",
+        "snapshot_template_name",
+        "assume_global_snapshot",
         "enable_summarize",
         "store_all_messages",
         "trajectory_config",
@@ -420,11 +422,33 @@ def test_a_shipped_daytona_recipe_passes_preflight():
     assert "backend daytona complete" in report.passed
 
 
-def test_daytona_without_auto_snapshot_is_rejected(tmp_path):
+def test_daytona_with_neither_snapshot_source_is_rejected(tmp_path):
     """Harbor falls back to per-sandbox declarative builds, which the eval org rejects."""
     path = _daytona_recipe(tmp_path, auto_snapshot=False)
 
-    with pytest.raises(RecipePreflightError, match="backend.daytona.auto_snapshot must be true"):
+    with pytest.raises(RecipePreflightError, match="either auto_snapshot true, or snapshot_template_name"):
+        _run(path)
+
+
+def test_daytona_may_reuse_an_existing_snapshot_instead_of_minting_one(tmp_path):
+    """The only workable configuration for an org at its snapshot quota."""
+    path = _daytona_recipe(
+        tmp_path, auto_snapshot=False, snapshot_template_name="harbor__abc123__snapshot", assume_global_snapshot=True
+    )
+
+    report = _run(path)
+
+    assert not report.failures, report.render()
+    parsed = parse_rl_config(str(path))
+    assert parsed.terminal_bench["harbor"]["snapshot_template_name"] == "harbor__abc123__snapshot"
+    assert parsed.terminal_bench["harbor"]["assume_global_snapshot"] is True
+
+
+def test_reusing_a_snapshot_without_assume_global_is_rejected(tmp_path):
+    """Harbor would still try to create the snapshot it was told to reuse."""
+    path = _daytona_recipe(tmp_path, auto_snapshot=False, snapshot_template_name="harbor__abc123__snapshot")
+
+    with pytest.raises(RecipePreflightError, match="assume_global_snapshot must be true"):
         _run(path)
 
 

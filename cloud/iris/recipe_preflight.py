@@ -332,10 +332,22 @@ def _check_backend(parsed: ParsedRLConfig, report: PreflightReport) -> None:
         )
 
     if backend.kind is BackendKind.DAYTONA:
+        # Two workable sandbox sources, and nothing in between. Either harbor mints a snapshot per task
+        # (auto_snapshot), or — when the org is at its snapshot quota and can mint nothing — every trial starts from a
+        # snapshot that already exists and each task's setup_files/setup.sh builds itself inside it. With neither,
+        # harbor falls through to a declarative build from the Dockerfile, which the org rejects, and the wave dies at
+        # start with every trial unscored.
         if harbor.get("auto_snapshot") is not True:
-            # Without it harbor builds each sandbox from the Dockerfile, which the
-            # eval org rejects, and the wave dies at start.
-            report.failures.append("backend.daytona.auto_snapshot must be true")
+            if not harbor.get("snapshot_template_name"):
+                report.failures.append(
+                    "backend.daytona needs either auto_snapshot true, or snapshot_template_name naming a snapshot "
+                    "that already exists (for an org at its snapshot quota)"
+                )
+            elif harbor.get("assume_global_snapshot") is not True:
+                report.failures.append(
+                    "backend.daytona.assume_global_snapshot must be true alongside snapshot_template_name, or harbor "
+                    "still tries to create the snapshot it was told to reuse"
+                )
         if not backend.options.get("api_key_file"):
             report.failures.append("backend.daytona.api_key_file is required (a path, never the key itself)")
         if backend.options.get("region"):
