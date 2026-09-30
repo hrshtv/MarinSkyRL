@@ -955,6 +955,28 @@ def test_unaligned_logprob_alert_survives_concatenation():
     assert merged["rollout_metrics"]["generate/tis/alignment_alert"] == 1.0
 
 
+def test_rerendered_turn_counts_survive_concatenation():
+    # Two coordinators with unequal turn counts: the merged fraction must come from the
+    # summed counts (7 of 40 turns), not from averaging the two fractions.
+    groups = [_generated_group(1, 0), _generated_group(1, 0)]
+    first, second = AlignmentStats(), AlignmentStats()
+    first.n_tokens = second.n_tokens = 10
+    for _ in range(30):
+        first.record_turn(10, rerendered=False)
+    for _ in range(7):
+        second.record_turn(10, rerendered=True)
+    for _ in range(3):
+        second.record_turn(10, rerendered=False)
+    groups[0]["rollout_metrics"].update(first.as_metrics(prefix="generate/tis/", lcs_alert_threshold=0.005))
+    groups[1]["rollout_metrics"].update(second.as_metrics(prefix="generate/tis/", lcs_alert_threshold=0.005))
+
+    merged = concatenate_trajectory_batches(groups, tis_lcs_alert_threshold=0.005)
+
+    assert merged["rollout_metrics"]["generate/tis/rerendered_turns"] == 7
+    assert merged["rollout_metrics"]["generate/tis/rerendered_turn_fraction"] == pytest.approx(7 / 40)
+    assert merged["rollout_metrics"]["generate/tis/rerendered_token_fraction"] == pytest.approx(70 / 400)
+
+
 def test_identity_aware_reward_metrics_survive_concatenation():
     groups = [_generated_group(2, 0), _generated_group(2, 0)]
     groups[0]["rollout_metrics"]["generate/reward_shaping/identity_aware/groups"] = 1

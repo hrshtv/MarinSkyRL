@@ -27,8 +27,11 @@ from skyrl_train.metric_names import (
     TIS_TITO_FULL_ATTEMPTS_METRIC,
     TIS_TITO_FULL_DECLINE_COUNT_METRIC,
     TIS_RERENDERED_TOKEN_FRACTION_METRIC,
+    TIS_RERENDERED_TOKENS_METRIC,
     TIS_RERENDERED_TURN_FRACTION_METRIC,
     TIS_RERENDERED_TURNS_METRIC,
+    TIS_SAMPLED_TOKENS_METRIC,
+    TIS_TURNS_METRIC,
     TIS_TITO_FULL_DECLINE_METRIC_PREFIX,
     TIS_TITO_FULL_SUCCESS_FRACTION_METRIC,
     TIS_UNALIGNED_FRACTION_METRIC,
@@ -233,7 +236,10 @@ class AlignmentStats:
         for reason in TitoFullDeclineReason:
             metrics[f"{tito_names['decline_prefix']}{reason.value}"] = float(self.tito_full_declines.get(reason, 0))
         rerendered_names = {
-            "turns": TIS_RERENDERED_TURNS_METRIC,
+            "turns": TIS_TURNS_METRIC,
+            "sampled_tokens": TIS_SAMPLED_TOKENS_METRIC,
+            "rerendered_turns": TIS_RERENDERED_TURNS_METRIC,
+            "rerendered_tokens": TIS_RERENDERED_TOKENS_METRIC,
             "turn_fraction": TIS_RERENDERED_TURN_FRACTION_METRIC,
             "token_fraction": TIS_RERENDERED_TOKEN_FRACTION_METRIC,
         }
@@ -241,7 +247,10 @@ class AlignmentStats:
             rerendered_names = {
                 name: value.replace(TIS_METRIC_PREFIX, prefix, 1) for name, value in rerendered_names.items()
             }
-        metrics[rerendered_names["turns"]] = float(self.n_rerendered_turns)
+        metrics[rerendered_names["turns"]] = float(self.n_turns)
+        metrics[rerendered_names["sampled_tokens"]] = float(self.n_sampled_tokens)
+        metrics[rerendered_names["rerendered_turns"]] = float(self.n_rerendered_turns)
+        metrics[rerendered_names["rerendered_tokens"]] = float(self.n_rerendered_tokens)
         metrics[rerendered_names["turn_fraction"]] = self.n_rerendered_turns / max(self.n_turns, 1)
         metrics[rerendered_names["token_fraction"]] = self.n_rerendered_tokens / max(self.n_sampled_tokens, 1)
         return metrics
@@ -1008,6 +1017,22 @@ def concatenate_trajectory_batches(
         sum_lcs_msgs += rm.get(TIS_LCS_FALLBACK_MESSAGES_METRIC, 0.0)
     if saw_tis:
         denom = max(total_aligned, 1.0)
+        counts = {
+            name: sum((output.get("rollout_metrics") or {}).get(name, 0.0) for output in trajectory_batches)
+            for name in (
+                TIS_TURNS_METRIC,
+                TIS_SAMPLED_TOKENS_METRIC,
+                TIS_RERENDERED_TURNS_METRIC,
+                TIS_RERENDERED_TOKENS_METRIC,
+            )
+        }
+        rollout_metrics.update(counts)
+        rollout_metrics[TIS_RERENDERED_TURN_FRACTION_METRIC] = counts[TIS_RERENDERED_TURNS_METRIC] / max(
+            counts[TIS_TURNS_METRIC], 1.0
+        )
+        rollout_metrics[TIS_RERENDERED_TOKEN_FRACTION_METRIC] = counts[TIS_RERENDERED_TOKENS_METRIC] / max(
+            counts[TIS_SAMPLED_TOKENS_METRIC], 1.0
+        )
         rollout_metrics[TIS_ALIGNED_TOKENS_METRIC] = total_aligned
         rollout_metrics[TIS_EXACT_MATCH_FRACTION_METRIC] = sum_exact / denom
         rollout_metrics[TIS_LCS_FALLBACK_FRACTION_METRIC] = sum_lcs / denom

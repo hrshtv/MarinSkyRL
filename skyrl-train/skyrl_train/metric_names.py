@@ -16,8 +16,12 @@ TIS_TITO_FULL_ATTEMPTS_METRIC = "generate/tis/tito_full/attempts"
 TIS_TITO_FULL_SUCCESS_FRACTION_METRIC = "generate/tis/tito_full/success_fraction"
 TIS_TITO_FULL_DECLINE_COUNT_METRIC = "generate/tis/tito_full/decline_count"
 TIS_TITO_FULL_DECLINE_METRIC_PREFIX = "generate/tis/tito_full/decline/"
-# Turns left out of the loss because the served context re-rendered them (ServedContext.RERENDERED).
+# Turns left out of the loss because the served context re-rendered them (ServedContext.RERENDERED). Counts are
+# summed when coordinator batches are merged; the fractions are recomputed from them.
+TIS_TURNS_METRIC = "generate/tis/turns"
+TIS_SAMPLED_TOKENS_METRIC = "generate/tis/sampled_tokens"
 TIS_RERENDERED_TURNS_METRIC = "generate/tis/rerendered_turns"
+TIS_RERENDERED_TOKENS_METRIC = "generate/tis/rerendered_tokens"
 TIS_RERENDERED_TURN_FRACTION_METRIC = "generate/tis/rerendered_turn_fraction"
 TIS_RERENDERED_TOKEN_FRACTION_METRIC = "generate/tis/rerendered_token_fraction"
 
