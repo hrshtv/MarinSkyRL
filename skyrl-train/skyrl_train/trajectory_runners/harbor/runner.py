@@ -81,6 +81,7 @@ from skyrl_train.trajectory_runners.trajectory_processing import (
     extract_routed_experts_from_rollout_details,
     extract_token_ids_from_rollout_details,
     get_batch_failure_metrics,
+    ServedContext,
     get_generation_prompt_ids,
     get_response_ids_and_loss_mask_from_messages,
     get_rollout_metrics,
@@ -176,6 +177,8 @@ _TASK_COMPLETE_PATTERNS = (
     re.compile(r"<task_complete>\s*true\s*</task_complete>", re.IGNORECASE),
     re.compile(r'["\']task_complete["\']\s*:\s*true', re.IGNORECASE),
     re.compile(r"mark_task_complete", re.IGNORECASE),
+    # mini-swe-agent's submit command, sent as a bash tool call.
+    re.compile(r"COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
 )
 
 
@@ -211,6 +214,8 @@ def detect_termination_signals(
             if isinstance(tool_calls, list):
                 tool_blob = " ".join(
                     str(tc.get("function_name") or (tc.get("function") or {}).get("name") or "")
+                    + " "
+                    + str((tc.get("function") or {}).get("arguments") or "")
                     for tc in tool_calls
                     if isinstance(tc, dict)
                 )
@@ -375,6 +380,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         tito_full: Optional[bool] = None,
         tis_splice: bool = True,
         context_distillation: Optional[ContextDistillationConfig] = None,
+        served_context: ServedContext = ServedContext.SAMPLED,
     ):
         """
         Args:
@@ -391,6 +397,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 selected objective does not already require behavior logprobs.
             context_distillation: ``trainer.algorithm.context_distillation`` — train on the
                 first user message with its guidance span removed. None means off.
+            served_context: ``trainer.algorithm.served_context`` — ``rerendered`` for an agent that
+                uses native tool calls, whose earlier turns reach later prompts through the chat template.
         """
         self.base_url = f"http://{trajectory_runner_cfg.http_endpoint_host}:{trajectory_runner_cfg.http_endpoint_port}"
         # Native controller-ingress for CLI-agent literal capture: when the runner stood up
@@ -445,6 +453,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         self._rollout_logprobs_required = rollout_logprobs_required
         self._tito_full = tito_full
         self._tis_splice = tis_splice
+        self._served_context = served_context
         self._tis_lcs_alert_threshold = tis_lcs_alert_threshold
         self._context_distillation = context_distillation or ContextDistillationConfig.disabled()
 
@@ -1923,6 +1932,28 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             )
         )
 
+    def _initial_prompt_ids(self, result: "TrialResult", messages: List[Dict[str, Any]]) -> List[int]:
+        """Token ids of the prompt the engine served before the first turn.
+
+        A re-rendered context was served with the agent's tool schema in the prompt, which the trainer does not
+        hold, so the ids come from the first turn's served prompt with its generation prompt removed. Without
+        served ids the trajectory is declined by full-token assembly and only the prompt's length is used.
+        """
+        if self._served_context is ServedContext.SAMPLED:
+            return self._tokenize_prompt(messages)
+        served = extract_prompt_token_ids_from_rollout_details(getattr(result.agent_result, "rollout_details", None))
+        if not served or not served[0]:
+            return self._tokenize_prompt(messages)
+        generation_prompt_ids = get_generation_prompt_ids(
+            self.tokenizer,
+            custom_chat_template=self.custom_chat_template_content,
+            chat_template_kwargs=self._chat_template_kwargs,
+        )
+        first_prompt = list(served[0])
+        if first_prompt[len(first_prompt) - len(generation_prompt_ids) :] != list(generation_prompt_ids):
+            return self._tokenize_prompt(messages)
+        return first_prompt[: len(first_prompt) - len(generation_prompt_ids)]
+
     def _training_context_prompt(
         self,
         rollout_prompt_ids: List[int],
@@ -2207,7 +2238,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         # Process successful trial
         # Prompt = system messages (if any) + first user message: the prompt the engine served
         # (rollout context). Its length sets the response budget below.
-        prompt_ids = self._tokenize_prompt(system_msgs + [conversation[0]])
+        prompt_ids = self._initial_prompt_ids(result, system_msgs + [conversation[0]])
         initial_prompt_length = len(prompt_ids)
         # Context distillation: the trainer's prompt is the first user message with its
         # guidance span removed; the served prompt rides along for the rollout-context forwards.
@@ -2278,6 +2309,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 rollout_logprobs_required=self._rollout_logprobs_required,
                 tito_full=self._tito_full,
                 tis_splice=self._tis_splice,
+                served_context=self._served_context,
             )
         else:
             response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
@@ -2292,6 +2324,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 rollout_logprobs_required=self._rollout_logprobs_required,
                 tito_full=self._tito_full,
                 tis_splice=self._tis_splice,
+                served_context=self._served_context,
             )
 
         # Prefer the agent's terminal reason when Harbor supplied one. The local

@@ -214,6 +214,9 @@ trainer:
     use_tis: false
     tito_full: null
     tis_splice: true
+    # How earlier assistant turns reach later prompts: `sampled` (the agent sends assistant text back verbatim,
+    # as terminus-2 does) or `rerendered` (native tool calls: the chat template writes the parsed message).
+    served_context: sampled
     tis_lcs_alert_threshold: 0.005
     # Context distillation (P²O, arXiv 2603.21877): rollouts carry a guidance suffix in the first
     # user message; training removes the span [start_marker, end_marker) before tokenizing the

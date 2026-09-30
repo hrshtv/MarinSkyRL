@@ -26,6 +26,9 @@ from skyrl_train.metric_names import (
     TIS_METRIC_PREFIX,
     TIS_TITO_FULL_ATTEMPTS_METRIC,
     TIS_TITO_FULL_DECLINE_COUNT_METRIC,
+    TIS_RERENDERED_TOKEN_FRACTION_METRIC,
+    TIS_RERENDERED_TURN_FRACTION_METRIC,
+    TIS_RERENDERED_TURNS_METRIC,
     TIS_TITO_FULL_DECLINE_METRIC_PREFIX,
     TIS_TITO_FULL_SUCCESS_FRACTION_METRIC,
     TIS_UNALIGNED_FRACTION_METRIC,
@@ -49,6 +52,23 @@ _NUM_TRIALS_METRIC = "generate/num_trials"
 _NUM_FAILED_INSTANCES_METRIC = "generate/num_failed_instances"
 _NUM_FAILED_TRAJECTORIES_METRIC = "generate/num_failed_trajectories"
 _NUM_MASKED_TRAJECTORIES_METRIC = "generate/num_masked_trajectories"
+
+
+class ServedContext(StrEnum):
+    """How an agent's earlier assistant turns reach the model in later prompts.
+
+    SAMPLED: as the tokens the model sampled. An agent that sends assistant text back verbatim (terminus-2) serves
+    ``prompt[t] == prompt[t-1] + completion[t-1] + observation``.
+
+    RERENDERED: as the chat template's rendering of the parsed message. With native tool calls the server parses each
+    completion into ``reasoning_content`` and ``tool_calls`` and the template writes those fields into the next prompt,
+    so a turn whose sampled whitespace, JSON spacing or think markers differ from the template's is served in a form
+    the model did not sample. Every prompt is still a prefix of the next one, so the final prompt is the exact context
+    of every turn; only the turns the template changed cannot be scored at their sampled tokens.
+    """
+
+    SAMPLED = "sampled"
+    RERENDERED = "rerendered"
 
 
 class TitoFullDeclineReason(StrEnum):
@@ -96,6 +116,10 @@ class AlignmentStats:
         n_tito_full_attempts: exact full-token assembly attempts
         n_tito_full_successes: exact full-token assembly successes
         tito_full_declines: failed full-token assembly attempts by invariant
+        n_turns:              assistant turns seen by full-token assembly
+        n_rerendered_turns:   turns left out of the loss because the served context re-rendered them
+        n_rerendered_tokens:  sampled tokens of those turns
+        n_sampled_tokens:     sampled tokens of every turn seen by full-token assembly
     """
 
     __slots__ = (
@@ -109,6 +133,10 @@ class AlignmentStats:
         "n_tito_full_attempts",
         "n_tito_full_successes",
         "tito_full_declines",
+        "n_turns",
+        "n_rerendered_turns",
+        "n_rerendered_tokens",
+        "n_sampled_tokens",
     )
 
     def __init__(self):
@@ -122,8 +150,16 @@ class AlignmentStats:
         self.n_tito_full_attempts = 0
         self.n_tito_full_successes = 0
         self.tito_full_declines: Dict[TitoFullDeclineReason, int] = defaultdict(int)
+        self.n_turns = 0
+        self.n_rerendered_turns = 0
+        self.n_rerendered_tokens = 0
+        self.n_sampled_tokens = 0
 
     def merge(self, other: "AlignmentStats") -> None:
+        self.n_turns += other.n_turns
+        self.n_rerendered_turns += other.n_rerendered_turns
+        self.n_rerendered_tokens += other.n_rerendered_tokens
+        self.n_sampled_tokens += other.n_sampled_tokens
         self.n_tokens += other.n_tokens
         self.n_exact += other.n_exact
         self.n_lcs += other.n_lcs
@@ -145,6 +181,14 @@ class AlignmentStats:
         """Record one exact full-token trajectory assembly."""
         self.n_tito_full_attempts += 1
         self.n_tito_full_successes += 1
+
+    def record_turn(self, num_sampled_tokens: int, *, rerendered: bool) -> None:
+        """Record one assistant turn of an assembled trajectory and whether the served context re-rendered it."""
+        self.n_turns += 1
+        self.n_sampled_tokens += num_sampled_tokens
+        if rerendered:
+            self.n_rerendered_turns += 1
+            self.n_rerendered_tokens += num_sampled_tokens
 
     def as_metrics(self, prefix: str = "tis/", *, lcs_alert_threshold: float) -> Dict[str, float]:
         n = max(self.n_tokens, 1)
@@ -188,6 +232,18 @@ class AlignmentStats:
         metrics[tito_names["decline_count"]] = float(sum(self.tito_full_declines.values()))
         for reason in TitoFullDeclineReason:
             metrics[f"{tito_names['decline_prefix']}{reason.value}"] = float(self.tito_full_declines.get(reason, 0))
+        rerendered_names = {
+            "turns": TIS_RERENDERED_TURNS_METRIC,
+            "turn_fraction": TIS_RERENDERED_TURN_FRACTION_METRIC,
+            "token_fraction": TIS_RERENDERED_TOKEN_FRACTION_METRIC,
+        }
+        if prefix != TIS_METRIC_PREFIX:
+            rerendered_names = {
+                name: value.replace(TIS_METRIC_PREFIX, prefix, 1) for name, value in rerendered_names.items()
+            }
+        metrics[rerendered_names["turns"]] = float(self.n_rerendered_turns)
+        metrics[rerendered_names["turn_fraction"]] = self.n_rerendered_turns / max(self.n_turns, 1)
+        metrics[rerendered_names["token_fraction"]] = self.n_rerendered_tokens / max(self.n_sampled_tokens, 1)
         return metrics
 
     def alignment_checkpoint(self) -> int:
@@ -1746,6 +1802,33 @@ def _normalize_candidate_logprobs(candidate_logprobs):
     return token_strings, floats
 
 
+def _masked_served_stream(
+    tokenizer,
+    generation_prompt_ids,
+    assistant_logprobs,
+    assistant_token_ids,
+    assistant_prompt_token_ids,
+    assistant_routed_experts,
+):
+    """The served stream with no position in the loss, for a trajectory whose assembly was declined.
+
+    A re-rendered context has no re-tokenized fallback: its messages carry tool calls, which the chat template
+    renders only together with the tool schema the server was given. The trajectory keeps its place in the batch
+    and its reward in the baseline, and contributes no gradient.
+    """
+    response_ids = [tokenizer.eos_token_id]
+    if assistant_prompt_token_ids and assistant_token_ids and assistant_prompt_token_ids[-1]:
+        served_full = list(assistant_prompt_token_ids[-1]) + list(assistant_token_ids[-1] or [])
+        first_prompt = assistant_prompt_token_ids[0] or []
+        initial_prompt_len = max(len(first_prompt) - len(generation_prompt_ids), 0)
+        response_ids = served_full[initial_prompt_len:] or response_ids
+    loss_mask = [0] * len(response_ids)
+    rollout_logprobs = None if assistant_logprobs is None else [0.0] * len(response_ids)
+    if assistant_routed_experts is None:
+        return response_ids, loss_mask, rollout_logprobs
+    return response_ids, loss_mask, rollout_logprobs, [[[SENTINEL_EXPERT_ID]] for _ in response_ids]
+
+
 def _assemble_response_ids_tito_full(
     messages,
     tokenizer,
@@ -1757,6 +1840,7 @@ def _assemble_response_ids_tito_full(
     alignment_stats,
     custom_chat_template,
     chat_template_kwargs,
+    served_context: ServedContext = ServedContext.SAMPLED,
 ):
     """Full-TITO assembly of ``response_ids``/``loss_mask``/logprobs/routed_experts.
 
@@ -1771,6 +1855,11 @@ def _assemble_response_ids_tito_full(
     length ``len(completion_token_ids[t])``. ``response_ids`` is that served stream minus the
     initial prompt (system+user0, no generation prompt), which by construction ends exactly at
     ``len(prompt_token_ids[0]) - len(generation_prompt_ids)``.
+
+    Under ``ServedContext.RERENDERED`` the invariant is ``prompt_token_ids[t]`` starting with
+    ``prompt_token_ids[t-1]``: the served stream is still the exact context of every turn, but a turn the
+    template re-rendered differently from its sample has no sampled tokens in that stream. Such a turn stays in
+    the context, is left out of the loss, and is counted in ``alignment_stats``.
 
     FAIL-LOUD, NEVER-GUESS: returns a typed decline reason whenever the streams are
     absent, short, or inconsistent. The caller can expose the failed invariant and
@@ -1795,7 +1884,9 @@ def _assemble_response_ids_tito_full(
             return TitoFullAssemblyResult(decline_reason=TitoFullDeclineReason.MALFORMED_TURN_STREAM)
     # Prefix invariant across turns.
     for t in range(1, n_turns):
-        prev = list(assistant_prompt_token_ids[t - 1]) + list(assistant_token_ids[t - 1])
+        prev = list(assistant_prompt_token_ids[t - 1])
+        if served_context is ServedContext.SAMPLED:
+            prev += list(assistant_token_ids[t - 1])
         cur = list(assistant_prompt_token_ids[t])
         if cur[: len(prev)] != prev:
             return TitoFullAssemblyResult(decline_reason=TitoFullDeclineReason.PREFIX_MISMATCH)
@@ -1810,11 +1901,14 @@ def _assemble_response_ids_tito_full(
         return TitoFullAssemblyResult(decline_reason=TitoFullDeclineReason.GENERATION_PROMPT_MISMATCH)
     served_full = list(assistant_prompt_token_ids[-1]) + list(assistant_token_ids[-1])
     # Every completion region must sit at its expected offset in the served stream.
+    rerendered_turns = set()
     for t in range(n_turns):
         off = len(assistant_prompt_token_ids[t])
         comp = list(assistant_token_ids[t])
         if served_full[off : off + len(comp)] != comp:
-            return TitoFullAssemblyResult(decline_reason=TitoFullDeclineReason.COMPLETION_REGION_MISMATCH)
+            if served_context is ServedContext.SAMPLED:
+                return TitoFullAssemblyResult(decline_reason=TitoFullDeclineReason.COMPLETION_REGION_MISMATCH)
+            rerendered_turns.add(t)
 
     response_ids = list(served_full[initial_prompt_len:])
     total_len = len(response_ids)
@@ -1834,6 +1928,9 @@ def _assemble_response_ids_tito_full(
     for t in range(n_turns):
         start = len(assistant_prompt_token_ids[t]) - initial_prompt_len
         comp = list(assistant_token_ids[t])
+        alignment_stats.record_turn(len(comp), rerendered=t in rerendered_turns)
+        if t in rerendered_turns:
+            continue
         end = start + len(comp)
         region_tokens = response_ids[start:end]
         for i in range(start, end):
@@ -1885,13 +1982,17 @@ def _assemble_response_ids_tito_full(
     # stream has no next prompt to contain them, so recover them from a single re-tok of
     # the last assistant message and append (masked) — makes the clean case byte-identical
     # to the re-tok path while the body stays exact-from-served-ids.
-    last_msg = assistant_msgs[-1]
-    cur = encode_messages_subset([last_msg], tokenizer, custom_chat_template, chat_template_kwargs=chat_template_kwargs)
-    if tokenizer.eos_token_id in cur:
-        _le = len(cur) - 1 - cur[::-1].index(tokenizer.eos_token_id)
-        trailing = cur[_le + 1 :]
-    else:
-        trailing = []
+    # A re-rendered context has no re-tokenized path to stay byte-identical with, and its messages carry tool calls
+    # that the template renders only together with the tool schema.
+    trailing = []
+    if served_context is ServedContext.SAMPLED:
+        last_msg = assistant_msgs[-1]
+        cur = encode_messages_subset(
+            [last_msg], tokenizer, custom_chat_template, chat_template_kwargs=chat_template_kwargs
+        )
+        if tokenizer.eos_token_id in cur:
+            _le = len(cur) - 1 - cur[::-1].index(tokenizer.eos_token_id)
+            trailing = cur[_le + 1 :]
     if trailing:
         response_ids.extend(trailing)
         loss_mask.extend([0] * len(trailing))
@@ -1924,6 +2025,7 @@ def get_response_ids_and_loss_mask_from_messages(
     rollout_logprobs_required: bool = False,
     tito_full: Optional[bool] = None,
     tis_splice: bool = True,
+    served_context: ServedContext = ServedContext.SAMPLED,
 ):
     """
     Get the response ids and loss mask from a list of messages.
@@ -1994,6 +2096,13 @@ def get_response_ids_and_loss_mask_from_messages(
     # shape-compatible diagnostic sequence; behavior-referenced training masks it.
     # Default OFF means this block is skipped entirely.
     tito_decline_reason = None
+    if served_context is ServedContext.RERENDERED and not _tito_full_enabled(
+        rollout_logprobs_required=rollout_logprobs_required, tito_full=tito_full
+    ):
+        raise ValueError(
+            "served_context=rerendered assembles trajectories from the served token streams; "
+            "set trainer.algorithm.tito_full=true or select an objective that consumes behavior logprobs"
+        )
     if _tito_full_enabled(rollout_logprobs_required=rollout_logprobs_required, tito_full=tito_full):
         alignment_checkpoint = alignment_stats.alignment_checkpoint()
         tito_result = _assemble_response_ids_tito_full(
@@ -2007,6 +2116,7 @@ def get_response_ids_and_loss_mask_from_messages(
             alignment_stats,
             custom_chat_template,
             chat_template_kwargs,
+            served_context=served_context,
         )
         tito_decline_reason = tito_result.decline_reason
         if tito_decline_reason is None:
@@ -2030,6 +2140,19 @@ def get_response_ids_and_loss_mask_from_messages(
             )
         else:
             alignment_stats.record_tito_full_decline(tito_decline_reason)
+            if served_context is ServedContext.RERENDERED:
+                logger.warning(
+                    "Full TITO prompt-id assembly declined ({}); the trajectory is left out of the loss.",
+                    tito_decline_reason.value,
+                )
+                return _masked_served_stream(
+                    tokenizer,
+                    generation_prompt_ids,
+                    assistant_logprobs,
+                    assistant_token_ids,
+                    assistant_prompt_token_ids,
+                    assistant_routed_experts,
+                )
             logger.warning(
                 "Full TITO prompt-id assembly declined ({}); building a masked re-tokenized fallback for diagnostics.",
                 tito_decline_reason.value,

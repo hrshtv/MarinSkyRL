@@ -964,6 +964,15 @@ class HarborConfigBuilder:
         # Get agent name from harbor config (defaults to "terminus-2")
         # This is the Harbor AgentName value directly (e.g., "terminus-2", "oracle")
         agent_name = agent_direct_fields.pop("name", DEFAULT_HARBOR_AGENT_NAME)
+        # Harbor resolves a known agent name before it looks at import_path, so an agent loaded by import path
+        # must reach it without a name: with the default name left in, terminus-2 runs and import_path is ignored.
+        if agent_direct_fields.get("import_path"):
+            if agent_name != DEFAULT_HARBOR_AGENT_NAME:
+                raise ValueError(
+                    f"harbor config sets both name={agent_name!r} and "
+                    f"agent_import_path={agent_direct_fields['import_path']!r}; set one"
+                )
+            agent_name = None
 
         # Apply timeout override if provided (e.g., for eval runs)
         if timeout_override_sec is not None:

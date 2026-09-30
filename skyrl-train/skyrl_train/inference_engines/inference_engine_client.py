@@ -579,6 +579,14 @@ class InferenceEngineClient(InferenceEngineInterface):
             if aborted_without_generating:
                 continue
 
+            # A request with tools cannot be continued: the server parses the completion into reasoning and tool
+            # calls, and continue_final_message resumes from message content alone, so the resumed turn would drop
+            # its reasoning and return token ids that no longer match its message. Sample the turn again.
+            if finish_reason == ABORT_FINISH_REASON and original_request_json.get("tools"):
+                accum = AccumulatedResponse()
+                response_role = None
+                continue
+
             # At this point, either some tokens were generated and/or request completed with a non-"abort" finish_reason
 
             # 1.5. Update base response if it is the first non-empty response
