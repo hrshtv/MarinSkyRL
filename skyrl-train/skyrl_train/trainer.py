@@ -1695,15 +1695,25 @@ class RayPPOTrainer:
         """Concatenate one batch of admitted groups and convert it to a training batch."""
         batch_size = self.context.config.batch_size
         max_staleness_steps = self.context.config.max_staleness_steps
+        refresh_period = int(getattr(self.cfg, "generator", {}).get("sampler_refresh_period", 1))
         assert len(groups) == batch_size, f"Expected {batch_size} groups, got {len(groups)}"
         with Timer("assemble_generation_group_mini_batch", self.all_timings):
             uids = [group.uid for group in groups for _ in group.trajectory_batch["response_ids"]]
             stalenesses = [self.global_step - group.policy_step for group in groups]
             staleness_by_uid = {group.uid: staleness for group, staleness in zip(groups, stalenesses, strict=True)}
             record_rollout_staleness(stalenesses, self.global_step)
-            assert max(stalenesses) <= max_staleness_steps, (
-                f"batch assembly returned staleness {max(stalenesses)} above max {max_staleness_steps}"
-            )
+            if refresh_period > 1:
+                # Buffer delay stays zero; policy age follows the declared refresh cycle.
+                expected_policy_step = 1 + ((self.global_step - 1) // refresh_period) * refresh_period
+                assert all(group.policy_step == expected_policy_step for group in groups), (
+                    f"frozen sampler batch must use policy step {expected_policy_step}, "
+                    f"got {[group.policy_step for group in groups]}"
+                )
+                assert max_staleness_steps == 0
+            else:
+                assert max(stalenesses) <= max_staleness_steps, (
+                    f"batch assembly returned staleness {max(stalenesses)} above max {max_staleness_steps}"
+                )
 
             trajectory_batch = concatenate_trajectory_batches(
                 [group.trajectory_batch for group in groups],

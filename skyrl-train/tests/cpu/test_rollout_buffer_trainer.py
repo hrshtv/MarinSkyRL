@@ -159,6 +159,30 @@ async def test_periodic_refresh_changes_actual_serving_weights_only_at_the_decla
             assert trainer._sampler_refresh_step == 0
 
 
+@pytest.mark.parametrize("step,policy_step", [(1, 1), (2, 1), (3, 1), (4, 4), (5, 4), (6, 4)])
+def test_frozen_sampler_batch_conversion_accepts_only_the_current_refresh_cycle(step, policy_step):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.context = SimpleNamespace(config=SimpleNamespace(batch_size=1, max_staleness_steps=0))
+    trainer.cfg = get_default_config()
+    trainer.cfg.generator.sampler_refresh_period = 3
+    trainer.cfg.trainer.algorithm.off_policy_correction = "none"
+    trainer.global_step = step
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer.tokenizer = SimpleNamespace(decode=str)
+    trainer.postprocess_trajectory_batch = lambda batch, uids: batch
+    trainer.select_trajectories = lambda batch, uids: (batch, uids)
+    trainer.convert_to_training_input = lambda batch, uids, *, rollout_staleness: rollout_staleness
+
+    assert trainer.convert_rollout_groups_to_training_input([_group("valid", policy_step)]) == [
+        step - policy_step,
+        step - policy_step,
+    ]
+    for wrong_step in [policy_step - 1, policy_step + 1]:
+        with pytest.raises(AssertionError, match="frozen sampler batch must use policy step"):
+            trainer.convert_rollout_groups_to_training_input([_group("wrong", wrong_step)])
+
+
 def test_rollout_batch_conversion_reports_staleness_and_stage_timings(monkeypatch):
     trainer = object.__new__(RayPPOTrainer)
     trainer.context = SimpleNamespace(config=SimpleNamespace(batch_size=2, max_staleness_steps=2))
