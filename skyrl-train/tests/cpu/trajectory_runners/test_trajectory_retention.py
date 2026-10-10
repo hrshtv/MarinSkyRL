@@ -701,6 +701,19 @@ def test_sample_count_is_global_and_order_independent_across_async_completions(t
     assert retained_ids[0] == retained_ids[1]
 
 
+@pytest.mark.parametrize("phase,step,version", [("train", 7, 6), ("eval", 7, 7), ("eval", 0, 0)])
+def test_evaluation_provenance_names_the_completed_policy_update(phase, step, version):
+    record = build_trajectory_records(
+        _input(step=step, phase=phase),
+        _output(),
+        _config(Path("/unused"), phases=["train", "eval"]),
+        _Tokenizer(),
+        runner_name="TaskRolloutWorker",
+    )[0].to_json()
+    assert record["provenance"]["model_version_step"] == version
+    assert record["global_step"] == step
+
+
 def test_record_contains_replay_provenance_and_trainable_boundaries():
     record = build_trajectory_records(
         _input(),
