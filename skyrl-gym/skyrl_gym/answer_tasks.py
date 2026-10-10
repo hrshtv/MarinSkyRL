@@ -60,6 +60,7 @@ def grade_aime(turn: ModelTurn, config: dict, extras: dict) -> Transition:
         ground_truth=ground_truth(extras),
         evaluation_token_budget=int(config.get("evaluation_token_budget", 8192)),
         strict_box_verify=bool(config.get("strict_box_verify", False)),
+        allow_general_math_reference=bool(config.get("allow_general_math_reference", False)),
     )
     policy = AIMERewardPolicy(
         length_penalty_weight=float(config.get("length_penalty_weight", 0.0)),
