@@ -31,6 +31,35 @@ def test_same_initial_model_and_seed_give_same_delta_in_independent_sampler_repl
     torch.testing.assert_close(a, b, atol=0, rtol=0)
 
 
+def test_expert_noise_is_independent_and_follows_global_identity_across_sharding_and_slot_permutation():
+    prefix = "model.layers.0.mlp.experts.routed_experts"
+    name = prefix + ".w13_weight"
+    initial = torch.ones(4, 3, 5)
+    full = torch.nn.Parameter(initial.clone())
+    dense = torch.nn.Parameter(torch.ones(3, 5))
+    FixedSamplerNoise([(name, full), ("dense.weight", dense)], 0.05, 2, expert_maps={prefix: (0, 1, 2, 3)})
+    shards = [([0, 2], (0, -1, 1, -1)), ([3, 1], (-1, 1, -1, 0))]
+    for global_ids, mapping in shards:
+        expert = torch.nn.Parameter(initial[global_ids].clone())
+        replica = torch.nn.Parameter(torch.ones(3, 5))
+        FixedSamplerNoise([(name, expert), ("dense.weight", replica)], 0.05, 2, expert_maps={prefix: mapping})
+        torch.testing.assert_close(expert, full[global_ids], rtol=0, atol=0)
+        torch.testing.assert_close(replica, dense, rtol=0, atol=0)
+    assert not torch.equal(full[0], full[1])
+
+
+@pytest.mark.parametrize("mapping", [(0, 0, 1, -1), (0, -1, -1, -1)])
+def test_expert_noise_rejects_ambiguous_or_incomplete_placement(mapping):
+    prefix = "model.layers.0.mlp.experts.routed_experts"
+    with pytest.raises(ValueError, match="Expert map does not cover every local slot"):
+        FixedSamplerNoise(
+            [(prefix + ".w13_weight", torch.nn.Parameter(torch.ones(2, 3, 5)))],
+            0.05,
+            2,
+            expert_maps={prefix: mapping},
+        )
+
+
 @pytest.mark.parametrize("scale", [0.0, 0.05])
 def test_clean_current_evaluation_restores_frozen_bf16_sampler_and_its_original_base(scale):
     initial = torch.arange(1, 17, dtype=torch.bfloat16).reshape(4, 4)

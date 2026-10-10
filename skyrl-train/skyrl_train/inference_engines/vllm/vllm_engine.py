@@ -333,7 +333,13 @@ class WorkerWrap:
         if action == "initialize":
             if self._fixed_sampler_noise is not None:
                 raise RuntimeError("The initial sampler perturbation is already fixed")
-            self._fixed_sampler_noise = FixedSamplerNoise(self.model_runner.model.named_parameters(), scale, seed)
+            receiver = getattr(self, "_expert_block_receiver", None)
+            expert_maps = receiver.expert_maps if receiver is not None else None
+            if self.model_config.is_moe and not expert_maps:
+                raise ValueError("MoE sampler noise requires authoritative expert maps from expert-block sync")
+            self._fixed_sampler_noise = FixedSamplerNoise(
+                self.model_runner.model.named_parameters(), scale, seed, expert_maps=expert_maps
+            )
         else:
             if self._fixed_sampler_noise is None:
                 raise RuntimeError("Sampler perturbation has not been initialized")
