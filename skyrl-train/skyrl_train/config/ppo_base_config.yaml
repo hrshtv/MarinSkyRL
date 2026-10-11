@@ -367,6 +367,8 @@ generator:
   sampler_weight_noise_scale: 0.0
   sampler_weight_noise_seed: ${trainer.seed}
   sampler_refresh_period: 1
+  # Some task graders (including the released Countdown recipe) grade the full completion.
+  preserve_full_response_text: false
   model_name: ${trainer.policy.model.path}
   model_dtype: "bfloat16"
   timeout_multiplier: 1.0
