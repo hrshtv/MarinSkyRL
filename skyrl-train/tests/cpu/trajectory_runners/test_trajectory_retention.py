@@ -714,6 +714,19 @@ def test_evaluation_provenance_names_the_completed_policy_update(phase, step, ve
     assert record["global_step"] == step
 
 
+def test_stale_sampler_records_keep_learner_updates_distinct_from_generating_versions(tmp_path):
+    sink = _sink(_config(tmp_path, sample_count_per_step=0, sample_fraction=1.0))
+    for step in (194, 195):
+        request = _input(step=step)
+        request["batch_metadata"].generating_policy_step = 131
+        sink.retain(request, _output())
+    sink.close()
+    records = _records(tmp_path)
+    assert {record["global_step"] for record in records} == {194, 195}
+    assert {record["provenance"]["model_version_step"] for record in records} == {130}
+    assert len({record["record_id"] for record in records}) == 6
+
+
 def test_record_contains_replay_provenance_and_trainable_boundaries():
     record = build_trajectory_records(
         _input(),
