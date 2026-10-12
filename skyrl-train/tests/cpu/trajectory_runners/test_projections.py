@@ -122,7 +122,7 @@ def test_projection_rejects_missing_requested_logprobs_on_a_trainable_turn(proje
     record = replace(
         record, logprobs=None, steps=(replace(record.steps[0], turn=replace(record.steps[0].turn, logprobs=None)),)
     )
-    with pytest.raises(RolloutContractError):
+    with pytest.raises(RolloutContractError, match="missing requested behavior logprobs"):
         projection_type(config(), Tokenizer()).project([record], request())
 
 

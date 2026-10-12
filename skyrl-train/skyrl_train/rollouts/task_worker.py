@@ -73,6 +73,7 @@ from skyrl_train.rollouts.task_projections import (
 )
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig
 from skyrl_train.trajectory_runners.types import (
+    ROUTED_EXPERTS_KEY,
     TokenProvenance,
     TrajectoryBatch,
     TrajectoryRequestBatch,
@@ -164,7 +165,7 @@ async def _model_turn(
         metadata={
             **{
                 name: output[name][0]
-                for name in ("student_topk_indices", "behavior_topk_logprobs", "routed_experts")
+                for name in ("student_topk_indices", "behavior_topk_logprobs", ROUTED_EXPERTS_KEY)
                 if output.get(name) is not None
             },
             "generation_token_budget": (output.get("generation_token_budgets") or [None])[0],

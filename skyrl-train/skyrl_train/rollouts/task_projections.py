@@ -29,7 +29,12 @@ from skyrl_train.trajectory_runners.trajectory_processing import (
     scalar_reward_token_credit,
 )
 from skyrl_train.trajectory_runners.selected_topk import AlignedStudentTopK, align_student_topk
-from skyrl_train.trajectory_runners.types import TrajectoryBatch, TrajectoryRequestBatch
+from skyrl_train.trajectory_runners.types import (
+    RESPONSE_SPAN_TAGS_KEY,
+    ROUTED_EXPERTS_KEY,
+    TrajectoryBatch,
+    TrajectoryRequestBatch,
+)
 from skyrl_train.utils.harbor_errors import (
     DEFAULT_ERROR_HANDLING_CONFIG,
     ErrorHandlingConfig,
@@ -147,30 +152,29 @@ def _rollout_rewards(rollout: RolloutData) -> RewardResult:
 def _student_topk(rollout: RolloutData) -> AlignedStudentTopK | None:
     candidates = [step.turn.metadata.get("student_topk_indices") for step in rollout.steps]
     scores = [step.turn.metadata.get("behavior_topk_logprobs") for step in rollout.steps]
-    selected = None
-    if any(value is not None for value in (*candidates, *scores)):
-        if any(value is None for value in (*candidates, *scores)):
-            raise RolloutContractError("Student top-K evidence must be present on every model turn")
-        generated = []
-        admitted_candidates = []
-        admitted_scores = []
-        for step, step_candidates, step_scores in zip(rollout.steps, candidates, scores, strict=True):
-            start = step.response_end + 1 - len(step.turn.response_token_ids)
-            for offset, (token, ids, values) in enumerate(
-                zip(step.turn.response_token_ids, step_candidates, step_scores, strict=True)
-            ):
-                if rollout.loss_mask[start + offset]:
-                    generated.append(token)
-                    admitted_candidates.append(ids)
-                    admitted_scores.append(values)
-        selected = align_student_topk(
-            rollout.response_token_ids,
-            rollout.loss_mask,
-            generated,
-            admitted_candidates,
-            admitted_scores,
-        )
-    return selected
+    if all(value is None for value in (*candidates, *scores)):
+        return None
+    if any(value is None for value in (*candidates, *scores)):
+        raise RolloutContractError("Student top-K evidence must be present on every model turn")
+    generated = []
+    admitted_candidates = []
+    admitted_scores = []
+    for step, step_candidates, step_scores in zip(rollout.steps, candidates, scores, strict=True):
+        start = step.response_end + 1 - len(step.turn.response_token_ids)
+        for offset, (token, ids, values) in enumerate(
+            zip(step.turn.response_token_ids, step_candidates, step_scores, strict=True)
+        ):
+            if rollout.loss_mask[start + offset]:
+                generated.append(token)
+                admitted_candidates.append(ids)
+                admitted_scores.append(values)
+    return align_student_topk(
+        rollout.response_token_ids,
+        rollout.loss_mask,
+        generated,
+        admitted_candidates,
+        admitted_scores,
+    )
 
 
 def _training_decision(
@@ -447,19 +451,21 @@ def _model_channel(
 
 
 def _attach_routed_experts(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
-    routes = [step.turn.metadata.get("routed_experts") for rollout in rollouts for step in rollout.steps]
+    routes = [step.turn.metadata.get(ROUTED_EXPERTS_KEY) for rollout in rollouts for step in rollout.steps]
     route_template = next((value for value in routes if value is not None and len(value)), None)
     if route_template is not None:
         batch["rollout_routed_experts"] = [
-            _model_channel(rollout, "routed_experts", len(response), route_template.shape[1:], route_template.dtype)
+            _model_channel(rollout, ROUTED_EXPERTS_KEY, len(response), route_template.shape[1:], route_template.dtype)
             for rollout, response in zip(rollouts, batch["response_ids"], strict=True)
         ]
 
 
 def _attach_span_tags(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
-    if any(step.turn.metadata.get("response_span_tags") is not None for rollout in rollouts for step in rollout.steps):
+    if any(
+        step.turn.metadata.get(RESPONSE_SPAN_TAGS_KEY) is not None for rollout in rollouts for step in rollout.steps
+    ):
         batch["response_span_tags"] = [
-            _model_channel(rollout, "response_span_tags", len(response), (), np.int64).tolist()
+            _model_channel(rollout, RESPONSE_SPAN_TAGS_KEY, len(response), (), np.int64).tolist()
             for rollout, response in zip(rollouts, batch["response_ids"], strict=True)
         ]
 

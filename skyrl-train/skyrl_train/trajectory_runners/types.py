@@ -11,6 +11,8 @@ from skyrl_train.inference_engines.base import ConversationType
 
 TrainingPhase = Literal["train", "eval"]
 REWARD_SHAPING_COMPONENT_NAMES = ("passthrough", "non_termination", "overlong", "successful_length")
+ROUTED_EXPERTS_KEY = "routed_experts"
+RESPONSE_SPAN_TAGS_KEY = "response_span_tags"
 
 
 class TokenProvenance(StrEnum):
