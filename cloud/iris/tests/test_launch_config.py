@@ -10,8 +10,7 @@ import pytest
 import yaml
 from omegaconf import OmegaConf
 from rolloutengine.contracts import ModelTurn
-from skyrl_gym.answer_tasks import grade_gsm8k
-from skyrl_gym.task_sessions import AnswerTaskSession
+from skyrl_gym.task_factories import session_factories
 
 from cloud.iris import training_driver
 from cloud.iris.launch_config import LaunchTopology, load_launch_config, validate_launch_config
@@ -114,30 +113,35 @@ def _raw_config() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_override", [False, True], ids=["shared-session", "source-session"])
 @pytest.mark.parametrize("text,reward", [("#### 12", 1.0), ("#### 12\nMore reasoning.", 0.0)])
 async def test_prepared_grader_parameters_reach_the_launch_selected_session(
-    tmp_path: Path, text: str, reward: float
+    tmp_path: Path, text: str, reward: float, source_override: bool
 ) -> None:
     raw = _raw_config()
-    raw["skyrl"]["environment"] = {"task_sessions": {"session": {"task_session": "custom_math"}}}
+    raw["skyrl"]["environment"] = {
+        "task_sessions": {
+            "session": {"task_session": "aime" if source_override else "gsm8k"},
+            "sources": {"fixture": {"session": {"task_session": "gsm8k"}}} if source_override else {},
+        }
+    }
     path = tmp_path / "launch.yaml"
     path.write_text(yaml.safe_dump(raw))
     config = load_launch_config(path)
     task = source_row_task(
         {
             "prompt": [{"role": "user", "content": "What is six plus six?"}],
-            "env_class": "custom_math",
             "reward_spec": {"ground_truth": "12"},
         },
         0,
         source_name="fixture",
         config={"reward_method": "final_line"},
     )
-    execution, _ = source_execution_settings(
+    execution, sources = source_execution_settings(
         OmegaConf.to_container(config.skyrl.environment.task_sessions, resolve=True)
     )
-    task = lowered_task(task, execution)
-    session = AnswerTaskSession(task, None, grader=grade_gsm8k)
+    task = lowered_task(task, sources.get(task.source.dataset, execution))
+    session = session_factories()[task.session.task_session](task, None)
     start = await session.prepare()
     try:
         transition = await session.advance(

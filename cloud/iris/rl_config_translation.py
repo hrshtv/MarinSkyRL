@@ -813,7 +813,7 @@ def _merge_config_mapping(config: DictConfig, values: Mapping[str, Any], prefix:
             continue
         path = f"{prefix}.{key}" if prefix else key
         if path == "environment.task_sessions.sources":
-            OmegaConf.update(config, path, copy.deepcopy(value), merge=True)
+            OmegaConf.update(config, path, copy.deepcopy(value), merge=True, force_add=True)
             continue
         current = OmegaConf.select(config, path, default=...)
         key_exists = current is not ...
