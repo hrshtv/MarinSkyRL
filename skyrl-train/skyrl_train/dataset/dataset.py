@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from typing import List
 from transformers import PreTrainedTokenizerBase
-from marinskyrl.resource_locator import parse_hf_dataset_selector
+from marinskyrl.resource_locator import dataset_reference_parts, parse_hf_dataset_selector
 
 
 def read_prompt_files(sources: list[str]) -> datasets.Dataset:
@@ -17,8 +17,8 @@ def read_prompt_files(sources: list[str]) -> datasets.Dataset:
         elif ext in [".json", ".jsonl"]:
             data = datasets.load_dataset("json", data_files=source, keep_in_memory=False)["train"]
         else:
-            name, separator, split = source.partition(":") if "::" not in source else (source, "", "")
-            split = split if separator else "train"
+            name, split = dataset_reference_parts(source)
+            split = "train" if split is None else split
             selector = parse_hf_dataset_selector(name)
             available = (
                 datasets.load_dataset(

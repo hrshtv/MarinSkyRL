@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from marinskyrl.remote_io import filesystem_and_path
-from marinskyrl.resource_locator import parse_hf_dataset_selector
+from marinskyrl.resource_locator import dataset_reference_parts, parse_hf_dataset_selector
 from cloud.iris.hf_datasets import resolve_hf_dataset_selector
 from marinskyrl.task_sources import DirectoryDataSource, data_source, data_source_dict
 
@@ -56,10 +56,10 @@ def resolve_rl_train_data_with_sources(
             sources.append(data_source_dict(source))
             continue
         if "://" not in entry:
-            name, separator, split = entry.partition(":") if "::" not in entry else (entry, "", "")
+            name, split = dataset_reference_parts(entry)
             if not Path(entry).exists() and parse_hf_dataset_selector(name) is not None:
                 pinned = resolve_hf_dataset_selector(name).canonical()
-                entry = f"{pinned}:{split}" if separator else pinned
+                entry = f"{pinned}:{split}" if split is not None else pinned
             resolved.append(entry)
             sources.append(entry)
             continue

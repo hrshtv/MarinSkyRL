@@ -10,6 +10,7 @@ CLOUD_URI_SCHEMES = frozenset({"s3", "gs", "gcs"})
 CLOUD_URI_PREFIXES = tuple(f"{scheme}://" for scheme in sorted(CLOUD_URI_SCHEMES))
 HF_SELECTOR_REVISION_SEPARATOR = "@"
 HF_SELECTOR_SUBDIR_SEPARATOR = "::"
+HF_SELECTOR_SPLIT_SEPARATOR = ":"
 
 
 class RolloutModelLoading(StrEnum):
@@ -93,6 +94,14 @@ def parse_hf_dataset_selector(value: str) -> HFDatasetSelector | None:
         revision=revision if revision_separator else None,
         subdir=subdir if subdir_separator else None,
     )
+
+
+def dataset_reference_parts(value: str) -> tuple[str, str | None]:
+    """Separate a dataset selector from its optional split, after a subdirectory."""
+    selector, separator, split = value.rpartition(HF_SELECTOR_SPLIT_SEPARATOR)
+    if not separator or selector.endswith(HF_SELECTOR_SPLIT_SEPARATOR):
+        return value, None
+    return selector, split
 
 
 @dataclass(frozen=True)

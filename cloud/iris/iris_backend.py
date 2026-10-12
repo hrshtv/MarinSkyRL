@@ -34,6 +34,7 @@ from iris.cluster.types import CoschedulingConfig, ResourceSpec, gpu_device
 from iris.resources.state import JobState
 from iris.rpc import job_pb2
 from omegaconf import DictConfig, OmegaConf
+from rolloutengine.lowering import SHELLBOX_SESSION
 
 from cloud.iris.launch_config import SubmissionMode, load_launch_config
 from cloud.iris.launch import LaunchOutcome
@@ -642,7 +643,12 @@ def _effective_gdn_backend(args: SimpleNamespace) -> str:
 
 def _rl_config_uses_daytona(config: DictConfig) -> bool:
     """Return whether the configured task backend requires Daytona credentials."""
-    uses_harbor = config.skyrl.get("terminal_bench_config") is not None
+    sessions = OmegaConf.select(config, "skyrl.environment.task_sessions", default=OmegaConf.create({}))
+    session_names = {
+        OmegaConf.select(sessions, "session.task_session", default=SHELLBOX_SESSION),
+        *(OmegaConf.select(source, "session.task_session") for source in sessions.get("sources", {}).values()),
+    }
+    uses_harbor = config.skyrl.get("terminal_bench_config") is not None and SHELLBOX_SESSION in session_names
     backend = OmegaConf.select(
         config,
         "skyrl.terminal_bench_config.harbor.environment_type",

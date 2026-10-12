@@ -330,9 +330,10 @@ two nodes of one GPU each; prepare GSM8K parquet as in
      max_new_tokens_per_turn: 512
      max_turns: 1
    environment:
-     env_class: gsm8k
+     task_sessions:
+       session:
+         task_session: gsm8k
    data:
-     kind: parquet
      train_data: [/data/gsm8k/train.parquet]
      val_data: [/data/gsm8k/validation.parquet]
    trainer:

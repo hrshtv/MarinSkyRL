@@ -111,6 +111,10 @@ environment:
   task_sessions:
     session:
       task_session: nemotron_ultra
+    runtime:
+      task_machine:
+        cpus: 1
+        memory_mb: 8192
 
 extra_env:
   NCCL_DEBUG: WARN

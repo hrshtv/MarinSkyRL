@@ -41,3 +41,23 @@ def test_daytona_preflight_follows_task_backend(harbor, expected):
     )
 
     assert launcher._rl_config_uses_daytona(config) is expected
+
+
+@pytest.mark.parametrize("harbor_source", [False, True])
+def test_daytona_preflight_ignores_unused_harbor_settings_in_nemotron_runs(harbor_source):
+    config = OmegaConf.create(
+        {
+            "skyrl": {
+                "terminal_bench_config": {"harbor": {"environment_type": "daytona"}},
+                "environment": {
+                    "task_sessions": {
+                        "session": {"task_session": "nemotron_ultra"},
+                        "sources": {"harbor/fixture": {"session": {"task_session": "shellbox"}}}
+                        if harbor_source
+                        else {},
+                    }
+                },
+            }
+        }
+    )
+    assert launcher._rl_config_uses_daytona(config) is harbor_source

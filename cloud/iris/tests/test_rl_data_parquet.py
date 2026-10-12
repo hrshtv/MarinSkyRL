@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared data staging.
 
-Local paths / HF ids pass through unchanged; an object-store URI is staged to node-local
+Local paths stay local and HF selectors use immutable revisions. An object-store URI is staged to node-local
 disk (datasets.load_dataset refuses a remote URI under HF_HUB_OFFLINE=1 → OfflineModeIsEnabled).
 """
 

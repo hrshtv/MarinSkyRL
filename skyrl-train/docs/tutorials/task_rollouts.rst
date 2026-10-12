@@ -163,8 +163,7 @@ Explicitly skipped grading can use a session's optimization reward.
 Without a session reward, the row is masked from loss and the baseline.
 ``harbor.verifier_disable=true`` skips grading for Harbor tasks and masks those rows.
 Nemotron GenRM tasks use a judge model to compare a group of responses against
-a private grading principle. Configure that judge in
-``environment.task_sessions.nemotron_ultra.genrm``.
+a private grading principle. Set ``genrm.judge`` in the private grader configuration at preparation time.
 Comparison grading completes before the worker emits a rollout group.
 Each training prompt group contains ``generator.n_samples_per_prompt`` attempts of one task.
 GenRM compares attempts that the exception policy permits for loss calculations.
