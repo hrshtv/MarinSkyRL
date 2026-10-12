@@ -16,7 +16,43 @@ Keep credentials outside that file.
 Omit `--terminal-tasks` when the source contains no SWE rows.
 The output contains bare TaskSpecs with separate training labels.
 
-Prepare Harbor packages with `marinskyrl.harbor_preparation` first.
+The input is a Parquet file from the Nemotron Ultra extraction tools in `infra/rl_data`.
+Each row contains chat messages in `prompt` and private source metadata in `extra_info.nemotron_ultra`.
+That metadata contains `blend`, `agent`, `route`, `record_json`, and `request_json`.
+SWE rows use `route=terminal_bench` and supply `terminal_bench_instance_id`.
+`--source` supplies the dataset identifier when a row has no `data_source`.
+
+For graders that require a judge, `graders.json` can contain:
+
+```json
+{
+  "grading": "verify",
+  "judges": {
+    "general": {
+      "model": "JUDGE_MODEL",
+      "base_url": "https://JUDGE_HOST/v1",
+      "api_key_env": "JUDGE_API_KEY"
+    }
+  }
+}
+```
+
+Replace the model and endpoint with the selected judge service.
+Supply `JUDGE_API_KEY` to the worker environment.
+Add a `safety` entry with the same fields when the task requires a safety judge.
+Use an empty object for tasks that require no extra verifier parameters.
+
+For SWE rows, prepare supported single-stage Harbor packages first:
+
+```bash
+uv run python -m marinskyrl.harbor_preparation \
+  --input /path/to/harbor-packages --output-dir /path/to/prepared-harbor \
+  --execution-output /path/to/harbor-execution.json
+```
+
+The command prints the TaskSpec artifact path for `--terminal-tasks`.
+Packages must declare prebuilt images and separate verifier environments.
+The execution file contains overrides under `environment.task_sessions.sources`.
 Merge its execution settings into the run config at `environment.task_sessions.sources`.
 Nemotron SWE tasks retain the Harbor source used by those settings.
 Other tasks use the selected `nemotron_ultra` session and the run's machine settings.

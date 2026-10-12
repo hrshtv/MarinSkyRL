@@ -4,7 +4,7 @@ OpenEnv uses RolloutEngine and one Shellbox machine per task.
 The session starts the server in that machine and sends reset and step requests.
 It returns observations and rewards. The engine closes the session before the machine.
 
-Prepare TaskSpecs with an explicit image and private server parameters:
+From `skyrl-train`, prepare TaskSpecs with an explicit image and private server parameters:
 
 ```bash
 uv run --project .. integrations/openenv/prepare_dummy_dataset.py \
