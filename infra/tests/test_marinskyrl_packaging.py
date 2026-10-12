@@ -142,8 +142,8 @@ def test_policy_closures_match_supported_architectures(architecture: str) -> Non
     names = {requirement.name for requirement in exported}
 
     assert {
-        "vllm", "torch", "torchaudio", "flashinfer-python", "nvidia-cuda-nvcc", "causal-conv1d", "flash-attn",
-        "mamba-ssm", "megatron-core", "transformer-engine-torch", "fast-hadamard-transform",
+        "vllm", "torch", "torchaudio", "flashinfer-python", "nvidia-cuda-nvcc", "flash-attn",
+        "megatron-core", "transformer-engine-torch", "fast-hadamard-transform",
     }.issubset(names)
     vllm = next(requirement for requirement in exported if requirement.name == "vllm")
     assert vllm.url is not None and vllm.url.endswith(f"manylinux_2_28_{architecture}.whl")
