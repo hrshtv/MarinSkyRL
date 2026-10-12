@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from collections.abc import Iterator, Mapping, Sequence
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from harbor_config.models.task.config import EnvironmentConfig, TaskConfig
 from marinskyrl.harbor_import import harbor_task
 from taskcompendium.models import NoGrader, Source, TaskSpec
 
@@ -18,6 +20,35 @@ from marinskyrl.task_preparation import cache_tasks
 
 MATERIALIZATION_BATCH_SIZE = 64
 HARBOR_ID_PREFIX = "harbor-id:"
+
+
+def _machine_overrides(environment: EnvironmentConfig, user: str | int | None) -> dict:
+    return {
+        "network": "allow" if environment.allow_internet else "deny",
+        "cpus": environment.cpus,
+        "memory_mb": environment.memory_mb,
+        "storage_mb": environment.storage_mb,
+        "gpus": environment.gpus or 0,
+        "user": None if user is None else str(user),
+        "startup_timeout": environment.build_timeout_sec,
+    }
+
+
+def harbor_execution_overrides(directory: Path) -> dict:
+    config = TaskConfig.model_validate_toml((directory / "task.toml").read_text())
+    return {
+        "runtime": {
+            "task_machine": _machine_overrides(config.environment, config.agent.user),
+            "verifier_machine": _machine_overrides(
+                config.verifier.environment or config.environment, config.verifier.user
+            ),
+        },
+        "session": {
+            "task_session": "shellbox",
+            "total_turn_timeout": config.agent.timeout_sec,
+            "verifier_timeout": config.verifier.timeout_sec,
+        },
+    }
 
 
 class TerminalBenchTaskDataset:
@@ -123,11 +154,15 @@ def materialize_harbor_tasks(
     *,
     cache_dir: Path,
     grader_override: NoGrader | None = None,
+    execution_output: Path | None = None,
 ) -> Path:
     """Prepare Harbor packages as a bare TaskSpec artifact."""
     sources = TerminalBenchTaskDataset(data_files)
     if not len(sources):
         raise ValueError("No Harbor tasks matched the configured sources")
+    if execution_output is not None and execution_output.exists():
+        raise FileExistsError(execution_output)
+    execution = {}
 
     def tasks() -> Iterator[TaskSpec]:
         with closing(PackedTaskMaterializer(cache_dir / "archives")) as materializer:
@@ -152,6 +187,8 @@ def materialize_harbor_tasks(
                             importer_revision="skyrl-harbor-v1",
                         ),
                     )
+                    if execution_output is not None:
+                        execution[data_source] = harbor_execution_overrides(directory)
                     if grader_override is not None:
                         task = task.model_copy(
                             update={
@@ -177,5 +214,32 @@ def materialize_harbor_tasks(
                     )
                     yield task
 
-    return cache_tasks(tasks(), cache_dir)
+    path = cache_tasks(tasks(), cache_dir)
+    if execution_output is not None:
+        execution_output.write_text(json.dumps({"environment": {"task_sessions": {"sources": execution}}}))
+        execution_output.chmod(0o600)
+    return path
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, help="Harbor package directory")
+    parser.add_argument("--packed-source", type=Path, help="TaskTrove source descriptor in JSON")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--execution-output", type=Path, required=True, help="Run settings in JSON")
+    parser.add_argument("--disable-verification", action="store_true")
+    args = parser.parse_args()
+    if (args.input is None) == (args.packed_source is None):
+        parser.error("Select one --input or --packed-source")
+    sources = [str(args.input)] if args.packed_source is None else [json.loads(args.packed_source.read_text())]
+    path = materialize_harbor_tasks(
+        sources,
+        cache_dir=args.output_dir,
+        grader_override=NoGrader(reason="Verification is disabled") if args.disable_verification else None,
+        execution_output=args.execution_output,
+    )
+    print(path)
+
+
+if __name__ == "__main__":
+    main()

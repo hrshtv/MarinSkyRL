@@ -45,7 +45,6 @@ class TaskGenerateExp(BasePPOExp):
 
 @ray.remote(num_cpus=1, max_retries=0)
 def skyrl_entrypoint(cfg: DictConfig):
-    # make sure that the training loop is not run on the head node.
     exp = TaskGenerateExp(cfg)
     exp.run()
 

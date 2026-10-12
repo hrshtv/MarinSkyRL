@@ -15,20 +15,16 @@ from shellbox.backends.shellsim.machine import ShellSimMachineFactory
 from shellbox.machine import Backend, ExitReason, Result, ShellSimBuiltins, UnsupportedMachineSpec
 from taskcompendium.models import Source
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
-from tests.cpu.task_specs import prepared_source_task
 from marinskyrl.harbor_preparation import materialize_harbor_tasks
-from marinskyrl.nemotron_preparation import resolve_terminal_task, terminal_task_index
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN
-from skyrl_train.rollouts.task_lowering import TaskExecutionSettings
-from rolloutengine.spec import TaskRuntimeSpec
+from marinskyrl.nemotron_preparation import nemotron_task_rows, terminal_task_index
+from marinskyrl.task_preparation import TASK_SPEC_COLUMN, source_row_task, write_task_rows
 from skyrl_gym.source_task import session_parameters
 from tests.cpu.task_specs import task_dataset
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
 from skyrl_gym.source_task import source_task
-from skyrl_train.config.utils import get_default_config
-from tests.cpu.task_specs import NATIVE_ENVIRONMENT, lowered_task, machine_runtime, session_spec, task_input
+from tests.cpu.task_specs import NATIVE_ENVIRONMENT, lowered_task, session_spec, task_input
 from skyrl_train.trajectory_runners.types import TrajectoryID, TaskRequestBatch
 from skyrl_train.trajectory_runners.trajectory_processing import validate_trajectory_batch
 from skyrl_train.trajectory_runners.model_clients import DirectModelClient, ModelServerError
@@ -115,7 +111,7 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
                 "env_class": "gsm8k_multi_turn",
                 "reward_spec": {"ground_truth": "12"},
                 "teacher_route": "code" if route == "terminal_bench" else "math",
-                "data_source": f"source-{index}",
+                "data_source": "mixed",
                 "extra_info": {
                     "nemotron_ultra": {
                         "blend": "rlvr1",
@@ -130,49 +126,19 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
     pq.write_table(pa.Table.from_pylist(rows), input_path)
     terminal_path = materialize_harbor_tasks([str(source)], cache_dir=tmp_path / "tasks")
     terminals = terminal_task_index(terminal_path)
-    tasks = [
-        resolve_terminal_task(
-            prepared_source_task(
-                row,
-                index,
-                source_name="fixture",
-                environment_configs={"session": session_spec().model_dump(exclude={"task_session"})},
-            ).task,
-            terminals,
-        )
-        for index, row in enumerate(rows)
-    ]
     prepared_path = tmp_path / "prepared.parquet"
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {TASK_SPEC_COLUMN: task.model_dump_json(), "teacher_route": row["teacher_route"]}
-                for task, row in zip(tasks, rows, strict=True)
-            ]
-        ),
+    write_task_rows(
         prepared_path,
-    )
-    source_execution = TaskExecutionSettings(
-        runtime=TaskRuntimeSpec(task_machine=None, verifier_machine=None),
-        session=session_spec("gsm8k_multi_turn"),
+        nemotron_task_rows(rows, source_name="fixture", config={}, environments={}, terminals=terminals),
     )
     prepared = task_dataset(
         [str(prepared_path)],
         Tokenizer(),
-        source_executions={"source-0": source_execution, "source-2": source_execution},
+        session=session_spec("gsm8k_multi_turn"),
     )
     shutil.rmtree(source)
     input_path.unlink()
-    inputs = tuple(
-        replace(
-            prepared[index],
-            metadata=replace(
-                prepared[index].metadata,
-                metric_tags=(f"nemotron_ultra/coverage/rlvr1/{row['extra_info']['nemotron_ultra']['agent']}",),
-            ),
-        )
-        for index, row in enumerate(rows)
-    )
+    inputs = tuple(prepared[index] for index in range(len(prepared)))
     uids = tuple(row.metadata.uid for row in inputs)
 
     class MixedClient:
@@ -273,15 +239,10 @@ async def test_source_tasks_run_without_the_original_dataset(tmp_path, task_inpu
         source,
     )
     row = pq.read_table(source).to_pylist()[0]
-    task = prepared_source_task(
-        row,
-        0,
-        source_name="fixture",
-        environment_configs={"session": session_spec().model_dump(exclude={"task_session"})},
-    )
+    task = source_row_task(row, 0, source_name="fixture", config={})
     prepared_path = tmp_path / "prepared.parquet"
     pq.write_table(
-        pa.Table.from_pylist([{TASK_SPEC_COLUMN: task.task.model_dump_json(), "teacher_route": "math"}]),
+        pa.Table.from_pylist([{TASK_SPEC_COLUMN: task.model_dump_json(), "teacher_route": "math"}]),
         prepared_path,
     )
     prepared = task_dataset([str(prepared_path)], Tokenizer(), session=session_spec("gsm8k"))
@@ -331,18 +292,17 @@ async def test_source_tasks_run_without_the_original_dataset(tmp_path, task_inpu
 )
 async def test_unified_gym_tasks_preserve_grading_and_turn_credit(task_inputs, environment, extras, responses, rewards):
     config, request = task_inputs
-    task = prepared_source_task(
-        {
-            "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
-            "env_class": environment,
-            **extras,
-        },
-        0,
-        source_name="fixture",
-        environment_configs={
-            **OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
-            "session": session_spec().model_dump(exclude={"task_session"}),
-        },
+    task = lowered_task(
+        source_row_task(
+            {
+                "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
+                **extras,
+            },
+            0,
+            source_name="fixture",
+            config={},
+        ),
+        environment,
     )
     request = replace(request, rows=(task_input(task),))
     model = ConversationClient(responses)
@@ -369,34 +329,18 @@ async def test_unified_gym_tasks_preserve_grading_and_turn_credit(task_inputs, e
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "row_limits,session_config,turns",
-    [
-        ({"max_turns": 2}, {}, 2),
-        ({"extra_info": {"max_turns": 2}}, {}, 2),
-        ({"max_turns": None, "extra_info": {"max_turns": 2}}, {}, 2),
-        ({"max_turns": 2, "extra_info": {"max_turns": 1}}, {}, 2),
-        ({"max_turns": 2}, {"session": {"max_turns": 1}}, 1),
-        ({}, {}, 1),
-    ],
-)
-async def test_source_row_turn_limit_controls_correction_and_terminal_grade(
-    task_inputs, row_limits, session_config, turns
-):
+@pytest.mark.parametrize("turns", [1, 2])
+async def test_session_turn_limit_controls_correction_and_terminal_grade(task_inputs, turns):
     config, request = task_inputs
-    task = prepared_source_task(
-        {
-            "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
-            "env_class": "gsm8k_multi_turn",
-            "reward_spec": {"ground_truth": "12"},
-            **row_limits,
-        },
-        0,
-        source_name="fixture",
-        environment_configs={
-            "session": session_spec(max_turns=1).model_dump(exclude={"task_session"}),
-            "gsm8k_multi_turn": session_config,
-        },
+    task = lowered_task(
+        source_task(
+            conversation_messages(request.rows[0].lowered.task.context.events),
+            {"reward_spec": {"ground_truth": "12"}},
+            {},
+            Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
+        ),
+        "gsm8k_multi_turn",
+        max_turns=turns,
     )
     request = replace(request, rows=(task_input(task),))
     model = ConversationClient(["#### 13", "#### 12"])
@@ -670,24 +614,9 @@ def task_machine():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("per_agent", [False, True])
-async def test_source_machine_selection_controls_tool_results(task_inputs, task_machine, per_agent):
+@pytest.mark.parametrize("expected", ["4", "7"])
+async def test_task_environment_controls_tool_results(task_inputs, task_machine, expected):
     config, request = task_inputs
-    environment = {
-        "machine": {
-            "requirements": {**NATIVE_ENVIRONMENT.model_dump(), "environment_variables": {"PYTHON_OUTPUT": "4"}},
-            "runtime": machine_runtime("docker").model_dump(),
-        },
-        "machines": {
-            "ns_tools_simple_agent": {
-                "requirements": {**NATIVE_ENVIRONMENT.model_dump(), "environment_variables": {"PYTHON_OUTPUT": "7"}},
-                "runtime": machine_runtime("docker").model_dump(),
-            }
-        }
-        if per_agent
-        else {},
-    }
-    expected = "7" if per_agent else "4"
     row = {
         "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
         "env_class": "nemotron_ultra",
@@ -700,14 +629,16 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
             }
         },
     }
-    task = prepared_source_task(
-        row,
-        0,
-        source_name="source",
-        environment_configs={
-            "session": session_spec().model_dump(exclude={"task_session"}),
-            "nemotron_ultra": environment,
-        },
+    task = lowered_task(
+        source_row_task(
+            row,
+            0,
+            source_name="source",
+            config={},
+            environment=NATIVE_ENVIRONMENT.model_copy(update={"environment_variables": {"PYTHON_OUTPUT": expected}}),
+        ),
+        "nemotron_ultra",
+        backend="docker",
     )
     request = replace(request, rows=(task_input(task),))
     message = {

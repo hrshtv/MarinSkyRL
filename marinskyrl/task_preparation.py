@@ -14,9 +14,15 @@ import pyarrow.parquet as pq
 from datasets import load_dataset
 from skyrl_gym.source_task import source_task
 from taskcompendium.models import EnvironmentRequirements, Source, TaskSpec
+from marinskyrl.task_format import TASK_SPEC_COLUMN, TaskDatasetRow
 
-TASK_SPEC_COLUMN = "task_spec"
-TASK_SCHEMA = pa.schema([pa.field(TASK_SPEC_COLUMN, pa.string(), nullable=False)])
+TASK_SCHEMA = pa.schema(
+    [
+        pa.field(TASK_SPEC_COLUMN, pa.string(), nullable=False),
+        pa.field("teacher_route", pa.string()),
+        pa.field("metric_tags", pa.list_(pa.string()), nullable=False),
+    ]
+)
 PARQUET_BATCH_SIZE = 1024
 
 
@@ -36,17 +42,36 @@ def source_row_task(
         row=str(index),
         importer_revision="skyrl-task-spec-v1",
     )
-    extras = {key: value for key, value in row.items() if key not in {"prompt", "env_class"}}
+    extras = {
+        key: value
+        for key, value in row.items()
+        if key not in {"prompt", "env_class", "teacher_route", "metric_tags", "data_source"}
+    }
     return source_task(row["prompt"], extras, dict(config), source, environment=environment)
 
 
 def write_tasks(path: Path, tasks: Iterable[TaskSpec]) -> None:
     """Write prepared TaskSpecs as a private input artifact."""
+    write_task_rows(path, (TaskDatasetRow(task) for task in tasks))
+
+
+def write_task_rows(path: Path, rows: Iterable[TaskDatasetRow]) -> None:
+    """Keep task definitions and training labels in separate storage columns."""
     with pq.ParquetWriter(path, TASK_SCHEMA) as writer:
         path.chmod(0o600)
-        for batch in batched(tasks, PARQUET_BATCH_SIZE):
+        for batch in batched(rows, PARQUET_BATCH_SIZE):
             writer.write_table(
-                pa.Table.from_pydict({TASK_SPEC_COLUMN: [task.model_dump_json() for task in batch]}, TASK_SCHEMA)
+                pa.Table.from_pylist(
+                    [
+                        {
+                            TASK_SPEC_COLUMN: row.task.model_dump_json(),
+                            "teacher_route": row.teacher_route,
+                            "metric_tags": list(row.metric_tags),
+                        }
+                        for row in batch
+                    ],
+                    schema=TASK_SCHEMA,
+                )
             )
 
 
@@ -79,10 +104,14 @@ def main() -> None:
     )
     format_name = "parquet" if args.input.suffix == ".parquet" else "json"
     rows = load_dataset(format_name, data_files=str(args.input), split="train")
-    write_tasks(
+    write_task_rows(
         args.output,
         (
-            source_row_task(row, index, source_name=args.source, config=config, environment=environment)
+            TaskDatasetRow(
+                source_row_task(row, index, source_name=args.source, config=config, environment=environment),
+                teacher_route=row.get("teacher_route"),
+                metric_tags=tuple(row.get("metric_tags") or ()),
+            )
             for index, row in enumerate(rows)
         ),
     )

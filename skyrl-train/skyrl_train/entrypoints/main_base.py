@@ -46,6 +46,10 @@ from marinskyrl.runtime_options import (
     static_preference_pairs_requested,
 )
 from skyrl_train.rollouts.task_lowering import source_execution_settings
+from marinskyrl.distillation import compile_distillation_plan_from_config
+from marinskyrl.rollout_grading import validate_task_grading
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from taskcompendium.models import TaskSpec
 
 if TYPE_CHECKING:
     from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
@@ -388,10 +392,6 @@ class BasePPOExp:
 
     def task_dataset(self, data_files):
         from skyrl_train.dataset.tasks import TaskSpecDataset  # noqa: PLC0415 - optional training dependencies
-        from marinskyrl.rollout_grading import validate_task_grading  # noqa: PLC0415 - optional task dependencies
-        from marinskyrl.task_preparation import TASK_SPEC_COLUMN  # noqa: PLC0415 - optional task dependencies
-        from taskcompendium.models import TaskSpec  # noqa: PLC0415 - optional task dependencies
-        from marinskyrl.distillation import compile_distillation_plan_from_config  # noqa: PLC0415
 
         execution, source_executions = source_execution_settings(
             OmegaConf.to_container(self.cfg.environment.task_sessions, resolve=True)
@@ -672,9 +672,10 @@ class BasePPOExp:
 
 @ray.remote(num_cpus=1, max_retries=0)
 def skyrl_entrypoint(cfg: DictConfig):
-    from skyrl_train.utils.fd_monitor import start_fd_monitor  # noqa: PLC0415 - optional training dependencies
+    if cfg.get("terminal_bench_config") is not None:
+        from skyrl_train.utils.fd_monitor import start_fd_monitor  # noqa: PLC0415 - optional training dependencies
 
-    start_fd_monitor()
+        start_fd_monitor()
     exp = BasePPOExp(cfg)
     exp.run()
 

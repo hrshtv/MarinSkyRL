@@ -34,6 +34,7 @@ marinskyrl/harbor_preparation.py
 marinskyrl/nemotron_preparation.py
 marinskyrl/protocol_replay.py
 marinskyrl/task_preparation.py
+marinskyrl/task_format.py
 marinskyrl/checkpoint_paths.py
 marinskyrl/distillation.py
 marinskyrl/hf_model.py

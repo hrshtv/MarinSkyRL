@@ -4,8 +4,7 @@ from examples.livecodebench.lcb_dataset import LIVECODEBENCH, process_example
 from skyrl_gym.source_task import session_parameters
 from taskcompendium.submission import conversation_messages
 
-from tests.cpu.task_specs import prepared_source_task
-from tests.cpu.task_specs import session_spec
+from marinskyrl.task_preparation import source_row_task
 
 
 REVERSE_SOLUTION = """```python
@@ -25,12 +24,12 @@ def test_lcb_example_builder_preserves_executable_reference_tests():
         split="test",
     )
 
-    task = prepared_source_task(
+    task = source_row_task(
         row,
         0,
         source_name=LIVECODEBENCH,
-        environment_configs={"session": session_spec().model_dump(exclude={"task_session"})},
-    ).task
+        config={},
+    )
     public = conversation_messages(task.context.events)
     parameters = session_parameters(task)
     assert "```python" in public[0]["content"]

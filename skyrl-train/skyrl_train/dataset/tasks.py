@@ -4,12 +4,11 @@ from collections.abc import Mapping, Sequence
 from functools import partial
 
 from datasets import Dataset
-from skyrl_gym.source_task import session_parameters
 from rolloutengine.lowering import SHELLBOX_SESSION
-from taskcompendium.models import SessionGrader, TaskSpec
+from taskcompendium.models import TaskSpec
 from transformers import PreTrainedTokenizerBase
 
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN
+from marinskyrl.task_format import TASK_SPEC_COLUMN
 from skyrl_train.dataset.dataset import PromptDataset
 from skyrl_train.rollouts.group_grader import task_group_grader
 from skyrl_train.rollouts.task_lowering import TaskExecutionSettings, lowered_task
@@ -51,13 +50,6 @@ class TaskSpecDataset(PromptDataset):
         row = self.dataframe[index]
         task = TaskSpec.model_validate_json(row[TASK_SPEC_COLUMN])
         lowered = lowered_task(task, self.source_executions.get(task.source.dataset, self.execution))
-        extras = session_parameters(task).extras if isinstance(task.grader, SessionGrader) else {}
-        ultra = (extras.get("extra_info") or {}).get("nemotron_ultra") or {}
-        metric_tags = (
-            (f"nemotron_ultra/coverage/{ultra['blend']}/{ultra['agent']}",)
-            if "blend" in ultra and "agent" in ultra
-            else ()
-        )
         return TaskInput(
             lowered=lowered,
             metadata=TrajectoryMetadata(
@@ -66,8 +58,8 @@ class TaskSpecDataset(PromptDataset):
                 if lowered.session.task_session == SHELLBOX_SESSION
                 else lowered.session.task_session,
                 data_source=task.source.dataset,
-                teacher_route=row.get("teacher_route") or extras.get("teacher_route"),
-                metric_tags=metric_tags,
+                teacher_route=row.get("teacher_route"),
+                metric_tags=tuple(row.get("metric_tags") or ()),
             ),
             group_grader=task_group_grader(lowered),
         )

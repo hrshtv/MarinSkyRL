@@ -7,7 +7,7 @@ from typing import Any
 
 from loguru import logger
 from transformers import PreTrainedTokenizerBase
-from marinskyrl.runtime_options import PreferencePairFormat
+from marinskyrl.runtime_options import PREFERENCE_PAIR_ENV_CLASS, PreferencePairFormat
 
 from skyrl_train.dataset.dataset import PromptDataset, read_prompt_files
 from skyrl_train.trajectory_runners.types import PreferenceInput, TrajectoryMetadata
@@ -94,7 +94,7 @@ class PreferencePairDataset(PromptDataset):
             preference=preference,
             metadata=TrajectoryMetadata(
                 uid=uid,
-                metric_class="preference_pair",
+                metric_class=PREFERENCE_PAIR_ENV_CLASS,
                 data_source=extra_info.get("data_source", preference.get("data_source")),
                 teacher_route=preference.get("teacher_route"),
             ),

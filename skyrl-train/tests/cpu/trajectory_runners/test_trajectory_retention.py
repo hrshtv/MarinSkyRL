@@ -263,8 +263,9 @@ def _sink(config, publisher=None) -> TrajectorySink:
 
 
 def test_normalized_output_produces_complete_core_trace_schema():
+    request = _input()
     records = build_trajectory_records(
-        _input(),
+        request,
         _output(),
         _config(Path("/unused")),
         _Tokenizer(),
@@ -289,7 +290,7 @@ def test_normalized_output_produces_complete_core_trace_schema():
         "metrics",
         "provenance",
     }
-    assert record["prompt"]["messages"][0] == {"role": "user", "content": "first"}
+    assert record["prompt"]["messages"] == list(request.public_prompts[0])
     assert record["response"]["text"] == "10 11"
     assert record["verifier"] is None
     assert record["schema_version"] == 6

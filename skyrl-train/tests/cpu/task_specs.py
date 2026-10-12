@@ -16,7 +16,6 @@ from taskcompendium.models import (
     TextMessage,
 )
 from skyrl_train.trajectory_runners.types import TaskInput, TrajectoryMetadata
-from marinskyrl.task_preparation import source_row_task
 from skyrl_train.dataset.tasks import TaskSpecDataset
 from skyrl_train.rollouts.task_lowering import TaskExecutionSettings
 
@@ -115,39 +114,6 @@ def lowered_task(
             verifier_machine=None if verifier_backend is None else machine_runtime(verifier_backend),
         ),
         session=session_spec(session_name, max_turns=max_turns, **limits),
-    )
-
-
-def prepared_source_task(row, index, *, source_name, environment_configs) -> LoweredTaskSpec:
-    session_name = row["env_class"]
-    config = dict(environment_configs.get(session_name, {}))
-    machine = config.pop("machine", None)
-    machines = config.pop("machines", {})
-    if session_name == "nemotron_ultra":
-        machine = machines.get(row["extra_info"]["nemotron_ultra"]["agent"], machine)
-    elif session_name == "openenv":
-        machine = machines.get(row["env_name"], machine)
-    source_session = dict(environment_configs["session"])
-    row_turns = row.get("max_turns") or (row.get("extra_info") or {}).get("max_turns")
-    if row_turns is not None:
-        source_session["max_turns"] = row_turns
-    session = TaskSessionSpec.model_validate(
-        {**source_session, **config.pop("session", {}), "task_session": session_name}
-    )
-    task = source_row_task(
-        row,
-        index,
-        source_name=source_name,
-        config=config,
-        environment=None if machine is None else EnvironmentRequirements.model_validate(machine["requirements"]),
-    )
-    return LoweredTaskSpec(
-        task=task,
-        runtime=TaskRuntimeSpec(
-            task_machine=None if machine is None else MachineRuntimeSpec.model_validate(machine["runtime"]),
-            verifier_machine=None,
-        ),
-        session=session,
     )
 
 

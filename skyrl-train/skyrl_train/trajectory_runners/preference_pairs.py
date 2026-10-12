@@ -99,11 +99,11 @@ class PreferencePairTrajectoryRunner:
 
     def _validate_request(self, input_batch: PreferenceRequestBatch) -> None:
         prompts = input_batch.prompts
-        env_extras = input_batch.preferences
-        if len(prompts) % 2 or len(env_extras) != len(prompts):
+        preferences = input_batch.preferences
+        if len(prompts) % 2 or len(preferences) != len(prompts):
             raise ValueError(
                 f"preference pairs arrive as chosen/rejected row pairs; got {len(prompts)} rows "
-                f"with {len(env_extras)} extras"
+                f"with {len(preferences)} extras"
             )
         trajectory_ids = input_batch.trajectory_ids
         if trajectory_ids is None:
@@ -119,7 +119,7 @@ class PreferencePairTrajectoryRunner:
     async def run(self, input_batch: PreferenceRequestBatch) -> TrajectoryBatch:
         self._validate_request(input_batch)
         prompts = input_batch.prompts
-        env_extras = input_batch.preferences
+        preferences = input_batch.preferences
 
         prompt_token_ids: list[list[int]] = []
         response_ids: list[list[int]] = []
@@ -128,8 +128,8 @@ class PreferencePairTrajectoryRunner:
         pair_roles: list[int] = []
         for pair_index in range(len(prompts) // 2):
             prompt = prompts[2 * pair_index]
-            extras = env_extras[2 * pair_index]
-            if prompts[2 * pair_index + 1] != prompt or env_extras[2 * pair_index + 1] != extras:
+            extras = preferences[2 * pair_index]
+            if prompts[2 * pair_index + 1] != prompt or preferences[2 * pair_index + 1] != extras:
                 raise ValueError("both rows of a preference pair must carry the same prompt and extras")
             if self.data_format is PreferencePairFormat.TOKENIZED:
                 pair = tokenized_pair(extras, max_sequence_length=self.max_input_length + self.max_generate_length)

@@ -1,19 +1,23 @@
 """Prepare mixed Nemotron rows as portable tasks before rollout execution."""
 
+import argparse
+import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
 
 import pyarrow.parquet as pq
+from datasets import load_dataset
 from skyrl_gym.source_task import session_parameters
 from taskcompendium.models import EnvironmentRequirements, TaskSpec
 
 from marinskyrl.harbor_preparation import HARBOR_ID_PREFIX
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN, PARQUET_BATCH_SIZE, source_row_task
+from marinskyrl.task_preparation import TASK_SPEC_COLUMN, PARQUET_BATCH_SIZE
+from marinskyrl.task_preparation import source_row_task, write_task_rows
+from marinskyrl.task_format import TaskDatasetRow
 
 
 def terminal_task_index(path: Path) -> dict[str, TaskSpec]:
-    """Index lowered Harbor tasks by their package and source instance identities."""
+    """Index Harbor TaskSpecs by package and source instance identities."""
     result = {}
     with pq.ParquetFile(path) as parquet:
         for batch in parquet.iter_batches(batch_size=PARQUET_BATCH_SIZE, columns=[TASK_SPEC_COLUMN]):
@@ -30,18 +34,17 @@ def terminal_task_index(path: Path) -> dict[str, TaskSpec]:
     return result
 
 
-def resolve_terminal_task(lowered: TaskSpec, terminals: Mapping[str, TaskSpec]) -> TaskSpec:
+def resolve_terminal_task(task: TaskSpec, terminals: Mapping[str, TaskSpec]) -> TaskSpec:
     """Resolve a terminal source row before rollout execution."""
-    task = lowered
     parameters = session_parameters(task)
     extras = parameters.extras
     ultra = (extras.get("extra_info") or {}).get("nemotron_ultra")
     if ultra is None:
-        return lowered
+        return task
     if not all(isinstance(ultra.get(key), str) and ultra[key] for key in ("blend", "agent")):
         raise ValueError("Nemotron Ultra tasks require non-empty blend and agent fields")
     if ultra.get("route") != "terminal_bench":
-        return lowered
+        return task
     identifier = ultra.get("terminal_bench_instance_id")
     if not isinstance(identifier, str) or not identifier:
         raise ValueError("A terminal-bench row must provide terminal_bench_instance_id")
@@ -56,16 +59,48 @@ def resolve_terminal_task(lowered: TaskSpec, terminals: Mapping[str, TaskSpec]) 
     )
 
 
-def nemotron_tasks(
-    rows: Iterable[Mapping[str, Any]],
+def nemotron_task_rows(
+    rows: Iterable[Mapping],
     *,
     source_name: str,
-    config: Mapping[str, Any],
+    config: dict,
     environments: Mapping[str, EnvironmentRequirements],
     terminals: Mapping[str, TaskSpec],
-) -> Iterable[TaskSpec]:
-    """Resolve mixed source rows before the trainer receives task records."""
+) -> Iterable[TaskDatasetRow]:
     for index, row in enumerate(rows):
-        agent = row["extra_info"]["nemotron_ultra"]["agent"]
-        task = source_row_task(row, index, source_name=source_name, config=config, environment=environments.get(agent))
-        yield resolve_terminal_task(task, terminals)
+        ultra = row["extra_info"]["nemotron_ultra"]
+        task = source_row_task(
+            row, index, source_name=source_name, config=config, environment=environments.get(ultra["agent"])
+        )
+        yield TaskDatasetRow(
+            task=resolve_terminal_task(task, terminals),
+            teacher_route=row.get("teacher_route"),
+            metric_tags=(f"nemotron_ultra/coverage/{ultra['blend']}/{ultra['agent']}",),
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--environments", type=Path, help="JSON map from agent names to EnvironmentRequirements")
+    parser.add_argument("--terminal-tasks", type=Path, help="Prepared Harbor TaskSpec artifact")
+    args = parser.parse_args()
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    rows = load_dataset("parquet", data_files=str(args.input), split="train")
+    environment_values = {} if args.environments is None else json.loads(args.environments.read_text())
+    tasks = nemotron_task_rows(
+        rows,
+        source_name=args.source,
+        config=json.loads(args.config.read_text()),
+        environments={key: EnvironmentRequirements.model_validate(value) for key, value in environment_values.items()},
+        terminals={} if args.terminal_tasks is None else terminal_task_index(args.terminal_tasks),
+    )
+    write_task_rows(args.output, tasks)
+
+
+if __name__ == "__main__":
+    main()

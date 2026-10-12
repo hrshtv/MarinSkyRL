@@ -101,10 +101,13 @@ def skipped_task():
     )
 
 
-def test_skipped_grading_is_accepted_for_pure_distillation():
+def test_prepared_task_skips_grading_only_with_reward_independent_training():
     cfg = skipped_grading_config()
+    # Teacher credit permits this task to omit the environment reward.
     validate_task_grading(skipped_task(), cfg, compile_distillation_plan_from_config(cfg))
-    assert cfg.trainer.algorithm.advantage_estimator == "uniform"
+    cfg.trainer.eval_interval = 5
+    with pytest.raises(ValueError, match="eval_interval<=0"):
+        validate_task_grading(skipped_task(), cfg, compile_distillation_plan_from_config(cfg))
 
 
 @pytest.mark.parametrize(
