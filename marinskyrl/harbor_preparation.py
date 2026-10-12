@@ -161,8 +161,8 @@ def materialize_harbor_tasks(
                 for item in batch:
                     if isinstance(item, Path):
                         directory = item
-                        data_source = str(item)
                         uid = item.name
+                        data_source = f"harbor/{uid}"
                     else:
                         directory = directories[item]
                         data_source = item.stable_uri()
@@ -206,7 +206,6 @@ def materialize_harbor_tasks(
     path = cache_tasks(tasks(), cache_dir)
     if execution_output is not None:
         execution_output.write_text(json.dumps({"environment": {"task_sessions": {"sources": execution}}}))
-        execution_output.chmod(0o600)
     return path
 
 

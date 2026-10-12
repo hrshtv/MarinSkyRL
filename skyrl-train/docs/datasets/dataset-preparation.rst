@@ -12,6 +12,10 @@ Each row contains ``task_spec``: a JSON string that satisfies the TaskCompendium
 ``TaskSpec`` schema. Optional ``teacher_route`` and ``metric_tags`` columns contain
 training labels, not task requirements. A teacher route selects a configured teacher
 for distillation. Metric tags supply coverage labels.
+Curriculum sampling uses ``extra_info.data_source`` and ``extra_info.grade`` for bin labels.
+These fields contain no verifier answers.
+An optional ``data_source`` column supplies the training source label when a row
+uses a task from another source. Runtime source overrides still match ``TaskSpec.source.dataset``.
 
 .. code-block:: python
 

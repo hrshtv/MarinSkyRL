@@ -57,7 +57,7 @@ class TaskSpecDataset(PromptDataset):
                 metric_class=TASKCOMPENDIUM_ENVIRONMENT
                 if lowered.session.task_session == SHELLBOX_SESSION
                 else lowered.session.task_session,
-                data_source=task.source.dataset,
+                data_source=row.get("data_source") or task.source.dataset,
                 teacher_route=row.get("teacher_route"),
                 metric_tags=tuple(row.get("metric_tags") or ()),
             ),

@@ -14,13 +14,15 @@ import pyarrow.parquet as pq
 from datasets import load_dataset
 from skyrl_gym.source_task import source_task
 from taskcompendium.models import EnvironmentRequirements, Source, TaskSpec
-from marinskyrl.task_format import TASK_SPEC_COLUMN, TaskDatasetRow
+from marinskyrl.task_format import TASK_SPEC_COLUMN, CurriculumBin, TaskDatasetRow
 
 TASK_SCHEMA = pa.schema(
     [
         pa.field(TASK_SPEC_COLUMN, pa.string(), nullable=False),
+        pa.field("data_source", pa.string()),
         pa.field("teacher_route", pa.string()),
         pa.field("metric_tags", pa.list_(pa.string()), nullable=False),
+        pa.field("extra_info", pa.struct([pa.field("data_source", pa.string()), pa.field("grade", pa.int64())])),
     ]
 )
 PARQUET_BATCH_SIZE = 1024
@@ -65,8 +67,15 @@ def write_task_rows(path: Path, rows: Iterable[TaskDatasetRow]) -> None:
                     [
                         {
                             TASK_SPEC_COLUMN: row.task.model_dump_json(),
+                            "data_source": row.data_source,
                             "teacher_route": row.teacher_route,
                             "metric_tags": list(row.metric_tags),
+                            "extra_info": None
+                            if row.curriculum_bin is None
+                            else {
+                                "data_source": row.curriculum_bin.name,
+                                "grade": row.curriculum_bin.grade,
+                            },
                         }
                         for row in batch
                     ],
@@ -110,11 +119,20 @@ def main() -> None:
             TaskDatasetRow(
                 source_row_task(row, index, source_name=args.source, config=config, environment=environment),
                 teacher_route=row.get("teacher_route"),
+                data_source=row.get("data_source"),
                 metric_tags=tuple(row.get("metric_tags") or ()),
+                curriculum_bin=curriculum_bin(row),
             )
             for index, row in enumerate(rows)
         ),
     )
+
+
+def curriculum_bin(row: Mapping[str, Any]) -> CurriculumBin | None:
+    info = row.get("extra_info")
+    if info is None or "data_source" not in info or "grade" not in info:
+        return None
+    return CurriculumBin(name=info["data_source"], grade=info["grade"])
 
 
 if __name__ == "__main__":

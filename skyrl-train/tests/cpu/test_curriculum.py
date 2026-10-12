@@ -6,6 +6,37 @@ from datasets import Dataset
 
 from skyrl_train.curriculum import CurriculumConfig, CurriculumOrder, SamplingKind, WeightingKind, dataset_bins
 from skyrl_train.rollouts.loader import JudgedGroup
+from marinskyrl.task_format import TaskDatasetRow
+from marinskyrl.task_preparation import curriculum_bin, source_row_task, write_task_rows
+from tests.cpu.task_specs import session_spec, task_dataset
+from tests.cpu.rollouts.engine_fakes import Tokenizer
+
+
+def test_prepared_artifact_preserves_curriculum_bin_membership(tmp_path):
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": "What is 2 + 2?"}],
+            "reward_spec": {"ground_truth": "4"},
+            "extra_info": {"data_source": name, "grade": grade},
+        }
+        for name, grade in (("hard", 10), ("easy", 1), ("easy", 1))
+    ]
+    path = tmp_path / "prepared.parquet"
+    write_task_rows(
+        path,
+        (
+            TaskDatasetRow(
+                source_row_task(row, index, source_name="math", config={}), curriculum_bin=curriculum_bin(row)
+            )
+            for index, row in enumerate(rows)
+        ),
+    )
+    dataset = task_dataset([str(path)], Tokenizer(), session=session_spec("gsm8k"))
+    bins = dataset_bins(dataset)
+    assert bins.names == ["easy", "hard"]
+    assert bins.grades.tolist() == [1, 10]
+    assert bins.row_to_bin.tolist() == [1, 0, 0]
+    assert bins.row_counts.tolist() == [2, 1]
 
 
 class _StubCurriculumDataset:

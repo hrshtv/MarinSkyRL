@@ -11,9 +11,8 @@ from skyrl_gym.source_task import session_parameters
 from taskcompendium.models import EnvironmentRequirements, TaskSpec
 
 from marinskyrl.harbor_preparation import HARBOR_ID_PREFIX
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN, PARQUET_BATCH_SIZE
-from marinskyrl.task_preparation import source_row_task, write_task_rows
-from marinskyrl.task_format import TaskDatasetRow
+from marinskyrl.task_preparation import PARQUET_BATCH_SIZE, source_row_task, write_task_rows
+from marinskyrl.task_format import TASK_SPEC_COLUMN, TaskDatasetRow
 
 
 def terminal_task_index(path: Path) -> dict[str, TaskSpec]:
@@ -51,12 +50,7 @@ def resolve_terminal_task(task: TaskSpec, terminals: Mapping[str, TaskSpec]) -> 
     if identifier.casefold() not in terminals:
         raise ValueError(f"Terminal-bench task {identifier!r} is absent from the configured task data")
     terminal = terminals[identifier.casefold()]
-    return terminal.model_copy(
-        update={
-            "id": task.id,
-            "source": task.source,
-        }
-    )
+    return terminal.model_copy(update={"id": task.id})
 
 
 def nemotron_task_rows(
@@ -74,6 +68,7 @@ def nemotron_task_rows(
         )
         yield TaskDatasetRow(
             task=resolve_terminal_task(task, terminals),
+            data_source=task.source.dataset,
             teacher_route=row.get("teacher_route"),
             metric_tags=(f"nemotron_ultra/coverage/{ultra['blend']}/{ultra['agent']}",),
         )

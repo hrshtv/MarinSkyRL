@@ -17,7 +17,9 @@ from taskcompendium.models import Source
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
 from marinskyrl.harbor_preparation import materialize_harbor_tasks
 from marinskyrl.nemotron_preparation import nemotron_task_rows, terminal_task_index
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN, source_row_task, write_task_rows
+from marinskyrl.task_preparation import source_row_task, write_task_rows
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from skyrl_train.rollouts.task_lowering import source_execution_settings
 from skyrl_gym.source_task import session_parameters
 from tests.cpu.task_specs import task_dataset
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
@@ -96,8 +98,10 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
     (source / "tests").mkdir()
     (source / "instruction.md").write_text("Repair the terminal task.")
     (source / "task.toml").write_text(
-        '[environment]\nworkdir = "/workspace"\nallow_internet = false\ndocker_image = "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
-        '[verifier]\nenvironment_mode = "separate"\n'
+        '[environment]\nworkdir = "/workspace"\nallow_internet = false\ncpus = 3\nmemory_mb = 1536\n'
+        'docker_image = "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        "[agent]\ntimeout_sec = 61\n"
+        '[verifier]\nenvironment_mode = "separate"\ntimeout_sec = 71\n'
     )
     (source / "tests" / alias_file).write_text(json.dumps(alias_metadata))
     (source / "tests/test.sh").write_text(
@@ -124,7 +128,10 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
         )
     input_path = tmp_path / "input.parquet"
     pq.write_table(pa.Table.from_pylist(rows), input_path)
-    terminal_path = materialize_harbor_tasks([str(source)], cache_dir=tmp_path / "tasks")
+    execution_output = tmp_path / "execution.json"
+    terminal_path = materialize_harbor_tasks(
+        [str(source)], cache_dir=tmp_path / "tasks", execution_output=execution_output
+    )
     terminals = terminal_task_index(terminal_path)
     prepared_path = tmp_path / "prepared.parquet"
     write_task_rows(
@@ -136,6 +143,20 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
         Tokenizer(),
         session=session_spec("gsm8k_multi_turn"),
     )
+    _, source_executions = source_execution_settings(
+        {
+            **prepared.execution.model_dump(mode="json"),
+            **json.loads(execution_output.read_text())["environment"]["task_sessions"],
+        }
+    )
+    prepared = task_dataset(
+        [str(prepared_path)], Tokenizer(), session=session_spec("gsm8k_multi_turn"), source_executions=source_executions
+    )
+    terminal = prepared[1].lowered
+    assert terminal.runtime.task_machine.cpus == 3
+    assert terminal.runtime.task_machine.memory_mb == 1536
+    assert terminal.session.total_turn_timeout == 61
+    assert terminal.session.verifier_timeout == 71
     shutil.rmtree(source)
     input_path.unlink()
     inputs = tuple(prepared[index] for index in range(len(prepared)))
@@ -159,7 +180,9 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
         backend = Backend.DOCKER
 
         async def create(self, spec):
-            return await ShellSimMachineFactory().create(replace(spec, source=ShellSimBuiltins(), cpus=None))
+            return await ShellSimMachineFactory().create(
+                replace(spec, source=ShellSimBuiltins(), cpus=None, memory_mb=None)
+            )
 
     settings = HarborTaskSettings.from_config(
         OmegaConf.create(

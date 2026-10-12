@@ -11,7 +11,8 @@ uv run --frozen python -m marinskyrl.harbor_preparation \
 
 The command prints the TaskSpec Parquet path. It also writes per-source machine
 resources, users, network policies, and deadlines to `execution.json`.
-Merge that file into the run config at `environment.task_sessions.sources`.
+Merge its `environment.task_sessions.sources` mapping into the same path in the run config.
+The training command does not read the execution JSON automatically.
 Select the Shellbox backend in the run config.
 
 The importer accepts single-stage tasks with prebuilt, digest-pinned images and
