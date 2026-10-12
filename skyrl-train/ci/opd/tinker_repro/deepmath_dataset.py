@@ -10,6 +10,9 @@ from typing import Any
 import datasets
 import pyarrow as pa
 
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from marinskyrl.task_preparation import source_row_task
+
 from training_plan import OPD_DATASET, OPD_DATASET_REVISION
 
 PROMPT_ONLY_ENV = "prompt_only"
@@ -22,14 +25,18 @@ def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
         question = row.get("question")
         if not isinstance(question, str) or not question.strip():
             raise ValueError(f"DeepMath row {index} has no non-empty question")
-        converted.append(
+        task = source_row_task(
             {
                 "data_source": OPD_DATASET,
                 "prompt": [{"role": "user", "content": question}],
                 "env_class": PROMPT_ONLY_ENV,
                 "extra_info": {"source_index": index},
-            }
+            },
+            index,
+            source_name=OPD_DATASET,
+            config={},
         )
+        converted.append({TASK_SPEC_COLUMN: task.model_dump_json()})
     return pa.Table.from_pylist(converted)
 
 
