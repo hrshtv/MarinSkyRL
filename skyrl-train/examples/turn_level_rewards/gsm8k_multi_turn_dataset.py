@@ -53,7 +53,6 @@ if __name__ == "__main__":
                         "content": question,
                     }
                 ],
-                "env_class": "gsm8k_multi_turn",
                 "reward_spec": {
                     "method": "rule",
                     "ground_truth": solution,

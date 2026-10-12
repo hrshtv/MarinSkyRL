@@ -40,7 +40,6 @@ def test_delphi_config_composes_environment_and_caps_into_hydra_config():
     assert cfg.environment.task_sessions.session.task_session == "aime"
     assert cfg.generator.engine_init_kwargs.max_model_len == 4096
     assert cfg.trainer.algorithm.advantage_estimator == "grpo"
-    assert "kind" not in cfg.data
     assert "policy_chat_template" not in cfg
     assert "model_num_attention_heads" not in cfg
 

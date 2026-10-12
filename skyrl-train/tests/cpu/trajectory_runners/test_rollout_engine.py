@@ -42,7 +42,7 @@ from skyrl_train.rollouts.buffer import (
     RolloutContentPolicy,
     RolloutTask,
 )
-from skyrl_train.dataset.tasks import TASK_SPEC_COLUMN
+from marinskyrl.task_format import TASK_SPEC_COLUMN
 from skyrl_train.rollouts.task_lowering import source_execution_settings
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker

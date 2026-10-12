@@ -20,7 +20,8 @@ import re
 import os
 
 import datasets
-from marinskyrl.task_preparation import TASK_SPEC_COLUMN, source_row_task
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from marinskyrl.task_preparation import source_row_task
 
 
 def extract_solution(solution_str):
@@ -65,7 +66,6 @@ if __name__ == "__main__":
                         "content": question,
                     }
                 ],
-                "env_class": "gsm8k",
                 "reward_spec": {
                     "method": "rule",
                     "ground_truth": solution,

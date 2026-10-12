@@ -97,7 +97,7 @@ async def test_runner_rejects_broken_pair_layouts(tokenizer):
     with pytest.raises(ValueError, match="repetition 0 then 1"):
         await runner.run(swapped)
     mismatched = replace(request(), preferences=({"chosen": "a"}, {"chosen": "b", "rejected": "c"}))
-    with pytest.raises(ValueError, match="same prompt and extras"):
+    with pytest.raises(ValueError, match="same prompt and preference record"):
         await runner.run(mismatched)
 
 

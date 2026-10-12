@@ -22,7 +22,9 @@ To download and prepare the dataset, run the following script:
 
 .. code-block:: bash
 
-   uv run examples/llm_as_a_judge/gsm8k_dataset_judge.py --output_dir $HOME/data/gsm8k_llm_judge
+   uv run --project .. examples/llm_as_a_judge/gsm8k_dataset_judge.py \
+     --output_dir $HOME/data/gsm8k_llm_judge \
+     --judge_model gpt-4o-mini --judge_base_url https://api.openai.com/v1
 
 This script downloads the GSM8K dataset, extracts ground truth answers, and formats it for the LLM judge environment.
 
@@ -118,7 +120,6 @@ The training configuration uses GRPO with colocated training and generation. Key
      
      # Environment and LLM judge configuration
      environment.task_sessions.session.task_session=llm_as_a_judge \
-     environment.task_sessions.llm_as_a_judge.model="gpt-4o-mini" \
      
      # Other parameters (see the `examples/llm_as_a_judge/run_llm_judge.sh` for the full script)
      ...

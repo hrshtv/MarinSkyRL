@@ -44,7 +44,6 @@ def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": f"{problem.strip()}\n\n{USER_INSTRUCTION}"},
                 ],
-                "env_class": "aime",
                 "reward_model": {"ground_truth": normalized_answer},
                 "extra_info": {"source_id": str(row.get("id", index))},
             },

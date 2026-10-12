@@ -46,7 +46,6 @@ def create_dataset(num_examples, num_digits, split_name):
                     "content": question,
                 },
             ],
-            "env_class": "multiply",
             "reward_spec": {
                 "method": "rule",
                 "ground_truth": answer,

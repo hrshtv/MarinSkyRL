@@ -68,7 +68,6 @@ if __name__ == "__main__":
                         "content": question,
                     }
                 ],
-                "env_class": "llm_as_a_judge",
                 "reward_spec": {
                     "method": "rule",
                     "ground_truth": solution,

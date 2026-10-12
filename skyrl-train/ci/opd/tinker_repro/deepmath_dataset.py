@@ -15,8 +15,6 @@ from marinskyrl.task_preparation import source_row_task
 
 from training_plan import OPD_DATASET, OPD_DATASET_REVISION
 
-PROMPT_ONLY_ENV = "prompt_only"
-
 
 def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
     """Return DeepMath questions as zero-reward, single-user-turn prompts."""
@@ -29,7 +27,6 @@ def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
             {
                 "data_source": OPD_DATASET,
                 "prompt": [{"role": "user", "content": question}],
-                "env_class": PROMPT_ONLY_ENV,
                 "extra_info": {"source_index": index},
             },
             index,

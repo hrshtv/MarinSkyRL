@@ -218,7 +218,6 @@ def process_single_row(row, current_split_name, row_index, *, config):
             "data_source": data_source_tagged,
             "prompt": prompt,
             "ability": row.get("ability"),
-            "env_class": "search",
             "reward_spec": reward_data,
             "extra_info": extra_info,
             "metadata": row.get("metadata"),

@@ -115,7 +115,6 @@ def process_example(example: Dict[str, Any], idx: int, dataset_name: str, split:
         "data_source": dataset_name,
         "prompt": [{"role": "user", "content": question}],
         "ability": "code",
-        "env_class": "lcb",
         "reward_model": {"method": "rule", "ground_truth": tests},
         "extra_info": {
             "split": split,
@@ -143,6 +142,7 @@ def process_dataset(
         dataset_dir: Directory containing raw datasets
         local_dir: Directory to save processed datasets
         max_rows: Maximum number of rows to process
+        environment: Process semantics and prebuilt image for code execution.
     """
     # Load dataset
     raw_data = load_dataset(dataset_name, split, base_dir=dataset_dir)

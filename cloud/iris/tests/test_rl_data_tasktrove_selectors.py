@@ -1,9 +1,8 @@
-from pathlib import Path
 import json
 
 from omegaconf import OmegaConf
 
-from cloud.iris import hf_datasets, rl_data
+from cloud.iris import rl_data
 from cloud.iris.training_driver import LocalRLConfig, LocalRLRunner
 from marinskyrl.resource_locator import HFDatasetSelector, is_hugging_face_repo_id, parse_hf_dataset_selector
 
@@ -24,31 +23,6 @@ def test_cache_names_do_not_confuse_repo_suffixes_with_subdirectories():
     subdirectory = HFDatasetSelector("fixture-org/a", revision="commit", subdir="b").cache_name()
 
     assert repo_suffix != subdirectory
-
-
-def test_download_selects_only_the_requested_subdirectory(monkeypatch, tmp_path):
-    snapshot = tmp_path / "snapshot"
-    selected = snapshot / "a"
-    selected.mkdir(parents=True)
-    calls = []
-
-    def download(**kwargs):
-        calls.append(kwargs)
-        return str(snapshot)
-
-    monkeypatch.setattr(hf_datasets, "snapshot_download", download)
-    monkeypatch.delenv("HF_CACHE_DIR", raising=False)
-
-    assert hf_datasets.download_hf_dataset("fixture-org/fixture-trove@rev-1::a") == str(selected)
-    assert calls == [
-        {
-            "repo_id": "fixture-org/fixture-trove",
-            "cache_dir": str(Path.home() / ".cache/huggingface/hub"),
-            "revision": "rev-1",
-            "repo_type": "dataset",
-            "allow_patterns": ["a/**"],
-        }
-    ]
 
 
 def test_runner_resolves_and_records_training_and_validation_selectors(monkeypatch, tmp_path):

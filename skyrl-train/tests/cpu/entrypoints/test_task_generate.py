@@ -14,7 +14,8 @@ from taskcompendium.models import (
 
 from skyrl_train.config.rollout_validation import EntrypointOperation
 from skyrl_train.config.utils import get_default_config
-from skyrl_train.dataset.tasks import TASK_SPEC_COLUMN, TaskSpecDataset
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from skyrl_train.dataset.tasks import TaskSpecDataset
 from skyrl_train.entrypoints.task_generate import TaskGenerateExp
 from skyrl_train.rollouts.task_lowering import source_execution_settings
 from skyrl_train.trajectory_runners.types import BatchMetadata, TrajectoryRequestBatch

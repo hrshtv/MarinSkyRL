@@ -12,8 +12,6 @@ from marinskyrl.task_format import TASK_SPEC_COLUMN
 from marinskyrl.task_preparation import source_row_task
 from skyrl_train.domain_sampling import ROUTE_COLUMN
 
-PROMPT_ONLY_ENV = "prompt_only"
-
 
 def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
     """Preserve released chat prompts and map each domain to its teacher."""
@@ -39,7 +37,6 @@ def convert_rows(rows: Iterable[Mapping[str, Any]]) -> pa.Table:
             {
                 "data_source": data_source,
                 "prompt": prompt,
-                "env_class": PROMPT_ONLY_ENV,
                 "source_index": index,
             },
             index,

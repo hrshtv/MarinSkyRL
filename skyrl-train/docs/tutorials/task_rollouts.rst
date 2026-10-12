@@ -24,6 +24,8 @@ It derives public prompts for length filtering without an intermediate Parquet f
 The scheduler and worker receive typed task objects, not serialized private payloads beside duplicate prompts.
 Prepare source datasets and task directories before the training command.
 The trainer does not infer task families from source rows.
+``skyrl_train.entrypoints.task_generate`` generates rollouts from the training dataset without optimizer updates.
+``skyrl_train.entrypoints.main_generate`` evaluates the validation dataset and records its metrics.
 ``LoweredTaskSpec.runtime`` selects optional task and verifier machines through ``MachineRuntimeSpec``.
 Each machine selection supplies a configured backend identifier, network policy, hardware limits, user, and startup or cleanup deadline.
 ``LoweredTaskSpec.session`` supplies the session factory identifier, turn limit, model and command caps, tool-turn deadline, cumulative turn deadline, attempt deadline, and verifier deadline.
@@ -127,7 +129,7 @@ Token-contract violations abort the prompt group.
 
 One transition follows each model response, including the final response.
 The engine uses each lowered record's ``session.max_turns``.
-Source conversion applies the row and source-family limits described above.
+Run settings supply shared and per-source session limits.
 The worker applies ``harbor.max_turns`` to Harbor tasks.
 A session can finish earlier.
 ``generator.max_input_length`` limits each rendered prompt, including continuations.
@@ -201,7 +203,7 @@ Worker shutdown cancels active requests, including group grading and buffer subm
 Half of that budget permits request cleanup. The remaining budget permits machine cleanup.
 Late machine creation uses the same owned close task as normal cleanup.
 If shutdown exceeds its budget, provider diagnostics identify open creations and machines, and shutdown reports a failure.
-The search task's HTTP client can use ten attempts, each with ``environment.task_sessions.search.timeout``, plus 45 seconds of retry delays.
+The search client can use ten attempts, each with its prepared verifier timeout, plus 45 seconds of retry delays.
 Those attempts can continue in retained cleanup after a task deadline expires.
 The worker returns after the buffer commit.
 

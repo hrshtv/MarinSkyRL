@@ -48,6 +48,7 @@ from marinskyrl.runtime_options import (
 from skyrl_train.rollouts.task_lowering import source_execution_settings
 from marinskyrl.distillation import compile_distillation_plan_from_config
 from marinskyrl.rollout_grading import validate_task_grading
+from skyrl_train.utils.fd_monitor import start_fd_monitor
 from marinskyrl.task_format import TASK_SPEC_COLUMN
 from taskcompendium.models import TaskSpec
 
@@ -673,8 +674,6 @@ class BasePPOExp:
 @ray.remote(num_cpus=1, max_retries=0)
 def skyrl_entrypoint(cfg: DictConfig):
     if cfg.get("terminal_bench_config") is not None:
-        from skyrl_train.utils.fd_monitor import start_fd_monitor  # noqa: PLC0415 - optional training dependencies
-
         start_fd_monitor()
     exp = BasePPOExp(cfg)
     exp.run()
