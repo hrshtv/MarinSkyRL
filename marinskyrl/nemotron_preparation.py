@@ -21,11 +21,7 @@ def terminal_task_index(path: Path) -> dict[str, TaskSpec]:
                 record = TaskSpec.model_validate_json(row[TASK_SPEC_COLUMN])
                 identifiers = {
                     record.id.casefold(),
-                    *(
-                        tag.removeprefix(HARBOR_ID_PREFIX)
-                        for tag in record.tags
-                        if tag.startswith(HARBOR_ID_PREFIX)
-                    ),
+                    *(tag.removeprefix(HARBOR_ID_PREFIX) for tag in record.tags if tag.startswith(HARBOR_ID_PREFIX)),
                 }
                 for identifier in identifiers:
                     if identifier in result and result[identifier] != record:
@@ -71,8 +67,5 @@ def nemotron_tasks(
     """Resolve mixed source rows before the trainer receives task records."""
     for index, row in enumerate(rows):
         agent = row["extra_info"]["nemotron_ultra"]["agent"]
-        task = source_row_task(
-            row, index, source_name=source_name, config=config, environment=environments.get(agent)
-        )
+        task = source_row_task(row, index, source_name=source_name, config=config, environment=environments.get(agent))
         yield resolve_terminal_task(task, terminals)
-
