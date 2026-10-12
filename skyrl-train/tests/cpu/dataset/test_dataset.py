@@ -6,14 +6,7 @@ from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
 from taskcompendium.models import (
-    AnswerType,
-    ConversationInput,
-    EnvironmentRequirements,
-    NoGrader,
-    PlainText,
     Source,
-    TaskSpec,
-    TextMessage,
 )
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
@@ -25,15 +18,9 @@ from tests.cpu.tiny_training.tiny_model import build_tiny_policy
 
 def task_row(prompt: str, index: int) -> dict:
     return {
-        TASK_SPEC_COLUMN: TaskSpec(
-            id=f"fixture-{index}",
-            context=ConversationInput(events=(TextMessage(role="user", content=prompt),)),
-            environment_requirements=EnvironmentRequirements(),
-            answer_type=AnswerType.TEXT,
-            answer_format=PlainText(),
-            grader=NoGrader(reason="Prompt-filtering fixture"),
-            source=Source(dataset="fixture", revision="1", row=str(index), importer_revision="1"),
-        ).model_dump_json()
+        TASK_SPEC_COLUMN: text_task(f"fixture-{index}", prompt=prompt, source="fixture")
+        .model_copy(update={"source": Source(dataset="fixture", revision="1", row=str(index), importer_revision="1")})
+        .model_dump_json()
     }
 
 

@@ -12,7 +12,7 @@ import fsspec
 from types import SimpleNamespace
 from huggingface_hub import HfApi
 
-from cloud.iris.rl_data import resolve_rl_train_data, resolve_rl_train_data_with_sources
+from cloud.iris.rl_data import resolve_rl_train_data_with_sources
 
 
 def test_local_parquet_and_hf_inputs_keep_immutable_source_references(tmp_path, monkeypatch):
@@ -42,15 +42,15 @@ def test_parquet_remote_uri_staged_to_local(tmp_path):
     remote = "memory://rl-data/train.parquet"
     with fsspec.open(remote, "wb") as destination:
         destination.write(b"PARQUET-BYTES")
-    out = resolve_rl_train_data(
+    out = resolve_rl_train_data_with_sources(
         [remote],
         scratch_dir=str(tmp_path),
         verbose=False,
     )
-    staged = Path(out[0])
+    staged = Path(out.paths[0])
     assert staged.is_absolute() and staged.exists()
     assert staged.name == "train.parquet"
-    assert "://" not in out[0]  # a local path, not the remote URI
+    assert "://" not in out.paths[0]  # a local path, not the remote URI
     assert staged.read_bytes() == b"PARQUET-BYTES"
 
 
@@ -59,6 +59,6 @@ def test_remote_inputs_with_the_same_filename_keep_distinct_contents(tmp_path):
     for uri, content in zip(uris, [b"FIRST", b"SECOND"], strict=True):
         with fsspec.open(uri, "wb") as destination:
             destination.write(content)
-    paths = resolve_rl_train_data(uris, scratch_dir=str(tmp_path), verbose=False)
+    paths = resolve_rl_train_data_with_sources(uris, scratch_dir=str(tmp_path), verbose=False).paths
     assert paths[0] != paths[1]
     assert [Path(path).read_bytes() for path in paths] == [b"FIRST", b"SECOND"]

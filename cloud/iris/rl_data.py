@@ -37,27 +37,13 @@ def _stage_remote_file(uri: str, destination: Path, *, overwrite: bool) -> None:
         staging.unlink(missing_ok=True)
 
 
-def resolve_rl_train_data(
-    train_data: list[str | dict[str, Any]],
-    scratch_dir: str | None = None,
-    on_exist: str = "skip",
-    verbose: bool = True,
-) -> list[str | dict[str, Any]]:
-    """Stage prepared TaskSpecs or static preference pairs."""
-    return list(
-        resolve_rl_train_data_with_sources(
-            train_data, scratch_dir=scratch_dir, on_exist=on_exist, verbose=verbose
-        ).paths
-    )
-
-
 def resolve_rl_train_data_with_sources(
     train_data: list[str | dict[str, Any]],
     scratch_dir: str | None = None,
     on_exist: str = "skip",
     verbose: bool = True,
 ) -> ResolvedRLData:
-    """Return local inputs without task extraction or conversion."""
+    """Return staged files or pinned Hub selectors with their source references."""
     stage_root = Path(scratch_dir) / "rl_data" if scratch_dir else Path("/tmp/skyrl_rl_data")
     resolved: list[str] = []
     sources: list[str | dict[str, Any]] = []

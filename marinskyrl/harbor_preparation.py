@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from rolloutengine.lowering import SHELLBOX_SESSION
 from harbor_config.models.task.config import EnvironmentConfig, TaskConfig
 from marinskyrl.harbor_import import harbor_task
 from taskcompendium.models import NoGrader, Source, TaskSpec
@@ -46,7 +47,7 @@ def harbor_execution_overrides(directory: Path) -> dict:
             ),
         },
         "session": {
-            "task_session": "shellbox",
+            "task_session": SHELLBOX_SESSION,
             "total_turn_timeout": config.agent.timeout_sec,
             "verifier_timeout": config.verifier.timeout_sec,
         },
