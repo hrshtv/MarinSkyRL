@@ -526,6 +526,8 @@ generator:
     publish_timeout_seconds: 120
     shutdown_timeout_seconds: 30
     reuse_publication_process: false
+    append_only: false
+    publication_retries: 0
     redact_fields: []
     model_path: ${trainer.policy.model.path}
     model_source_identity: ${trainer.policy.model.source_identity}

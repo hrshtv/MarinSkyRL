@@ -714,13 +714,18 @@ def _initialize_publication(request: PublicationRequest) -> _RetentionLedger:
     return _reconciled_ledger(writer, config)
 
 
-def _publish_archives(request: PublicationRequest) -> _RetentionLedger:
-    if request.archives is None or request.ledger is None:
+def _publish_archives(request: PublicationRequest) -> _RetentionLedger | None:
+    config = parse_trajectory_retention_config(request.retention_config)
+    if request.archives is None or (request.ledger is None and not config.append_only):
         raise ValueError("trajectory publication request is incomplete")
     writer = _FilesystemTrajectoryWriter(request.output_path)
     for path, payload in request.archives.items():
         if not writer.exists(path):
             writer.write_bytes(path, payload)
+    if config.append_only:
+        # Each committed archive contains its manifest. Reconciliation can rebuild
+        # the index without rewriting or transferring the growing run ledger.
+        return None
     ledger = _RetentionLedger.from_json(request.ledger)
     writer.write_json(_LEDGER_NAME, to_jsonable(ledger))
     return ledger
@@ -744,7 +749,7 @@ def execute_publication(request: PublicationRequest) -> PublicationResult:
     return PublicationResult(
         request_id=request.request_id,
         record_count=request.record_count,
-        ledger=to_jsonable(ledger),
+        ledger=to_jsonable(ledger) if ledger is not None else None,
     )
 
 
@@ -889,7 +894,13 @@ class TrajectorySink:
         assert request.archives is not None
         archive_bytes = sum(len(payload) for payload in request.archives.values())
         if self.config.required:
-            result = self.publisher.execute(request)
+            for attempt in range(self.config.publication_retries + 1):
+                result = self.publisher.execute(request)
+                if result.error is None:
+                    break
+                metrics[f"{RETENTION_METRIC_PREFIX}/write_errors"] += 1.0
+                metrics[f"{RETENTION_METRIC_PREFIX}/publish_timeouts"] += float(result.timed_out)
+                logger.warning("Required archive publication attempt {} failed: {}", attempt + 1, result.error)
             if result.error is not None:
                 self._raise_publication_error(result, ", ".join(request.archives))
             metrics[f"{RETENTION_METRIC_PREFIX}/written"] += float(request.record_count)
@@ -927,7 +938,7 @@ class TrajectorySink:
             operation=PublicationOperation.PUBLISH,
             output_path=self.config.output_path,
             archives=archives,
-            ledger=to_jsonable(self._ledger),
+            ledger=None if self.config.append_only else to_jsonable(self._ledger),
             retention_config=to_jsonable(self.config),
             record_count=record_count,
         )
@@ -935,6 +946,18 @@ class TrajectorySink:
     def _queue_selected(self, records: Sequence[TrajectoryRecord], metrics: dict[str, float]) -> None:
         """Queue the payload-bounded priority prefix of the records that qualify for retention."""
         assert self._ledger is not None
+        if self.config.append_only:
+            for record in sorted(records, key=self._sample_score):
+                if record.record_id in self._ledger.records:
+                    metrics[f"{RETENTION_METRIC_PREFIX}/duplicates"] += 1.0
+                    continue
+                selection = self._selection(record, self._ledger)
+                assert selection is not None
+                selected = _SelectedRecord(record=record, payload=self._encode_record(record), selection=selection)
+                self._add_selected_record(self._ledger, selected)
+                self._queued.append(selected)
+                metrics[f"{RETENTION_METRIC_PREFIX}/selected"] += 1.0
+            return
         selection_ledger = _copy_ledger(self._ledger)
         selected = []
         for record in sorted(records, key=self._sample_score):
@@ -1063,8 +1086,8 @@ class TrajectorySink:
             reasons.append(_SELECTION_FRACTION)
 
         displaced_id = None
-        count_samples = self._count_samples(ledger, self._step_key(record))
         if self.config.sample_count_per_step > 0:
+            count_samples = self._count_samples(ledger, self._step_key(record))
             if len(count_samples) < self.config.sample_count_per_step:
                 reasons.append(_SELECTION_COUNT)
             else:

@@ -813,9 +813,19 @@ def test_storage_worker_process_writes_archives_and_returns_the_ledger(tmp_path)
     assert (tmp_path / "archive.zip").read_bytes() == b"payload"
 
 
-def test_reused_storage_worker_publishes_multiple_archives_without_losing_records(tmp_path):
+@pytest.mark.parametrize("append_only", [False, True])
+def test_reused_storage_worker_publishes_multiple_archives_without_losing_records(tmp_path, append_only):
+    config = _config(
+        tmp_path,
+        reuse_publication_process=True,
+        append_only=append_only,
+        sample_count_per_step=0,
+        sample_fraction=1.0,
+        max_bytes_per_step=None,
+        max_bytes_per_run=None,
+    )
     sink = _sink(
-        _config(tmp_path, reuse_publication_process=True, sample_count_per_step=0, sample_fraction=1.0),
+        config,
         publisher=ProcessTrajectoryPublisher(
             execute_publication, publish_timeout_seconds=120, shutdown_timeout_seconds=30, reuse_process=True
         ),
@@ -829,6 +839,47 @@ def test_reused_storage_worker_publishes_multiple_archives_without_losing_record
     records = _records(tmp_path)
     assert len(records) == 9
     assert {record["global_step"] for record in records} == {7, 8, 9}
+    # Rebuild from committed archives and avoid publishing the same records again.
+    resumed = _sink(config)
+    try:
+        metrics = resumed.retain(_input(step=7), _output())
+        assert metrics["generate/trajectory_retention/duplicates"] == 3
+        assert metrics["generate/trajectory_retention/written"] == 0
+    finally:
+        resumed.close()
+    assert len(_records(tmp_path)) == 9
+
+
+def test_required_append_only_publication_recovers_lost_ack_without_duplicate_records(tmp_path):
+    class LostAcknowledgementPublisher(InlineTrajectoryPublisher):
+        lost_ack = False
+
+        def execute(self, request):
+            result = super().execute(request)
+            if request.operation is PublicationOperation.PUBLISH and not self.lost_ack:
+                self.lost_ack = True
+                return PublicationResult(
+                    request.request_id, request.record_count, error="lost acknowledgement", timed_out=True
+                )
+            return result
+
+    config = _config(
+        tmp_path,
+        append_only=True,
+        publication_retries=1,
+        sample_fraction=1.0,
+        sample_count_per_step=0,
+        max_bytes_per_step=None,
+        max_bytes_per_run=None,
+    )
+    sink = _sink(config, publisher=LostAcknowledgementPublisher(execute_publication))
+    try:
+        metrics = sink.retain(_input(), _output())
+    finally:
+        sink.close()
+    assert metrics["generate/trajectory_retention/written"] == 3
+    assert metrics["generate/trajectory_retention/publish_timeouts"] == 1
+    assert len(_records(tmp_path)) == 3
 
 
 def test_initialization_reconciles_archive_written_before_ledger_commit(tmp_path):
