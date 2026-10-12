@@ -5,6 +5,7 @@ import json
 import shutil
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -21,18 +22,20 @@ from taskcompendium.models import (
     EnvironmentRequirements,
     FileReward,
     MissingArtifactPolicy,
+    NoGrader,
     RewardFile,
     RewardFileFormat,
     ScriptGrader,
     TextMessage,
     VerifierArtifact,
+    TaskSpec,
 )
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
 from marinskyrl.task_preparation import write_tasks
 from marinskyrl.protocol_replay import ReplayPartition, replay_tasks
 from marinskyrl.harbor_preparation import materialize_harbor_tasks
 from tests.cpu.task_specs import task_dataset
-from skyrl_train.rollouts.task_lowering import TaskExecutionSettings
+from skyrl_train.rollouts.task_lowering import TaskExecutionSettings, source_execution_settings
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
@@ -41,6 +44,43 @@ from tests.cpu.task_specs import NATIVE_ENVIRONMENT, SHELL_ENVIRONMENT, lowered_
 from skyrl_train.trajectory_runners.types import BatchMetadata, TokenProvenance, TrajectoryID
 from skyrl_train.trajectory_runners.model_clients import ModelServerError
 from tests.cpu.rollouts.engine_fakes import ConversationClient, FixtureImageFactory, InferenceClient, Tokenizer, Writer
+
+
+def test_harbor_preparation_preserves_task_and_verifier_execution_policies(tmp_path):
+    source = tmp_path / "source.with.dots" / "task"
+    (source / "tests").mkdir(parents=True)
+    (source / "instruction.md").write_text("Write the answer in /workspace/answer.txt")
+    (source / "tests/test.sh").write_text("echo 1 > /logs/verifier/reward.txt\n")
+    (source / "task.toml").write_text(
+        '[environment]\nworkdir = "/workspace"\nallow_internet = true\ncpus = 2\nmemory_mb = 1536\n'
+        'docker_image = "fixture@sha256:' + "a" * 64 + '"\n'
+        '[agent]\nuser = "candidate"\ntimeout_sec = 120\n'
+        '[verifier]\nenvironment_mode = "separate"\nuser = "grader"\ntimeout_sec = 90\n'
+        "[verifier.environment]\nallow_internet = false\ncpus = 1\nmemory_mb = 1024\n"
+        'docker_image = "fixture@sha256:' + "b" * 64 + '"\n'
+    )
+    execution_output = tmp_path / "execution.json"
+    path = materialize_harbor_tasks([str(source)], cache_dir=tmp_path / "prepared", execution_output=execution_output)
+    task = TaskSpec.model_validate_json(pq.read_table(path).column("task_spec")[0].as_py())
+    base = task_dataset([str(path)], Tokenizer()).execution
+    _, sources = source_execution_settings(
+        {
+            **base.model_dump(mode="json"),
+            **json.loads(execution_output.read_text())["environment"]["task_sessions"],
+        }
+    )
+    lowered = task_dataset([str(path)], Tokenizer(), source_executions=sources)[0].lowered
+
+    assert lowered.task == task
+    assert lowered.runtime.task_machine.user == "candidate"
+    assert lowered.runtime.task_machine.network is NetworkPolicy.ALLOW
+    assert lowered.runtime.task_machine.cpus == 2
+    assert lowered.runtime.task_machine.memory_mb == 1536
+    assert lowered.runtime.verifier_machine.user == "grader"
+    assert lowered.runtime.verifier_machine.network is NetworkPolicy.DENY
+    assert lowered.runtime.verifier_machine.cpus == 1
+    assert lowered.session.total_turn_timeout == 120
+    assert lowered.session.verifier_timeout == 90
 
 
 @pytest.mark.asyncio
@@ -173,7 +213,7 @@ async def test_disabled_harbor_verification_keeps_tokens_but_masks_training(
     path = materialize_harbor_tasks(
         [str(source)],
         cache_dir=tmp_path / "disabled",
-        grader_override=settings.grader_override(),
+        grader_override=NoGrader(reason="Verification is disabled"),
     )
     prepared = task_dataset([str(path)], Tokenizer())
     task = prepared[0]

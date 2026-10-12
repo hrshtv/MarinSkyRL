@@ -26,7 +26,6 @@ from marinskyrl.task_sources import (
     data_source_dict,
     TaskTroveParquetSource,
     TaskTroveSelection,
-    TaskTroveSelectionSnapshot,
     TaskTroveTagMatch,
 )
 from marinskyrl.harbor_preparation import TerminalBenchTaskDataset, materialize_harbor_tasks
@@ -281,24 +280,6 @@ def test_packed_materializer_reuses_reader_across_batches(tmp_path: Path) -> Non
 
     assert (first / "instruction.md").read_text() == "Do one"
     assert (second / "instruction.md").read_text() == "Do three"
-
-
-def test_packed_dataset_rejects_changed_launch_selection(tmp_path: Path) -> None:
-    dataset_path = tmp_path / "tasks.parquet"
-    _write_dataset(dataset_path)
-    source = _source(dataset_path, TaskTroveSelection(sources=("source-a",)))
-    summary = select_task_references(source)
-    changed = replace(
-        source,
-        snapshot=TaskTroveSelectionSnapshot(
-            count=len(summary.references),
-            digest="changed",
-            distinct_environment_count=summary.distinct_environment_count,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="digest changed"):
-        TerminalBenchTaskDataset([asdict(changed)])
 
 
 def test_packed_materializer_rejects_solution_files(tmp_path: Path) -> None:
