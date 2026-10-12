@@ -5,11 +5,11 @@ from unittest.mock import patch
 from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
-from rolloutengine.spec import LoweredTaskSpec
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, SourceTaskDataset
+from skyrl_train.dataset.tasks import SourceTaskDataset
 from skyrl_train.entrypoints.main_base import BasePPOExp
+from skyrl_train.trajectory_runners.types import task_messages
 
 
 class _StubTokenizer:
@@ -66,14 +66,14 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert dataset is not None
     assert len(dataset) == 2
     rows = dataset.collate_fn([dataset[0], dataset[1]])
-    assert [row["prompt"] for row in rows] == [
+    assert [task_messages(row["input"].lowered) for row in rows] == [
         [{"role": "user", "content": "short prompt"}],
         [{"role": "user", "content": "a" * 120}],
     ]
     assert [row["uid"] for row in rows] == ["0", "1"]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in rows]
+    tasks = [row["input"].lowered.task for row in rows]
     assert [task.source.row for task in tasks] == ["0", "1"]
-    assert all(row["env_class"] == "gsm8k" for row in rows)
+    assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
 
 
 @pytest.mark.parametrize("num_workers", [1, 2])
@@ -100,8 +100,8 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
         num_workers=num_workers,
     )
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [row["prompt"] for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in prepared]
+    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
+    tasks = [row["input"].lowered.task for row in prepared]
     assert [task.source.row for task in tasks] == ["0", "2"]
     assert dataset.dataframe.cache_files == []
 
