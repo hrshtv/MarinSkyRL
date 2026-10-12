@@ -136,13 +136,12 @@ def test_tasktrove_selection_combines_source_tags_and_modes(tmp_path: Path) -> N
         TaskTroveSelection(sources=("source-a",), tags=("bash",), modes=("script",)),
     )
 
-    summary = select_task_references(source)
+    references = select_task_references(source)
 
-    assert [(reference.row_group, reference.path) for reference in summary.references] == [
+    assert [(reference.row_group, reference.path) for reference in references] == [
         (0, "task-1"),
         (1, "task-3"),
     ]
-    assert summary.distinct_environment_count == 1
 
 
 def test_tasktrove_any_tags_and_limit_have_stable_nested_membership(tmp_path: Path) -> None:
@@ -158,7 +157,7 @@ def test_tasktrove_any_tags_and_limit_have_stable_nested_membership(tmp_path: Pa
     two = select_task_references(_source(dataset_path, selection))
     three = select_task_references(_source(dataset_path, TaskTroveSelection(**{**asdict(selection), "limit": 3})))
 
-    assert {reference.uid() for reference in two.references} < {reference.uid() for reference in three.references}
+    assert {reference.uid() for reference in two} < {reference.uid() for reference in three}
 
 
 def test_tasktrove_selection_rejects_unknown_source(tmp_path: Path) -> None:
@@ -270,7 +269,7 @@ async def test_packed_tasks_execute_after_source_removal(tmp_path, verification)
 def test_packed_materializer_reuses_reader_across_batches(tmp_path: Path) -> None:
     dataset_path = tmp_path / "tasks.parquet"
     _write_dataset(dataset_path)
-    references = select_task_references(_source(dataset_path, TaskTroveSelection(sources=("source-a",)))).references
+    references = select_task_references(_source(dataset_path, TaskTroveSelection(sources=("source-a",))))
     materializer = PackedTaskMaterializer(tmp_path / "cache")
 
     first = materializer.materialize_batch([references[0]])[references[0]]
@@ -286,7 +285,7 @@ def test_packed_materializer_rejects_solution_files(tmp_path: Path) -> None:
     dataset_path = tmp_path / "tasks.parquet"
     _write_dataset(dataset_path, include_solution=True)
     source = _source(dataset_path, TaskTroveSelection(sources=("source-c",)))
-    reference = select_task_references(source).references[0]
+    reference = select_task_references(source)[0]
 
     with pytest.raises(PackedTaskArchiveError, match="solution"):
         PackedTaskMaterializer(tmp_path / "cache").materialize_batch([reference])
@@ -296,7 +295,7 @@ def test_packed_materializer_rejects_parent_traversal(tmp_path: Path) -> None:
     dataset_path = tmp_path / "tasks.parquet"
     _write_dataset(dataset_path, include_unsafe_path=True)
     source = _source(dataset_path, TaskTroveSelection(sources=("source-c",)))
-    reference = select_task_references(source).references[0]
+    reference = select_task_references(source)[0]
 
     with pytest.raises(PackedTaskArchiveError, match="Unsafe task archive path"):
         PackedTaskMaterializer(tmp_path / "cache").materialize_batch([reference])

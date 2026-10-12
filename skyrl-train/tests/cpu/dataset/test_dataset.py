@@ -163,7 +163,7 @@ def test_prompt_dataset_hf_split_selection(
         return
     dataset = build()
     assert len(dataset) == 2
-    messages, _env, extra, _uid = dataset[1]
+    messages, extra, _uid = dataset[1]
     assert messages == "a" * 120
     assert extra == {"answer": "a2"}
 
@@ -179,10 +179,9 @@ def test_prompt_dataset_uids(mock_load_dataset, sample_dataset, mock_tokenizer):
         max_prompt_length=1024,
         num_workers=1,
         prompt_key="prompt",
-        env_class_key="env_class",
     )
     rows = [ds[i] for i in range(len(ds))]
-    uids = [row[3] for row in rows]
+    uids = [row[2] for row in rows]
 
     # UID is simply the row index
     assert uids[0] == "0"
@@ -190,6 +189,6 @@ def test_prompt_dataset_uids(mock_load_dataset, sample_dataset, mock_tokenizer):
     assert len(set(uids)) == len(uids)
 
     rows_again = [ds[i] for i in range(len(ds))]
-    uids_again = [row[3] for row in rows_again]
+    uids_again = [row[2] for row in rows_again]
     # When sampled the second time, UIDs should not change
     assert uids_again == uids

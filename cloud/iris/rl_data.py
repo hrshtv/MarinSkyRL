@@ -1,4 +1,4 @@
-"""Stage prepared training data without source conversion."""
+"""RL data staging and launch geometry checks."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _stage_remote_file(uri: str, destination: Path, *, overwrite: bool) -> None:
         staging.unlink(missing_ok=True)
 
 
-def resolve_rl_train_data_with_sources(
+def resolve_rl_train_data(
     train_data: list[str | dict[str, Any]],
     scratch_dir: str | None = None,
     on_exist: str = "skip",

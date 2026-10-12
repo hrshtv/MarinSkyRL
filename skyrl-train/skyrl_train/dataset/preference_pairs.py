@@ -87,7 +87,7 @@ class PreferencePairDataset(PromptDataset):
         super().__init__(tokenizer=tokenizer, **kwargs)
 
     def __getitem__(self, index: int) -> PreferenceInput:
-        prompt, _, preference, uid = super().__getitem__(index)
+        prompt, preference, uid = super().__getitem__(index)
         extra_info = preference.get("extra_info") or {}
         return PreferenceInput(
             prompt=prompt,

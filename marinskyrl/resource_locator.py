@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import os
 import posixpath
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 CLOUD_URI_SCHEMES = frozenset({"s3", "gs", "gcs"})
 CLOUD_URI_PREFIXES = tuple(f"{scheme}://" for scheme in sorted(CLOUD_URI_SCHEMES))
@@ -69,12 +69,6 @@ class HFDatasetSelector:
         revision = f"{HF_SELECTOR_REVISION_SEPARATOR}{self.revision}" if self.revision else ""
         subdir = f"{HF_SELECTOR_SUBDIR_SEPARATOR}{self.subdir}" if self.subdir else ""
         return f"{self.repo_id}{revision}{subdir}"
-
-    def cache_name(self) -> str:
-        """Return a reversible cache key that includes every selector component."""
-        components = (("repo", self.repo_id), ("subdir", self.subdir), ("revision", self.revision))
-        encoded = ((name, quote(value, safe="-._")) for name, value in components if value is not None)
-        return "__".join(f"{name}-{len(value)}-{value}" for name, value in encoded)
 
 
 def parse_hf_dataset_selector(value: str) -> HFDatasetSelector | None:

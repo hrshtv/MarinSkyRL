@@ -26,7 +26,7 @@ from cloud.iris.artifacts import fs_and_path
 from cloud.iris.rl_data import (
     check_rl_environment,
     compute_num_inference_engines,
-    resolve_rl_train_data_with_sources,
+    resolve_rl_train_data,
 )
 from marinskyrl.process_diagnostics import ProcessOutcomeKind, write_process_outcome
 from marinskyrl.resource_locator import is_cloud_uri, model_source_for_path
@@ -150,7 +150,7 @@ class LocalRLRunner:
             if not values:
                 continue
             print(f"\nResolving {role} data: {values}")
-            resolved = resolve_rl_train_data_with_sources(values)
+            resolved = resolve_rl_train_data(values)
             paths = list(resolved.paths)
             sources = list(resolved.sources)
             setattr(self.config, attribute, paths)

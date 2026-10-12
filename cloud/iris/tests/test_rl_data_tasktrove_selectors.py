@@ -18,13 +18,6 @@ def test_dataset_selector_is_distinct_from_plain_repo_id():
     )
 
 
-def test_cache_names_do_not_confuse_repo_suffixes_with_subdirectories():
-    repo_suffix = HFDatasetSelector("fixture-org/a__b", revision="commit").cache_name()
-    subdirectory = HFDatasetSelector("fixture-org/a", revision="commit", subdir="b").cache_name()
-
-    assert repo_suffix != subdirectory
-
-
 def test_runner_resolves_and_records_training_and_validation_selectors(monkeypatch, tmp_path):
     resolved = {
         "fixture-org/fixture-trove::train": rl_data.ResolvedRLData(
@@ -40,7 +33,7 @@ def test_runner_resolves_and_records_training_and_validation_selectors(monkeypat
     def resolve(values):
         return resolved[values[0]]
 
-    monkeypatch.setattr("cloud.iris.training_driver.resolve_rl_train_data_with_sources", resolve)
+    monkeypatch.setattr("cloud.iris.training_driver.resolve_rl_train_data", resolve)
     launch_config = OmegaConf.create(
         {
             "run": {"mode": "train"},

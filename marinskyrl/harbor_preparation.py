@@ -24,6 +24,7 @@ from marinskyrl.task_preparation import cache_tasks
 from marinskyrl.task_format import HARBOR_ID_PREFIX
 
 MATERIALIZATION_BATCH_SIZE = 64
+HARBOR_SOURCE_PREFIX = "harbor/"
 
 
 def _machine_overrides(environment: EnvironmentConfig, user: str | int | None) -> dict:
@@ -82,8 +83,7 @@ class TerminalBenchTaskDataset:
         return []
 
     def _packed_tasks(self, source: TaskTroveParquetSource) -> list[PackedTaskReference]:
-        summary = select_task_references(source, dataset_path=source.resolved_path())
-        return list(summary.references)
+        return list(select_task_references(source, dataset_path=source.resolved_path()))
 
     def _load_data_files(self) -> list[Path | PackedTaskReference]:
         items: list[Path | PackedTaskReference] = []
@@ -161,7 +161,7 @@ def materialize_harbor_tasks(
                     if isinstance(item, Path):
                         directory = item
                         uid = item.name
-                        source_name = f"harbor/{uid}"
+                        source_name = f"{HARBOR_SOURCE_PREFIX}{uid}"
                     else:
                         directory = directories[item]
                         source_name = item.stable_uri()
@@ -222,7 +222,7 @@ def _cache_harbor_tasks(
 def materialize_harbor_archives(
     input_path: Path, *, cache_dir: Path, execution_output: Path, grader_override: NoGrader | None
 ) -> Path:
-    """Prepare path/task_binary Parquet archives without a trainer extraction step."""
+    """Prepare path/task_binary Parquet archives as a bare TaskSpec artifact."""
 
     def items() -> Iterator[tuple[str, str, Path]]:
         materializer = PackedTaskMaterializer(cache_dir / "archives")
@@ -231,7 +231,7 @@ def materialize_harbor_archives(
                 for row in batch.to_pylist():
                     uid = row["path"]
                     directory = materializer.materialize_archive(row["task_binary"])
-                    yield uid, f"harbor/{uid}", directory
+                    yield uid, f"{HARBOR_SOURCE_PREFIX}{uid}", directory
 
     return _cache_harbor_tasks(items(), cache_dir, grader_override, execution_output)
 
