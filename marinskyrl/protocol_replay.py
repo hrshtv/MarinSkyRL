@@ -18,9 +18,7 @@ class ReplayPartition(StrEnum):
     VALIDATION = "validation"
 
 
-def replay_tasks(
-    cases_path: Path, manifest_path: Path, *, partition: ReplayPartition
-) -> list[TaskSpec]:
+def replay_tasks(cases_path: Path, manifest_path: Path, *, partition: ReplayPartition) -> list[TaskSpec]:
     """Validate replay identity and the selected task partition before preparation."""
     contents = cases_path.read_bytes()
     manifest = json.loads(manifest_path.read_text())

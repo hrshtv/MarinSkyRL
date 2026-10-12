@@ -1,7 +1,16 @@
 import json
 
 from omegaconf import OmegaConf
-from taskcompendium.models import AnswerType, ConversationInput, EnvironmentRequirements, NoGrader, PlainText, Source, TaskSpec, TextMessage
+from taskcompendium.models import (
+    AnswerType,
+    ConversationInput,
+    EnvironmentRequirements,
+    NoGrader,
+    PlainText,
+    Source,
+    TaskSpec,
+    TextMessage,
+)
 
 from skyrl_train.config.rollout_validation import EntrypointOperation
 from skyrl_train.config.utils import get_default_config
@@ -65,18 +74,24 @@ def test_task_generate_builds_complete_evaluation_request(tmp_path):
         }
     )
     source = tmp_path / "tasks.jsonl"
-    source.write_text("\n".join(
-        json.dumps({TASK_SPEC_COLUMN: TaskSpec(
-            id=name,
-            context=ConversationInput(events=(TextMessage(role="user", content=name),)),
-            environment_requirements=EnvironmentRequirements(),
-            answer_type=AnswerType.TEXT,
-            answer_format=PlainText(),
-            grader=NoGrader(reason="Generation fixture"),
-            source=Source(dataset="fixture", revision="1", row=name, importer_revision="1"),
-        ).model_dump_json()})
-        for name in ("task-a", "task-b")
-    ))
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    TASK_SPEC_COLUMN: TaskSpec(
+                        id=name,
+                        context=ConversationInput(events=(TextMessage(role="user", content=name),)),
+                        environment_requirements=EnvironmentRequirements(),
+                        answer_type=AnswerType.TEXT,
+                        answer_format=PlainText(),
+                        grader=NoGrader(reason="Generation fixture"),
+                        source=Source(dataset="fixture", revision="1", row=name, importer_revision="1"),
+                    ).model_dump_json()
+                }
+            )
+            for name in ("task-a", "task-b")
+        )
+    )
 
     class Tokenizer:
         def apply_chat_template(self, messages, add_generation_prompt):
@@ -87,8 +102,12 @@ def test_task_generate_builds_complete_evaluation_request(tmp_path):
         OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True)
     )
     experiment.train_dataset = TaskSpecDataset(
-        [str(source)], experiment.tokenizer, 100,
-        execution=execution, source_executions=source_executions, num_workers=1,
+        [str(source)],
+        experiment.tokenizer,
+        100,
+        execution=execution,
+        source_executions=source_executions,
+        num_workers=1,
     )
     inference_client = object()
 
