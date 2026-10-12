@@ -46,6 +46,14 @@ uv run --project .. --extra megatron --extra vllm -m skyrl_train.entrypoints.mai
   generator.sampling_params.max_generate_length=4096 \
   generator.max_input_length=30720 \
   generator.max_turns=50 \
+  environment.task_sessions.runtime.task_machine.network=allow \
+  environment.task_sessions.runtime.task_machine.memory_mb=8192 \
+  environment.task_sessions.runtime.verifier_machine.network=allow \
+  environment.task_sessions.runtime.verifier_machine.memory_mb=8192 \
+  environment.task_sessions.session.command_timeout=120 \
+  environment.task_sessions.session.total_turn_timeout=3600 \
+  environment.task_sessions.session.verifier_timeout=3600 \
+  environment.task_sessions.session.cleanup_timeout=30 \
   trainer.policy.optimizer_config.lr=1.0e-6 \
   trainer.algorithm.use_kl_loss=true \
   generator.backend=vllm \

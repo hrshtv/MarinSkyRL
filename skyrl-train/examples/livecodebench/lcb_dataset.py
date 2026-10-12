@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from skyrl_gym.envs.data_contracts import normalize_lcb_ground_truth
+from taskcompendium.models import CommandSemantics, EnvironmentRequirements
+
+from marinskyrl.task_format import TASK_SPEC_COLUMN
+from marinskyrl.task_preparation import source_row_task
 
 """Utility functions for loading and processing datasets."""
 
@@ -122,7 +126,15 @@ def process_example(example: Dict[str, Any], idx: int, dataset_name: str, split:
     return data
 
 
-def process_dataset(dataset_name: str, split: str, dataset_dir: str, local_dir: str, max_rows: Optional[int] = None):
+def process_dataset(
+    dataset_name: str,
+    split: str,
+    dataset_dir: str,
+    local_dir: str,
+    max_rows: Optional[int] = None,
+    *,
+    environment: EnvironmentRequirements,
+):
     """Process a dataset for a given split.
 
     Args:
@@ -141,7 +153,14 @@ def process_dataset(dataset_name: str, split: str, dataset_dir: str, local_dir: 
     for idx, example in enumerate(raw_data):
         processed_example = process_example(example, idx, dataset_name, split)
         if processed_example is not None:
-            processed_data.append(processed_example)
+            task = source_row_task(
+                processed_example,
+                idx,
+                source_name=dataset_name,
+                config={},
+                environment=environment,
+            )
+            processed_data.append({TASK_SPEC_COLUMN: task.model_dump_json()})
 
     # Apply max_rows limit if specified
     if max_rows:
@@ -150,14 +169,9 @@ def process_dataset(dataset_name: str, split: str, dataset_dir: str, local_dir: 
     # Save individual dataset files
     df = pd.DataFrame(processed_data)
     parquet_path = os.path.join(local_dir, f"{split}_{dataset_name}.parquet")
-    json_path = os.path.join(local_dir, f"{split}_{dataset_name}.json")
 
     print(f"Writing {len(df)} rows to {split}_{dataset_name}.parquet")
     df.to_parquet(parquet_path)
-
-    if split == "test":
-        print(f"Writing {len(df)} rows to {split}_{dataset_name}.json")
-        df.to_json(json_path, orient="records")
 
     return processed_data
 
@@ -180,7 +194,11 @@ if __name__ == "__main__":
         default=None,
         help="Maximum number of rows to include in output files (truncate if set).",
     )
+    parser.add_argument("--python_image", required=True, help="Prebuilt Python image with an @sha256 digest")
     args = parser.parse_args()
+    environment = EnvironmentRequirements(
+        command_semantics=CommandSemantics.LINUX_PROCESS, docker_image=args.python_image
+    )
 
     local_dir = args.local_dir
     print(f"Local_dir:{local_dir}")
@@ -190,13 +208,14 @@ if __name__ == "__main__":
         os.makedirs(local_dir, exist_ok=True)
 
     # Process train dataset
-    train_data = process_dataset(LIVECODEBENCH, "train", args.dataset_dir, local_dir, args.max_rows)
+    train_data = process_dataset(
+        LIVECODEBENCH, "train", args.dataset_dir, local_dir, args.max_rows, environment=environment
+    )
 
     # Process test dataset
-    val_data = process_dataset(LIVECODEBENCH, "test", args.dataset_dir, local_dir, args.max_rows)
+    process_dataset(LIVECODEBENCH, "test", args.dataset_dir, local_dir, args.max_rows, environment=environment)
 
     # Save combined train dataset
     all_train_df = pd.DataFrame(train_data)
     all_train_df.to_parquet(os.path.join(local_dir, "deepcoder_train.parquet"))
-    all_train_df.to_json(os.path.join(local_dir, "deepcoder_train.json"), orient="records")
-    print(f"Writing {len(all_train_df)} rows to deepcoder_train.parquet and deepcoder_train.json")
+    print(f"Writing {len(all_train_df)} rows to deepcoder_train.parquet")
