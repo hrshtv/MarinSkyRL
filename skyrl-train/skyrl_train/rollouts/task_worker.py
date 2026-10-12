@@ -65,14 +65,10 @@ from skyrl_train.trajectory_runners.model_clients import (
     ModelClient,
     ModelServerError,
 )
-from skyrl_train.trajectory_runners.projections import (
-    StepWiseTrajectoryProjection,
-    WholeTrajectoryProjection,
-    logprobs_requested,
-)
 from skyrl_train.rollouts.task_projections import (
     StepTaskProjection,
     WholeTaskProjection,
+    logprobs_requested,
 )
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig
 from skyrl_train.trajectory_runners.types import (
@@ -429,7 +425,7 @@ class TaskRolloutWorker:
                     request,
                     self.harbor,
                     int(self.trajectory_runner_cfg.sampling_params.max_generate_length),
-                    self.projection.projection.tokenizer,
+                    self.projection.tokenizer,
                     harbor_tasks=[harbor is not None for harbor in harbor_settings],
                 )
         return rollouts
@@ -556,9 +552,9 @@ class TaskRolloutWorkerSpec:
         return TaskRolloutWorker(
             runner_config,
             (
-                StepTaskProjection(StepWiseTrajectoryProjection(runner_config, tokenizer))
+                StepTaskProjection(runner_config, tokenizer)
                 if self.config.trainer.step_wise_training
-                else WholeTaskProjection(WholeTrajectoryProjection(runner_config, tokenizer))
+                else WholeTaskProjection(runner_config, tokenizer)
             ),
             client,
             factories,
