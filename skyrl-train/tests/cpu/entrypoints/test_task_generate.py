@@ -1,10 +1,13 @@
+import json
+
 from omegaconf import OmegaConf
-from rolloutengine.spec import LoweredTaskSpec
-from tests.cpu.task_specs import session_spec
+from taskcompendium.models import AnswerType, ConversationInput, EnvironmentRequirements, NoGrader, PlainText, Source, TaskSpec, TextMessage
 
 from skyrl_train.config.rollout_validation import EntrypointOperation
-from skyrl_train.dataset.harbor import HarborTaskDataset
-from skyrl_train.entrypoints.terminal_bench_generate import TerminalBenchGenerateExp
+from skyrl_train.config.utils import get_default_config
+from skyrl_train.dataset.tasks import TASK_SPEC_COLUMN, TaskSpecDataset
+from skyrl_train.entrypoints.task_generate import TaskGenerateExp
+from skyrl_train.rollouts.task_lowering import source_execution_settings
 from skyrl_train.trajectory_runners.types import BatchMetadata, TrajectoryRequestBatch
 
 
@@ -30,9 +33,9 @@ class RecordingTrajectoryRunner:
         self.events.append("shutdown")
 
 
-def test_terminal_bench_generate_builds_complete_evaluation_request(tmp_path):
+def test_task_generate_builds_complete_evaluation_request(tmp_path):
     runner = RecordingTrajectoryRunner()
-    experiment = object.__new__(TerminalBenchGenerateExp)
+    experiment = object.__new__(TaskGenerateExp)
     experiment.cfg = OmegaConf.create(
         {
             "generator": {
@@ -47,7 +50,7 @@ def test_terminal_bench_generate_builds_complete_evaluation_request(tmp_path):
                     "logprobs": None,
                 },
             },
-            "environment": {"env_class": "terminal_bench"},
+            "environment": {"env_class": "taskcompendium"},
             # run() configures progress and enters the trainer telemetry lifecycle before _run().
             "trainer": {
                 "run_name": "generate",
@@ -61,24 +64,31 @@ def test_terminal_bench_generate_builds_complete_evaluation_request(tmp_path):
             },
         }
     )
-    sources = tmp_path / "sources"
-    for name in ("task-a", "task-b"):
-        source = sources / name
-        (source / "tests").mkdir(parents=True)
-        (source / "instruction.md").write_text(name)
-        (source / "task.toml").write_text(
-            '[environment]\ndocker_image = "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
-            '[verifier]\nenvironment_mode = "separate"\n'
-        )
-        (source / "tests/test.sh").write_text("echo 1 > /logs/verifier/reward.txt\n")
+    source = tmp_path / "tasks.jsonl"
+    source.write_text("\n".join(
+        json.dumps({TASK_SPEC_COLUMN: TaskSpec(
+            id=name,
+            context=ConversationInput(events=(TextMessage(role="user", content=name),)),
+            environment_requirements=EnvironmentRequirements(),
+            answer_type=AnswerType.TEXT,
+            answer_format=PlainText(),
+            grader=NoGrader(reason="Generation fixture"),
+            source=Source(dataset="fixture", revision="1", row=name, importer_revision="1"),
+        ).model_dump_json()})
+        for name in ("task-a", "task-b")
+    ))
 
     class Tokenizer:
         def apply_chat_template(self, messages, add_generation_prompt):
             return [1, 2]
 
     experiment.tokenizer = Tokenizer()
-    experiment.train_dataset = HarborTaskDataset(
-        [str(sources)], experiment.tokenizer, 100, session=session_spec(), cache_dir=tmp_path / "cache", num_workers=1
+    execution, source_executions = source_execution_settings(
+        OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True)
+    )
+    experiment.train_dataset = TaskSpecDataset(
+        [str(source)], experiment.tokenizer, 100,
+        execution=execution, source_executions=source_executions, num_workers=1,
     )
     inference_client = object()
 
@@ -93,15 +103,12 @@ def test_terminal_bench_generate_builds_complete_evaluation_request(tmp_path):
 
     assert runner.events == ["startup", "start_eval generate 0", "run", "stop_eval", "shutdown"]
     assert runner.request is not None
-    assert [prompt[0]["content"] for prompt in runner.request["prompts"]] == ["task-a"] * 8 + ["task-b"] * 8
-    trajectory_ids = runner.request["trajectory_ids"]
+    assert [prompt[0]["content"] for prompt in runner.request.public_prompts] == ["task-a"] * 8 + ["task-b"] * 8
+    trajectory_ids = runner.request.trajectory_ids
     assert trajectory_ids is not None
     assert [trajectory_id.to_string() for trajectory_id in trajectory_ids] == [
         f"task-{task}_{repetition_id}" for task in ("a", "b") for repetition_id in range(8)
     ]
-    assert runner.request["env_classes"] == ["taskcompendium"] * 16
-    assert [
-        LoweredTaskSpec.model_validate_json(extra["lowered_task_spec"]).task.id
-        for extra in runner.request["env_extras"]
-    ] == (["task-a"] * 8 + ["task-b"] * 8)
-    assert runner.request["batch_metadata"] == BatchMetadata(global_step=0, training_phase="eval")
+    assert [row.metadata.metric_class for row in runner.request.rows] == ["taskcompendium"] * 16
+    assert [row.lowered.task.id for row in runner.request.rows] == ["task-a"] * 8 + ["task-b"] * 8
+    assert runner.request.batch_metadata == BatchMetadata(global_step=0, training_phase="eval")

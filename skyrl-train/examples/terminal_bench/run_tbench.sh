@@ -11,7 +11,7 @@ NUM_GPUS=1
 LOGGER="console"  # change to "console" to print to stdout
 SANDBOXES_DIR="sandboxes" # TODO: For now, `sandboxes` is cloned into SkyRL/skyrl-train.
 
-uv run --isolated --extra megatron --extra vllm --with "litellm[proxy]>=1.67.5" --with "sandbox@./sandboxes" -m skyrl_train.entrypoints.terminal_bench \
+uv run --isolated --extra megatron --extra vllm --with "litellm[proxy]>=1.67.5" --with "sandbox@./sandboxes" -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR']" \
   data.val_data="['$DATA_DIR']" \
   +terminal_bench_config=terminal_bench \

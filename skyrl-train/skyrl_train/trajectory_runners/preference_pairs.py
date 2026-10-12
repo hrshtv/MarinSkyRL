@@ -11,13 +11,14 @@ from typing import Any
 
 from loguru import logger
 
-from skyrl_train.dataset.preference_pairs import PreferencePairFormat, completion_text, tokenized_pair
+from marinskyrl.runtime_options import PreferencePairFormat
+from skyrl_train.dataset.preference_pairs import completion_text, tokenized_pair
 from skyrl_train.rollouts.buffer import RolloutTask, RolloutWriter, write_trajectory_batch
 from skyrl_train.rollouts.finalization import finalize_trajectory_batch
 from skyrl_train.trajectory_runners.trajectory_retention import RetentionSink
 from skyrl_train.trajectory_runners.types import (
     TrajectoryBatch,
-    TrajectoryRequestBatch,
+    PreferenceRequestBatch,
 )
 
 
@@ -96,15 +97,15 @@ class PreferencePairTrajectoryRunner:
             completions.append(completion_ids)
         return prompt_ids, completions
 
-    def _validate_request(self, input_batch: TrajectoryRequestBatch) -> None:
-        prompts = input_batch["prompts"]
-        env_extras = input_batch["env_extras"] or []
+    def _validate_request(self, input_batch: PreferenceRequestBatch) -> None:
+        prompts = input_batch.prompts
+        env_extras = input_batch.preferences
         if len(prompts) % 2 or len(env_extras) != len(prompts):
             raise ValueError(
                 f"preference pairs arrive as chosen/rejected row pairs; got {len(prompts)} rows "
                 f"with {len(env_extras)} extras"
             )
-        trajectory_ids = input_batch.get("trajectory_ids")
+        trajectory_ids = input_batch.trajectory_ids
         if trajectory_ids is None:
             return
         for pair_index in range(len(prompts) // 2):
@@ -115,10 +116,10 @@ class PreferencePairTrajectoryRunner:
             ) != (0, 1):
                 raise ValueError("preference pairs require trajectory IDs ordered as repetition 0 then 1")
 
-    async def run(self, input_batch: TrajectoryRequestBatch) -> TrajectoryBatch:
+    async def run(self, input_batch: PreferenceRequestBatch) -> TrajectoryBatch:
         self._validate_request(input_batch)
-        prompts = input_batch["prompts"]
-        env_extras = input_batch["env_extras"] or []
+        prompts = input_batch.prompts
+        env_extras = input_batch.preferences
 
         prompt_token_ids: list[list[int]] = []
         response_ids: list[list[int]] = []

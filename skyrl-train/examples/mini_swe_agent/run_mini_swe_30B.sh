@@ -18,7 +18,7 @@ TP_SIZE=4
 LOGGER=wandb
 
 # We use a small batch size here for demonstration
-uv run --project .. --extra megatron --extra vllm -m skyrl_train.entrypoints.taskcompendium \
+uv run --project .. --extra megatron --extra vllm -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator="grpo" \

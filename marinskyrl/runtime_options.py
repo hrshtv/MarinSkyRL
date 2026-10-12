@@ -59,10 +59,14 @@ class PolicyLossType(StrEnum):
 PREFERENCE_PAIR_ENV_CLASS = "preference_pair"
 
 
+class PreferencePairFormat(StrEnum):
+    TEXT = "text"
+    TOKENIZED = "tokenized"
+
+
 class EvaluationRunner(StrEnum):
     TRAINING = "training"
     TASK = "task"
-    HARBOR = "harbor"
 
 
 def reference_model_required(algorithm: Mapping[str, Any]) -> bool:

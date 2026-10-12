@@ -16,15 +16,18 @@ from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec, TaskRuntimeS
 from rolloutengine.lowering import SHELLBOX_SESSION
 from rolloutengine.task_session import session_start
 from skyrl_gym.source_task import session_parameters, source_task
-from taskcompendium.models import EnvironmentRequirements, SessionGrader, Source
+from taskcompendium.models import EnvironmentRequirements, SessionGrader, Source, TaskSpec
 from taskcompendium.runtime.shell import resolve_shell_tool
 from transformers import PreTrainedTokenizerBase
 
 from skyrl_train.dataset.dataset import PromptDataset
 from skyrl_train.rollouts.group_grader import task_group_grader
+from skyrl_train.rollouts.task_lowering import TaskExecutionSettings, lowered_task
+from skyrl_train.trajectory_runners.types import TaskInput, TrajectoryMetadata, task_messages
 
 TASKCOMPENDIUM_ENVIRONMENT = "taskcompendium"
 LOWERED_TASK_COLUMN = "lowered_task_spec"
+TASK_SPEC_COLUMN = "task_spec"
 TASK_SCHEMA = pa.schema([pa.field(LOWERED_TASK_COLUMN, pa.string(), nullable=False)])
 PARQUET_BATCH_SIZE = 1024
 
@@ -57,6 +60,77 @@ class TaskDataset(PromptDataset):
 
     def prepare_dataset(self, dataset):
         return dataset.map(_stored_task_prompt, num_proc=self.num_workers)
+
+
+class TaskSpecDataset(PromptDataset):
+    """Load prepared TaskSpecs and add the run's machine and session settings."""
+
+    def __init__(
+        self,
+        datasets: Sequence[str],
+        tokenizer: PreTrainedTokenizerBase,
+        max_prompt_length: int,
+        *,
+        execution: TaskExecutionSettings,
+        source_executions: Mapping[str, TaskExecutionSettings],
+        num_workers: int = 8,
+    ):
+        self.execution = execution
+        self.source_executions = source_executions
+        super().__init__(list(datasets), tokenizer, max_prompt_length, num_workers=num_workers)
+
+    def prepare_dataset(self, dataset: Dataset) -> Dataset:
+        if TASK_SPEC_COLUMN not in dataset.column_names:
+            raise ValueError("Generated RL requires prepared TaskSpec JSON in the task_spec column")
+        return dataset.map(
+            partial(_task_spec_prompt, execution=self.execution, source_executions=self.source_executions),
+            num_proc=self.num_workers,
+            keep_in_memory=True,
+        )
+
+    def uid(self, index: int) -> str:
+        return self.dataframe[index]["task_id"]
+
+    def __getitem__(self, index: int) -> TaskInput:
+        row = self.dataframe[index]
+        task = TaskSpec.model_validate_json(row[TASK_SPEC_COLUMN])
+        lowered = lowered_task(task, self.source_executions.get(task.source.dataset, self.execution))
+        extras = session_parameters(task).extras if isinstance(task.grader, SessionGrader) else {}
+        ultra = (extras.get("extra_info") or {}).get("nemotron_ultra") or {}
+        metric_tags = (
+            (f"nemotron_ultra/coverage/{ultra['blend']}/{ultra['agent']}",)
+            if "blend" in ultra and "agent" in ultra
+            else ()
+        )
+        return TaskInput(
+            lowered=lowered,
+            metadata=TrajectoryMetadata(
+                uid=task.id,
+                metric_class=TASKCOMPENDIUM_ENVIRONMENT
+                if lowered.session.task_session == SHELLBOX_SESSION
+                else lowered.session.task_session,
+                data_source=task.source.dataset,
+                teacher_route=row.get("teacher_route"),
+                metric_tags=metric_tags,
+            ),
+            group_grader=task_group_grader(lowered),
+        )
+
+    def collate_fn(self, rows: Sequence[TaskInput]) -> list[dict]:
+        return [{"uid": row.metadata.uid, "input": row} for row in rows]
+
+
+def _task_spec_prompt(
+    row: dict,
+    *,
+    execution: TaskExecutionSettings,
+    source_executions: Mapping[str, TaskExecutionSettings],
+) -> dict:
+    task = TaskSpec.model_validate_json(row[TASK_SPEC_COLUMN])
+    return {
+        "prompt": task_messages(lowered_task(task, source_executions.get(task.source.dataset, execution))),
+        "task_id": task.id,
+    }
 
 
 def _stored_task_prompt(row: dict) -> dict:

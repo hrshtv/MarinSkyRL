@@ -24,24 +24,20 @@ def test_resolve_daytona_rl_api_key_rejects_generic_key(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("entrypoint", "terminal_bench_data", "backend", "expected"),
+    ("harbor", "expected"),
     [
-        ("skyrl_train.entrypoints.main_base", [], "daytona", False),
-        ("skyrl_train.entrypoints.terminal_bench", [], "daytona", True),
-        ("skyrl_train.entrypoints.terminal_bench_generate", [], "daytona", True),
-        ("skyrl_train.entrypoints.terminal_bench", [], "docker", False),
-        ("skyrl_train.entrypoints.main_base", ["s3://bucket/tasks.parquet"], "docker", False),
-        # Nemotron Ultra routing sends its SWE rows to Harbor from the standard entrypoint.
-        ("skyrl_train.entrypoints.main_base", ["s3://bucket/tasks.parquet"], "daytona", True),
+        (None, False),
+        ({"harbor": {"environment_type": "daytona"}}, True),
+        ({"harbor": {"environment_type": "docker"}}, False),
     ],
 )
-def test_daytona_preflight_follows_task_backend(entrypoint, terminal_bench_data, backend, expected):
+@pytest.mark.parametrize("entrypoint", ["skyrl_train.entrypoints.main_base", "skyrl_train.entrypoints.task_generate"])
+def test_daytona_preflight_follows_task_backend(entrypoint, harbor, expected):
     config = OmegaConf.create(
         {
             "runtime": {"entrypoint": entrypoint},
             "skyrl": {
-                "data": {"terminal_bench_data": terminal_bench_data},
-                "terminal_bench_config": {"harbor": {"environment_type": backend}},
+                "terminal_bench_config": harbor,
             },
         }
     )

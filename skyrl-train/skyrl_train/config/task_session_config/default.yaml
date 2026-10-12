@@ -2,6 +2,7 @@
 max_verifier_workers: 32 # verifier threads in each rollout worker
 
 session:
+  task_session: shellbox
   max_turns: ${generator.max_turns}
   model_turn_timeout: null
   command_timeout: ${trajectory_runner.command_timeout}
@@ -10,6 +11,22 @@ session:
   attempt_timeout: null
   verifier_timeout: null
   cleanup_timeout: ${trajectory_runner.cleanup_timeout}
+
+runtime:
+  task_machine: &task_machine_runtime
+    backend: docker
+    network: deny
+    cpus: null
+    memory_mb: null
+    storage_mb: null
+    gpus: 0
+    user: null
+    startup_timeout: 600
+    cleanup_timeout: null
+  verifier_machine: *task_machine_runtime
+
+# Each source can override runtime and session settings. Task definitions stay in the input dataset.
+sources: {}
 
 lcb:
   machine: &python_machine

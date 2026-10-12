@@ -1,5 +1,3 @@
-import pytest
-
 from cloud.iris.role_plan import ModelRoleKind, RoleExecution, derive_num_nodes, derive_role_plan
 
 
@@ -62,9 +60,8 @@ def test_generation_launch_keeps_its_rollout_role():
     assert derive_num_nodes(plan) == 2
 
 
-@pytest.mark.parametrize("runner", ["task", "harbor"])
-def test_preference_pair_task_validation_reserves_generation_capacity(runner):
-    plan = derive_role_plan(skyrl_config(**{"trainer.evaluation_runner": runner}))
+def test_preference_pair_task_validation_reserves_generation_capacity():
+    plan = derive_role_plan(skyrl_config(**{"trainer.evaluation_runner": "task"}))
     assert sorted(claim.kind.value for claim in plan.claims) == ["policy", "reference", "rollout"]
     assert derive_num_nodes(plan) == 2
     assert plan.claim(ModelRoleKind.ROLLOUT).execution is RoleExecution.LOCAL

@@ -207,7 +207,7 @@ def test_composed_launch_rejects_kl_switches(tmp_path: Path, switch: str) -> Non
     [
         ("standard", 0, "sync"),
         ("standard", 2, "async"),
-        ("terminal_bench", 1, "async"),
+        ("standard", 1, "async"),
         ("generate", 0, None),
     ],
 )

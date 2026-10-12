@@ -6,10 +6,35 @@ from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
 from rolloutengine.spec import LoweredTaskSpec
+from taskcompendium.models import (
+    AnswerType,
+    ConversationInput,
+    EnvironmentRequirements,
+    NoGrader,
+    PlainText,
+    Source,
+    TaskSpec,
+    TextMessage,
+)
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, SourceTaskDataset
+from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TASK_SPEC_COLUMN, SourceTaskDataset, TaskSpecDataset
 from skyrl_train.entrypoints.main_base import BasePPOExp
+from skyrl_train.rollouts.task_lowering import source_execution_settings
+
+
+def task_row(prompt: str, index: int) -> dict:
+    return {
+        TASK_SPEC_COLUMN: TaskSpec(
+            id=f"fixture-{index}",
+            context=ConversationInput(events=(TextMessage(role="user", content=prompt),)),
+            environment_requirements=EnvironmentRequirements(),
+            answer_type=AnswerType.TEXT,
+            answer_format=PlainText(),
+            grader=NoGrader(reason="Prompt-filtering fixture"),
+            source=Source(dataset="fixture", revision="1", row=str(index), importer_revision="1"),
+        ).model_dump_json()
+    }
 
 
 class _StubTokenizer:
@@ -44,14 +69,10 @@ def sample_dataset():
 
 
 @pytest.mark.parametrize("probe_enabled", [False, True], ids=["evaluation", "probe_without_evaluation"])
-def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_enabled):
+def test_eval_dataset_filtering(mock_tokenizer, tmp_path, probe_enabled):
     path = tmp_path / "validation.parquet"
-    sample_dataset.map(
-        lambda row: {
-            "prompt": [{"role": "user", "content": row["prompt"]}],
-            "env_class": "gsm8k",
-            "reward_spec": {"ground_truth": row["answer"]},
-        }
+    Dataset.from_list(
+        [task_row(content, index) for index, content in enumerate(("short prompt", "a" * 40, "b" * 200))]
     ).to_parquet(path)
     experiment = object.__new__(BasePPOExp)
     experiment.cfg = get_default_config()
@@ -66,14 +87,56 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert dataset is not None
     assert len(dataset) == 2
     rows = dataset.collate_fn([dataset[0], dataset[1]])
-    assert [row["prompt"] for row in rows] == [
-        [{"role": "user", "content": "short prompt"}],
-        [{"role": "user", "content": "a" * 120}],
-    ]
-    assert [row["uid"] for row in rows] == ["0", "1"]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in rows]
+    assert [row["input"].lowered.task.context.events[0].content for row in rows] == ["short prompt", "a" * 40]
+    assert [row["uid"] for row in rows] == ["fixture-0", "fixture-1"]
+    tasks = [row["input"].lowered.task for row in rows]
     assert [task.source.row for task in tasks] == ["0", "1"]
-    assert all(row["env_class"] == "gsm8k" for row in rows)
+    assert all(row["input"].metadata.metric_class == "taskcompendium" for row in rows)
+
+
+@pytest.mark.parametrize("source_max_turns", [None, 3])
+def test_task_specs_preserve_definitions_and_use_run_session_settings(tmp_path, source_max_turns):
+    source = tmp_path / "tasks.jsonl"
+    input_row = task_row("Prepared task", 0)
+    source.write_text(json.dumps(input_row))
+    cfg = get_default_config()
+    cfg.generator.max_turns = 2
+    if source_max_turns is not None:
+        OmegaConf.update(
+            cfg,
+            "environment.task_sessions.sources.fixture",
+            {"session": {"max_turns": source_max_turns}},
+            force_add=True,
+        )
+    execution, source_executions = source_execution_settings(
+        OmegaConf.to_container(cfg.environment.task_sessions, resolve=True)
+    )
+    dataset = TaskSpecDataset(
+        [str(source)],
+        _StubTokenizer(),
+        100,
+        execution=execution,
+        source_executions=source_executions,
+        num_workers=1,
+    )
+    lowered = dataset[0].lowered
+
+    assert lowered.task == TaskSpec.model_validate_json(input_row[TASK_SPEC_COLUMN])
+    assert lowered.session.max_turns == (source_max_turns or 2)
+    assert lowered.runtime.task_machine is None
+    assert lowered.runtime.verifier_machine is None
+    assert dataset.dataframe.cache_files == []
+
+
+def test_generated_rl_rejects_unprepared_source_rows(tmp_path):
+    source = tmp_path / "raw.jsonl"
+    source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Raw question"}], "env_class": "gsm8k"}))
+    experiment = object.__new__(BasePPOExp)
+    experiment.cfg = get_default_config()
+    experiment.tokenizer = _StubTokenizer()
+
+    with pytest.raises(ValueError, match="prepared TaskSpec"):
+        experiment.task_dataset([str(source)])
 
 
 @pytest.mark.parametrize("num_workers", [1, 2])

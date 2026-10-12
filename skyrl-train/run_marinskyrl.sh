@@ -15,7 +15,7 @@ CKPTS_DIR="/home/ec2-user/marinskyrl/ckpts"
 EXPORTS_DIR="/home/ec2-user/marinskyrl/exports"
 
 # Run SkyRL command
-python -m skyrl_train.entrypoints.terminal_bench \
+python -m skyrl_train.entrypoints.main_base \
   data.train_data=$TRAIN_DATA \
   data.val_data=$EVAL_DATA \
   trainer.policy.model.path=open-thoughts/OpenThinker-Agent-v1-SFT \
