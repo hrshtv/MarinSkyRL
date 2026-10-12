@@ -794,6 +794,7 @@ class TrajectorySink:
             execute_publication,
             publish_timeout_seconds=config.publish_timeout_seconds,
             shutdown_timeout_seconds=config.shutdown_timeout_seconds,
+            reuse_process=config.reuse_publication_process,
         )
         self._lock = threading.Lock()
         # Includes the queued records, so selection sees every record the sink has accepted.
@@ -844,6 +845,7 @@ class TrajectorySink:
             if not self._queued:
                 return
             result = self.publisher.execute(self._queued_publication())
+            self.publisher.close()
             if result.error is not None:
                 logger.error("Trajectory retention publication did not finish during shutdown: {}", result.error)
 

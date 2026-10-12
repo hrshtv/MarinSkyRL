@@ -24,6 +24,7 @@ class TrajectoryRetentionConfig:
     required: bool = False
     publish_timeout_seconds: float = 120.0
     shutdown_timeout_seconds: float = 30.0
+    reuse_publication_process: bool = False
     redact_fields: tuple[str, ...] = ()
     model_path: str | None = None
     model_source_identity: str | None = None
@@ -69,6 +70,7 @@ def parse_trajectory_retention_config(config: Mapping[str, Any] | None) -> Traje
         required=bool(config.get("required", defaults.required)),
         publish_timeout_seconds=float(config.get("publish_timeout_seconds", defaults.publish_timeout_seconds)),
         shutdown_timeout_seconds=float(config.get("shutdown_timeout_seconds", defaults.shutdown_timeout_seconds)),
+        reuse_publication_process=bool(config.get("reuse_publication_process", defaults.reuse_publication_process)),
         redact_fields=tuple(str(field) for field in redact_value),
         model_path=_optional_string(config.get("model_path", defaults.model_path)),
         model_source_identity=_optional_string(config.get("model_source_identity", defaults.model_source_identity)),

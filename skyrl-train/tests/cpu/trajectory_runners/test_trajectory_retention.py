@@ -774,14 +774,18 @@ def test_disabled_sink_is_a_noop(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_storage_worker_is_terminated_at_the_publication_deadline():
+@pytest.mark.parametrize("reuse", [False, True])
+def test_storage_worker_is_terminated_at_the_publication_deadline(reuse):
     publisher = ProcessTrajectoryPublisher(
         _never_finishes,
         publish_timeout_seconds=0.05,
         shutdown_timeout_seconds=0.05,
+        reuse_process=reuse,
     )
 
-    result = publisher.execute(PublicationRequest("blocked", PublicationOperation.PUBLISH, "/unused"))
+    result = publisher.execute(
+        PublicationRequest("blocked", PublicationOperation.PUBLISH, "/unused", archives={"large.zip": b"x" * 8_000_000})
+    )
 
     assert result.timed_out
     assert result.error is not None
@@ -807,6 +811,24 @@ def test_storage_worker_process_writes_archives_and_returns_the_ledger(tmp_path)
     assert result.error is None
     assert result.ledger == _empty_ledger()
     assert (tmp_path / "archive.zip").read_bytes() == b"payload"
+
+
+def test_reused_storage_worker_publishes_multiple_archives_without_losing_records(tmp_path):
+    sink = _sink(
+        _config(tmp_path, reuse_publication_process=True, sample_count_per_step=0, sample_fraction=1.0),
+        publisher=ProcessTrajectoryPublisher(
+            execute_publication, publish_timeout_seconds=120, shutdown_timeout_seconds=30, reuse_process=True
+        ),
+    )
+    try:
+        for step in (7, 8, 9):
+            metrics = sink.retain(_input(step=step), _output())
+            assert metrics["generate/trajectory_retention/written"] == 3
+    finally:
+        sink.close()
+    records = _records(tmp_path)
+    assert len(records) == 9
+    assert {record["global_step"] for record in records} == {7, 8, 9}
 
 
 def test_initialization_reconciles_archive_written_before_ledger_commit(tmp_path):
