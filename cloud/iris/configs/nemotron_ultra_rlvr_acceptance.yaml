@@ -1,5 +1,5 @@
 # One-off acceptance run for every generator in both released blends.
-# The sample and exact TaskTrove proxy sidechannel are immutable campaign artifacts.
+# Supply a prepared TaskSpec sample before launch.
 entrypoint: standard
 
 config_groups:
@@ -117,6 +117,5 @@ extra_env:
   RAY_DEDUP_LOGS: "0"
 
 data:
-  train_data:
-    - s3://marin-us-east-02a/marin/users/benfeuer/datasets/snowball-ultra-rlvr/20260912-79f8eda15ea12e1adf7bb14dcb338a29d391b80e/acceptance-tasktrove-v1/sample.parquet
+  train_data: []
   val_data: []
