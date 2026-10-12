@@ -11,7 +11,7 @@ from typing import Any
 import pyarrow.parquet as pq
 from loguru import logger
 from transformers import PreTrainedTokenizerBase
-from skyrl_train.dataset.harbor_import import harbor_task
+from marinskyrl.harbor_import import harbor_task
 from harbor_config.models.task.config import EnvironmentConfig, TaskConfig
 from rolloutengine.lowering import SHELLBOX_SESSION
 from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec, TaskRuntimeSpec, TaskSessionSpec
