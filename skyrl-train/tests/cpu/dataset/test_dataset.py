@@ -5,11 +5,36 @@ from unittest.mock import patch
 from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
+from taskcompendium.models import (
+    AnswerType,
+    ConversationInput,
+    EnvironmentRequirements,
+    NoGrader,
+    PlainText,
+    Source,
+    TaskSpec,
+    TextMessage,
+)
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import SourceTaskDataset
+from marinskyrl.task_format import TASK_SPEC_COLUMN
 from skyrl_train.entrypoints.main_base import BasePPOExp
-from skyrl_train.task_inputs import task_messages
+from tests.cpu.task_specs import text_task
+from tests.cpu.tiny_training.tiny_model import build_tiny_policy
+
+
+def task_row(prompt: str, index: int) -> dict:
+    return {
+        TASK_SPEC_COLUMN: TaskSpec(
+            id=f"fixture-{index}",
+            context=ConversationInput(events=(TextMessage(role="user", content=prompt),)),
+            environment_requirements=EnvironmentRequirements(),
+            answer_type=AnswerType.TEXT,
+            answer_format=PlainText(),
+            grader=NoGrader(reason="Prompt-filtering fixture"),
+            source=Source(dataset="fixture", revision="1", row=str(index), importer_revision="1"),
+        ).model_dump_json()
+    }
 
 
 class _StubTokenizer:
@@ -44,14 +69,10 @@ def sample_dataset():
 
 
 @pytest.mark.parametrize("probe_enabled", [False, True], ids=["evaluation", "probe_without_evaluation"])
-def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_enabled):
+def test_eval_dataset_filtering(mock_tokenizer, tmp_path, probe_enabled):
     path = tmp_path / "validation.parquet"
-    sample_dataset.map(
-        lambda row: {
-            "prompt": [{"role": "user", "content": row["prompt"]}],
-            "env_class": "gsm8k",
-            "reward_spec": {"ground_truth": row["answer"]},
-        }
+    Dataset.from_list(
+        [task_row(content, index) for index, content in enumerate(("short prompt", "a" * 40, "b" * 200))]
     ).to_parquet(path)
     experiment = object.__new__(BasePPOExp)
     experiment.cfg = get_default_config()
@@ -66,44 +87,50 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert dataset is not None
     assert len(dataset) == 2
     rows = dataset.collate_fn([dataset[0], dataset[1]])
-    assert [task_messages(row["input"].lowered) for row in rows] == [
-        [{"role": "user", "content": "short prompt"}],
-        [{"role": "user", "content": "a" * 120}],
-    ]
-    assert [row["uid"] for row in rows] == ["0", "1"]
+    assert [row["input"].lowered.task.context.events[0].content for row in rows] == ["short prompt", "a" * 40]
+    assert [row["uid"] for row in rows] == ["fixture-0", "fixture-1"]
     tasks = [row["input"].lowered.task for row in rows]
     assert [task.source.row for task in tasks] == ["0", "1"]
-    assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
+    assert all(row["input"].metadata.metric_class == "taskcompendium" for row in rows)
 
 
-@pytest.mark.parametrize("num_workers", [1, 2])
-def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, num_workers):
-    rows = [
-        {
-            "prompt": [{"role": "user", "content": content}],
-            "env_class": "gsm8k",
-            "reward_spec": {"ground_truth": "PRIVATE_ANSWER"},
-            "teacher_route": "math",
-            "data_source": "fixture",
-            "extra_info": {"grade": index},
-        }
-        for index, content in enumerate(("First question", "x" * 200, "Last question"))
-    ]
-    source = tmp_path / "source.jsonl"
-    source.write_text("\n".join(json.dumps(row) for row in rows))
+def test_generated_rl_rejects_unprepared_source_rows(tmp_path):
+    source = tmp_path / "raw.jsonl"
+    source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Raw question"}], "env_class": "gsm8k"}))
+    experiment = object.__new__(BasePPOExp)
+    experiment.cfg = get_default_config()
+    experiment.tokenizer = _StubTokenizer()
 
-    dataset = SourceTaskDataset(
-        [str(source)],
-        _StubTokenizer(),
-        100,
-        environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
-        num_workers=num_workers,
+    with pytest.raises(ValueError, match="prepared TaskSpec"):
+        experiment.task_dataset([str(source)])
+
+
+@pytest.mark.parametrize("override_source", ["train-source", "val-source", "misspelled-source"])
+def test_driver_matches_source_overrides_against_train_and_eval_tasks(tmp_path, override_source):
+    train_path = tmp_path / "train.jsonl"
+    eval_path = tmp_path / "eval.jsonl"
+    for path, source in ((train_path, "train-source"), (eval_path, "val-source")):
+        path.write_text(json.dumps({TASK_SPEC_COLUMN: text_task(source, source=source).model_dump_json()}))
+    cfg = get_default_config()
+    cfg.trainer.policy.model.path = str(build_tiny_policy(tmp_path / "model"))
+    cfg.trainer.train_batch_size = 1
+    cfg.trainer.eval_interval = 1
+    cfg.trainer.placement.colocate_all = False
+    cfg.data.train_data = [str(train_path)]
+    cfg.data.val_data = [str(eval_path)]
+    OmegaConf.update(
+        cfg,
+        f"environment.task_sessions.sources.{override_source}",
+        {"session": {"max_turns": 3}},
+        force_add=True,
     )
-    prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [row["input"].lowered.task for row in prepared]
-    assert [task.source.row for task in tasks] == ["0", "2"]
-    assert dataset.dataframe.cache_files == []
+    if override_source == "misspelled-source":
+        with pytest.raises(ValueError, match="Unknown task execution sources"):
+            BasePPOExp(cfg)
+        return
+    experiment = BasePPOExp(cfg)
+    selected = experiment.train_dataset if override_source == "train-source" else experiment.eval_dataset
+    assert selected[0].lowered.session.max_turns == 3
 
 
 @patch("datasets.load_dataset")

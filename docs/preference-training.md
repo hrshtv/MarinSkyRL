@@ -1,6 +1,6 @@
 # Preference training and task validation
 
-Select `algorithm_recipe=dpo` and set `environment.env_class=preference_pair`.
+Select `algorithm_recipe=dpo` and set `data.preference_pair_format=text`.
 Each training row is one chosen/rejected pair. Set
 `generator.n_samples_per_prompt=2`; the runner emits the chosen completion
 first and the rejected completion second.

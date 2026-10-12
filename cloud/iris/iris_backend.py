@@ -45,8 +45,6 @@ from cloud.iris.ray_storage import (
 from cloud.iris.rl_config_translation import (
     RL_CONFIG_PAYLOAD_ENV,
     RL_CONFIG_TASK_DIR,
-    RL_ENTRYPOINTS,
-    RLEntrypoint,
 )
 from marinskyrl.resource_locator import (
     is_cloud_uri,
@@ -644,10 +642,7 @@ def _effective_gdn_backend(args: SimpleNamespace) -> str:
 
 def _rl_config_uses_daytona(config: DictConfig) -> bool:
     """Return whether the configured task backend requires Daytona credentials."""
-    uses_harbor = str(config.runtime.entrypoint) in {
-        RL_ENTRYPOINTS[RLEntrypoint.TERMINAL_BENCH],
-        RL_ENTRYPOINTS[RLEntrypoint.TERMINAL_BENCH_GENERATE],
-    } or bool(config.skyrl.get("data", {}).get("terminal_bench_data"))
+    uses_harbor = config.skyrl.get("terminal_bench_config") is not None
     backend = OmegaConf.select(
         config,
         "skyrl.terminal_bench_config.harbor.environment_type",

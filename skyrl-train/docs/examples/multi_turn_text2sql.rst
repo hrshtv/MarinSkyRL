@@ -83,7 +83,7 @@ Now that we have our dataset and database files, let's walk through the some of 
 
     uv run --isolated --extra vllm -m skyrl_train.entrypoints.main_base \
         #### Environment configuration
-        environment.env_class=text2sql \
+        environment.task_sessions.session.task_session=text2sql \
         environment.task_sessions.text2sql.db_path=$DB_PATH \
       
         #### Multi-turn Async Rollouts configuration
