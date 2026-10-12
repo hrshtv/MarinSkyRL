@@ -162,11 +162,28 @@ class JsonlTracker:
         with self.path.open("a") as handle:
             handle.write(json.dumps({"step": step, **data}, default=float) + "\n")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exception):
+        pass
+
 
 def read_metrics(root: Path) -> list[dict]:
     """Return the metrics records an experiment under ``root`` logged, in order."""
     with (root / "exports" / METRICS_FILE).open() as handle:
         return [json.loads(line) for line in handle]
+
+
+def cpu_inference_engine_client(cfg: DictConfig, tokenizer) -> InferenceEngineClient:
+    engine_actor = ray.remote(CPUInferenceEngine)
+    engines = [
+        RayWrappedInferenceEngine(
+            engine_actor.options(num_cpus=1).remote(cfg.trainer.policy.model.path, cfg.trainer.seed + index)
+        )
+        for index in range(cfg.generator.num_inference_engines)
+    ]
+    return InferenceEngineClient(engines, tokenizer, cfg)
 
 
 class TinyTrainingExp(BasePPOExp):
@@ -204,16 +221,7 @@ class TinyTrainingExp(BasePPOExp):
     def create_inference_engine_client(
         self, *, operation: EntrypointOperation = EntrypointOperation.TRAIN
     ) -> InferenceEngineClient:
-        engine_actor = ray.remote(CPUInferenceEngine)
-        engines = [
-            RayWrappedInferenceEngine(
-                engine_actor.options(num_cpus=1).remote(
-                    self.cfg.trainer.policy.model.path, self.cfg.trainer.seed + index
-                )
-            )
-            for index in range(self.cfg.generator.num_inference_engines)
-        ]
-        return InferenceEngineClient(engines, self.tokenizer, self.cfg)
+        return cpu_inference_engine_client(self.cfg, self.tokenizer)
 
 
 def run_tiny_training(cfg: DictConfig) -> None:
