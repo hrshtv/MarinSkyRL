@@ -309,3 +309,10 @@ class PackedTaskMaterializer:
                 for reference in group:
                     results[reference] = self._task_path(reference)
         return results
+
+    def materialize_archive(self, blob: bytes) -> Path:
+        """Extract one archive with the same checks as a packed task reference."""
+        target = self.cache_root / "tasks" / hashlib.sha256(blob).hexdigest()
+        if not (target / _COMPLETE_MARKER_FILENAME).is_file():
+            self._write_task(target, blob)
+        return target
