@@ -69,3 +69,23 @@ def test_terminal_task_selection_fails_before_execution(tmp_path, selection):
     )
     with pytest.raises(ValueError, match="absent from the configured task data"):
         resolve_terminal_task(task, terminal_task_index(path))
+
+
+def test_harbor_preparation_rejects_duplicate_ids_before_execution_overrides(tmp_path):
+    sources = []
+    for index, parent in enumerate(("first", "second")):
+        root = tmp_path / parent
+        root.mkdir()
+        task = _write_task(root, "same-id")
+        (task / "tests").mkdir()
+        (task / "tests/test.sh").write_text("echo 1 > /logs/verifier/reward.txt\n")
+        (task / "task.toml").write_text(
+            '[environment]\ndocker_image = "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+            f"cpus = {index + 1}\n"
+            '[verifier]\nenvironment_mode = "separate"\n'
+        )
+        sources.append(str(task))
+    execution_output = tmp_path / "execution.json"
+    with pytest.raises(ValueError, match="Duplicate Harbor task ID"):
+        materialize_harbor_tasks(sources, cache_dir=tmp_path / "cache", execution_output=execution_output)
+    assert not execution_output.exists()

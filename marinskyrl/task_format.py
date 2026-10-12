@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from taskcompendium.models import TaskSpec
 
 TASK_SPEC_COLUMN = "task_spec"
+TASKCOMPENDIUM_ENVIRONMENT = "taskcompendium"
+HARBOR_ID_PREFIX = "harbor-id:"
 
 
 @dataclass(frozen=True)

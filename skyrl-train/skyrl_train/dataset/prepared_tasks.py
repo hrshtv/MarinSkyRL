@@ -8,13 +8,11 @@ from rolloutengine.lowering import SHELLBOX_SESSION
 from taskcompendium.models import TaskSpec
 from transformers import PreTrainedTokenizerBase
 
-from marinskyrl.task_format import TASK_SPEC_COLUMN
+from marinskyrl.task_format import TASK_SPEC_COLUMN, TASKCOMPENDIUM_ENVIRONMENT
 from skyrl_train.dataset.dataset import PromptDataset
 from skyrl_train.rollouts.group_grader import task_group_grader
 from skyrl_train.rollouts.task_lowering import TaskExecutionSettings, lowered_task
 from skyrl_train.trajectory_runners.types import TaskInput, TrajectoryMetadata, task_messages
-
-TASKCOMPENDIUM_ENVIRONMENT = "taskcompendium"
 
 
 class TaskSpecDataset(PromptDataset):

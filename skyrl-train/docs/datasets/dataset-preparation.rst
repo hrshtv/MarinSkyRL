@@ -147,7 +147,7 @@ or specify HuggingFace dataset(s) prepared in the expected format:
 
 
 Prepared TaskSpec API
---------------------
+---------------------
 
 The preparation modules store bare ``TaskSpec`` definitions in the ``task_spec`` column.
 Tasks contain public context, private grader inputs, and environment requirements.
@@ -171,6 +171,9 @@ Executable tasks require prebuilt, digest-pinned images.
 ``skyrl_train.dataset.prepared_tasks.TaskSpecDataset`` accepts these artifacts, a tokenizer, and explicit execution settings.
 Its ``execution`` argument contains ``TaskExecutionSettings`` with a ``TaskRuntimeSpec`` and a ``TaskSessionSpec``.
 Its ``source_executions`` argument selects overrides by exact ``TaskSpec.source.dataset`` values.
+Different session types require distinct source names for run-specific session selection.
+The preparation CLI rejects different ``env_class`` values under the same source name.
+Harbor preparation rejects duplicate task IDs before it writes execution overrides.
 The loader retains task definitions and returns typed ``TaskInput`` records with run-specific ``LoweredTaskSpec`` values.
 The standard trainer entrypoint uses the source-row format above.
 

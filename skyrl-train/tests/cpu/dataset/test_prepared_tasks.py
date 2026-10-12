@@ -159,3 +159,39 @@ async def test_preparation_cli_preserves_private_grading_and_labels_after_source
     assert dataset[0].metadata.metric_tags == ("fixture/math",)
     assert dataset.dataframe[0]["extra_info"] == {"data_source": "easy", "grade": 3}
     assert "ground_truth" not in json.dumps(client.requests[0]["prompts"])
+
+
+def test_preparation_cli_rejects_different_sessions_with_the_same_source_before_output(tmp_path):
+    source = tmp_path / "mixed.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "prompt": [{"role": "user", "content": "Question"}],
+                    "env_class": session_name,
+                    "data_source": "same-source",
+                    "reward_spec": {"ground_truth": "12"},
+                }
+            )
+            for session_name in ("gsm8k", "aime")
+        )
+    )
+    output = tmp_path / "tasks.parquet"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "marinskyrl.task_preparation",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--source",
+            "fixture",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0, result.stderr
+    assert not output.exists()

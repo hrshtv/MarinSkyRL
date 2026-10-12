@@ -1,3 +1,5 @@
+"""Prepare Harbor packages as bare tasks and separate execution overrides."""
+
 from __future__ import annotations
 
 import argparse
@@ -17,9 +19,9 @@ from taskcompendium.models import NoGrader, Source, TaskSpec
 from marinskyrl.packed_tasks import PackedTaskMaterializer, PackedTaskReference, select_task_references
 from marinskyrl.task_sources import DirectoryDataSource, TaskTroveParquetSource, data_source
 from marinskyrl.task_preparation import cache_tasks
+from marinskyrl.task_format import HARBOR_ID_PREFIX
 
 MATERIALIZATION_BATCH_SIZE = 64
-HARBOR_ID_PREFIX = "harbor-id:"
 
 
 def _machine_overrides(environment: EnvironmentConfig, user: str | int | None) -> dict:
@@ -79,6 +81,17 @@ class TerminalBenchTaskDataset:
 
     def _packed_tasks(self, source: TaskTroveParquetSource) -> list[PackedTaskReference]:
         summary = select_task_references(source, dataset_path=source.resolved_path())
+        if source.snapshot is None:
+            return list(summary.references)
+        if source.snapshot.count != len(summary.references):
+            raise ValueError(
+                f"TaskTrove selection count changed: launch selected {source.snapshot.count}, "
+                f"Ray selected {len(summary.references)}"
+            )
+        if source.snapshot.digest != summary.digest:
+            raise ValueError("TaskTrove selection digest changed between launch and Ray")
+        if source.snapshot.distinct_environment_count != summary.distinct_environment_count:
+            raise ValueError("TaskTrove environment count changed between launch and Ray")
         return list(summary.references)
 
     def _load_data_files(self) -> list[Path | PackedTaskReference]:
@@ -152,6 +165,7 @@ def materialize_harbor_tasks(
     if execution_output is not None and execution_output.exists():
         raise FileExistsError(execution_output)
     execution = {}
+    seen_task_ids = set()
 
     def tasks() -> Iterator[TaskSpec]:
         with closing(PackedTaskMaterializer(cache_dir / "archives")) as materializer:
@@ -162,22 +176,25 @@ def materialize_harbor_tasks(
                     if isinstance(item, Path):
                         directory = item
                         uid = item.name
-                        data_source = f"harbor/{uid}"
+                        source_name = f"harbor/{uid}"
                     else:
                         directory = directories[item]
-                        data_source = item.stable_uri()
+                        source_name = item.stable_uri()
                         uid = item.uid()
+                    if uid in seen_task_ids:
+                        raise ValueError(f"Duplicate Harbor task ID {uid!r}")
+                    seen_task_ids.add(uid)
                     task = harbor_task(
                         directory,
                         source=Source(
-                            dataset=data_source,
+                            dataset=source_name,
                             revision="unhashed",
                             row=uid,
                             importer_revision="skyrl-harbor-v1",
                         ),
                     )
                     if execution_output is not None:
-                        execution[data_source] = harbor_execution_overrides(directory)
+                        execution[source_name] = harbor_execution_overrides(directory)
                     if grader_override is not None:
                         task = task.model_copy(
                             update={

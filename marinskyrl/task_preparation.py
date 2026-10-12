@@ -113,6 +113,16 @@ def main() -> None:
     )
     format_name = "parquet" if args.input.suffix == ".parquet" else "json"
     rows = load_dataset(format_name, data_files=str(args.input), split="train")
+    source_sessions = {}
+    for row in rows:
+        session_name = row.get("env_class")
+        if session_name is None:
+            continue
+        source_name = row.get("data_source") or args.source
+        if source_sessions.setdefault(source_name, session_name) != session_name:
+            raise NotImplementedError(
+                f"Source {source_name!r} contains different session types. Give each session type a separate source."
+            )
     write_task_rows(
         args.output,
         (
