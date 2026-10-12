@@ -14,29 +14,22 @@ Its default is 32 per worker. The verifier thread count does not set task concur
 Task and environment operations
 -------------------------------
 
-A task Parquet file contains one serialized ``LoweredTaskSpec`` per row in the
-``lowered_task_spec`` column. The record preserves a ``TaskSpec`` and adds machine selections and session limits.
+A prepared dataset contains one serialized ``TaskSpec`` per row in the
+``task_spec`` column. The loader adds run-owned machine selections and session limits.
 The task declares public context, tools, an answer format, a typed grader, resources, and environment requirements.
 Custom sessions use ``SessionGrader`` and retain private settings in a ``config.json`` verifier resource.
 
-``skyrl_train.entrypoints.main_base`` converts source rows through
-``SourceTaskDataset`` with Hugging Face ``Dataset.map``.
-It retains serialized tasks in memory without an intermediate Parquet or Arrow cache file.
-Source-row conversion does not use ``data.task_cache_dir``.
-``skyrl_train.entrypoints.taskcompendium`` reads task Parquet directly.
-The `SWE example <../../examples/mini_swe_agent/README.md>`_ uses this entrypoint with ``data.train_data`` and ``data.val_data``.
-``skyrl_train.entrypoints.terminal_bench`` converts task
-directories and packed sources through ``HarborTaskDataset`` and uses the same worker.
-Harbor caches private task Parquet in ``data.task_cache_dir``.
-Explicit exports use ``skyrl_train.dataset.tasks.write_tasks(Path(...), records)``.
+``skyrl_train.entrypoints.main_base`` loads prepared tasks through ``TaskSpecDataset``.
+It derives public prompts for length filtering without an intermediate Parquet file.
+The scheduler and worker receive typed task objects, not serialized private payloads beside duplicate prompts.
+Prepare source datasets and task directories before the training command.
+The trainer does not infer task families from source rows.
 ``LoweredTaskSpec.runtime`` selects optional task and verifier machines through ``MachineRuntimeSpec``.
 Each machine selection supplies a configured backend identifier, network policy, hardware limits, user, and startup or cleanup deadline.
 ``LoweredTaskSpec.session`` supplies the session factory identifier, turn limit, model and command caps, tool-turn deadline, cumulative turn deadline, attempt deadline, and verifier deadline.
 Its cleanup deadline requires an explicit finite, positive value.
 Tasks support one stage and prebuilt, digest-pinned images. Multi-stage packages and task-specific image builds cause rejection.
 TaskCompendium defines task serialization. SkyRL owns its dataset file format.
-With ``data.terminal_bench_data``, ``skyrl_train.entrypoints.main_base`` prepares mixed Nemotron
-rows through ``NemotronTaskDataset``. Terminal rows contain the executable task and its execution settings.
 The worker does not require the original task directories.
 ``harbor.max_turns`` and Harbor exception settings apply only to Harbor tasks.
 These exception settings include ``harbor.mask_exceptions`` and ``harbor.default_error_treatment``.
@@ -60,14 +53,12 @@ Machine-free tasks do not require these executables, even when unused session co
 Executable availability does not establish Docker daemon access or image contents.
 
 ``environment.task_sessions.session`` supplies launch-time session limits.
-Source-specific ``session`` blocks override those limits, including ``max_turns``.
-Source conversion uses a non-null row ``max_turns``, then ``extra_info.max_turns``, then the common session limit.
-An explicit source-family ``session.max_turns`` overrides the row limit.
+``environment.task_sessions.runtime`` supplies machine settings.
+``environment.task_sessions.sources`` contains per-source overrides for runtime and session settings.
+Each key matches ``TaskSpec.source.dataset``.
+The loader preserves the task definition when it adds these settings.
 The common session limit uses ``generator.max_turns`` by default.
-Materialized task records keep their stored session limits.
-For example, ``environment.task_sessions.lcb.session.total_turn_timeout`` overrides the cumulative turn deadline for code tasks.
-Harbor lowering uses package machine settings, users, total-turn deadlines, and verifier deadlines.
-Other Harbor session limits come from launch configuration.
+Harbor deployment overrides apply only to Harbor-tagged tasks.
 The attempt deadline includes startup, preparation, all turns, and final verification.
 The cumulative turn deadline excludes preparation and final verification.
 The verifier deadline includes artifact transfer and separate verifier startup.
