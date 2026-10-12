@@ -14,7 +14,11 @@ from skyrl_train.utils.trainer_utils import (
     build_eval_dataloader,
 )
 from skyrl_train.trajectory_runners.base import TrajectoryRequestBatch, TrajectoryBatch
-from skyrl_train.trajectory_runners.trajectory_processing import validate_trajectory_batch
+from skyrl_train.trajectory_runners.trajectory_processing import (
+    concatenate_trajectory_batches,
+    validate_trajectory_batch,
+)
+from skyrl_gym.verification import VerificationResult
 from typing import Union
 import ray
 import os
@@ -29,6 +33,33 @@ from skyrl_train.io import io
 from tests.cpu.util import example_dummy_config
 
 BasicType = Union[int, float, str, bool, type(None)]
+
+
+def test_batch_metrics_use_reward_sign_only_when_no_verdict_exists():
+    graded = {
+        "prompt_token_ids": [[1], [1]],
+        "response_ids": [[2], [2, 3]],
+        "loss_masks": [[1], [1, 1]],
+        "rewards": [1.0, 0.7],
+        "verification_results": [
+            VerificationResult.verified(1.0, passed=True),
+            VerificationResult.verified(0.0, passed=False),
+        ],
+    }
+    preference = {
+        "prompt_token_ids": [[1]],
+        "response_ids": [[2, 3, 4]],
+        "loss_masks": [[1, 1, 1]],
+        "rewards": [1.0],
+        "verification_results": [None],
+    }
+    joined = concatenate_trajectory_batches([graded, preference], tis_lcs_alert_threshold=0.005)
+
+    assert joined["rollout_metrics"]["generate/avg_tokens_non_zero_rewards"] == 2.0
+    assert joined["rollout_metrics"]["generate/avg_tokens_zero_rewards"] == 2.0
+    filtered = filter_trajectory_batch(joined, [2])
+    assert filtered["rollout_metrics"]["generate/avg_tokens_non_zero_rewards"] == 3.0
+    assert filtered["rollout_metrics"]["generate/avg_tokens_zero_rewards"] == 0.0
 
 
 class ListTokenizer:

@@ -1,6 +1,7 @@
 """TaskCompendium execution and projection into SkyRL training batches."""
 
 import asyncio
+import math
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -144,6 +145,8 @@ async def _model_turn(
     if output["token_provenance"] != TokenProvenance.ENGINE:
         raise RolloutContractError("The canonical rollout engine requires exact model tokens")
     logprobs = output.get("response_logprobs")
+    if logprobs is not None and any(not math.isfinite(value) for value in logprobs[0]):
+        raise RolloutContractError("Behavior logprobs must be finite")
     message = (
         {"role": "assistant", "content": output["responses"][0]}
         if request.prompt_token_ids is not None

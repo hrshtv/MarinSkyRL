@@ -487,7 +487,7 @@ async def test_interrupted_tasks_keep_verified_turns_and_apply_training_policy(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("violation", ["prefix", "logprobs", "provenance"])
+@pytest.mark.parametrize("violation", ["prefix", "logprobs", "provenance", "nan", "infinity"])
 async def test_invalid_model_evidence_aborts_the_group_even_with_error_masking(task_inputs, violation):
     class InvalidClient(ConversationClient):
         async def generate(self, request):
@@ -497,6 +497,8 @@ async def test_invalid_model_evidence_aborts_the_group_even_with_error_masking(t
                     output["prompt_ids"][0][0] = 99
                 elif violation == "logprobs":
                     output["response_logprobs"][0].pop()
+                elif violation in {"nan", "infinity"}:
+                    output["response_logprobs"][0][0] = float("nan" if violation == "nan" else "inf")
                 else:
                     output["token_provenance"] = TokenProvenance.RECONSTRUCTED
             return output
