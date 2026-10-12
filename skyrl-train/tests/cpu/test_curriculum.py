@@ -14,19 +14,23 @@ class _StubCurriculumDataset:
     bins maps data_source name -> (grade, row_count), rows laid out in insertion order.
     """
 
-    def __init__(self, bins: dict[str, tuple[int, int]]):
+    def __init__(self, bins: dict[str, tuple[int, int]], *, task_ids: tuple[str, ...] | None = None):
         prompts, infos = [], []
         for name, (grade, rows) in bins.items():
             for _ in range(rows):
                 prompts.append(f"prompt-{len(prompts)}")
                 infos.append({"data_source": name, "grade": grade})
         self.dataframe = Dataset.from_dict({"prompt": prompts, "extra_info": infos})
+        self.task_ids = tuple(str(index) for index in range(len(prompts))) if task_ids is None else task_ids
 
     def __len__(self):
         return len(self.dataframe)
 
     def __getitem__(self, idx):
         return idx
+
+    def uid(self, index: int) -> str:
+        return self.task_ids[index]
 
     def collate_fn(self, batch):
         return batch
@@ -51,6 +55,17 @@ def _draws(order, count):
 
 
 TWO_BINS = {"g0-easy": (0, 1), "g1-hard": (1, 1)}
+
+
+def test_task_ids_update_the_correct_curriculum_bin():
+    dataset = _StubCurriculumDataset(TWO_BINS, task_ids=("task:3", "task:9"))
+    order = CurriculumOrder(dataset, CurriculumConfig(kind=SamplingKind.NAIVE), seed=0, window_size=2)
+
+    metrics = order.observe([JudgedGroup("task:9", (1.0, 0.0))])
+
+    assert metrics["curriculum/g0-easy/groups"] == 0
+    assert metrics["curriculum/g1-hard/groups"] == 1
+    assert metrics["curriculum/g1-hard/pass_rate"] == 0.5
 
 
 def test_draws_deterministic_given_seed():
