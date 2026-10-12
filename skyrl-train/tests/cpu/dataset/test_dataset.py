@@ -9,7 +9,7 @@ from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.dataset.tasks import SourceTaskDataset
 from skyrl_train.entrypoints.main_base import BasePPOExp
-from skyrl_train.trajectory_runners.types import task_messages
+from skyrl_train.task_inputs import task_messages
 
 
 class _StubTokenizer:

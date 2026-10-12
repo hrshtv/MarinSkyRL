@@ -15,7 +15,7 @@ from taskcompendium.models import (
     TaskSpec,
     TextMessage,
 )
-from skyrl_train.trajectory_runners.types import TaskInput, TrajectoryMetadata
+from skyrl_train.task_inputs import TaskInput, TrajectoryMetadata
 from skyrl_train.dataset.prepared_tasks import TaskSpecDataset
 from skyrl_train.rollouts.task_lowering import TaskExecutionSettings
 
