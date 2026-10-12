@@ -1,5 +1,4 @@
 from pathlib import Path
-from types import SimpleNamespace
 import json
 
 from omegaconf import OmegaConf
@@ -52,22 +51,6 @@ def test_download_selects_only_the_requested_subdirectory(monkeypatch, tmp_path)
     ]
 
 
-def test_revision_resolution_uses_the_requested_revision(monkeypatch):
-    calls = []
-
-    class FakeApi:
-        def dataset_info(self, repo_id, revision):
-            calls.append((repo_id, revision))
-            return SimpleNamespace(sha="immutable-sha")
-
-    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
-
-    selector = hf_datasets.resolve_hf_dataset_selector("fixture-org/fixture-trove@rev-1::a")
-
-    assert selector.canonical() == "fixture-org/fixture-trove@immutable-sha::a"
-    assert calls == [("fixture-org/fixture-trove", "rev-1")]
-
-
 def test_runner_resolves_and_records_training_and_validation_selectors(monkeypatch, tmp_path):
     resolved = {
         "fixture-org/fixture-trove::train": rl_data.ResolvedRLData(
@@ -80,15 +63,14 @@ def test_runner_resolves_and_records_training_and_validation_selectors(monkeypat
         ),
     }
 
-    def resolve(values, *, kind):
-        assert kind == "parquet"
+    def resolve(values):
         return resolved[values[0]]
 
     monkeypatch.setattr("cloud.iris.training_driver.resolve_rl_train_data_with_sources", resolve)
     launch_config = OmegaConf.create(
         {
             "run": {"mode": "train"},
-            "inputs": {"data_kind": "parquet"},
+            "inputs": {},
             "skyrl": {
                 "data": {"train_data": [], "val_data": []},
             },

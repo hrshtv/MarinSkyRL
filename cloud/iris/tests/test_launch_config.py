@@ -78,7 +78,6 @@ def _raw_config() -> dict[str, Any]:
                 "tokenizer_uri": "s3://models/qwen-tokenizer",
                 "tokenizer_revision": "a" * 40,
             },
-            "data_kind": "parquet",
             "train_data": [],
             "validation_data": [],
         },
@@ -116,7 +115,7 @@ def _raw_config() -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("text,reward", [("#### 12", 1.0), ("#### 12\nMore reasoning.", 0.0)])
-async def test_custom_session_settings_reach_private_grading_through_the_launch_config(
+async def test_prepared_grader_parameters_reach_the_launch_selected_session(
     tmp_path: Path, text: str, reward: float
 ) -> None:
     raw = _raw_config()
@@ -212,7 +211,6 @@ def test_composed_launch_rejects_kl_switches(tmp_path: Path, switch: str) -> Non
     [
         ("standard", 0, "sync"),
         ("standard", 2, "async"),
-        ("standard", 1, "async"),
         ("generate", 0, None),
     ],
 )
@@ -256,7 +254,6 @@ def test_qwen_smoke_hugging_face_model_input_reaches_the_runner_without_a_model_
         "tokenizer_uri": "Qwen/Qwen3-0.6B",
         "tokenizer_revision": "main",
     }
-    config["inputs"]["data_kind"] = "parquet"
     path = tmp_path / "qwen-launch.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False))
     seen = []

@@ -40,12 +40,11 @@ def resolve_rl_train_data(
     scratch_dir: str | None = None,
     on_exist: str = "skip",
     verbose: bool = True,
-    kind: str = "parquet",
 ) -> list[str | dict[str, Any]]:
     """Stage prepared TaskSpecs or static preference pairs."""
     return list(
         resolve_rl_train_data_with_sources(
-            train_data, scratch_dir=scratch_dir, on_exist=on_exist, verbose=verbose, kind=kind
+            train_data, scratch_dir=scratch_dir, on_exist=on_exist, verbose=verbose
         ).paths
     )
 
@@ -55,11 +54,8 @@ def resolve_rl_train_data_with_sources(
     scratch_dir: str | None = None,
     on_exist: str = "skip",
     verbose: bool = True,
-    kind: str = "parquet",
 ) -> ResolvedRLData:
     """Return local inputs without task extraction or conversion."""
-    if kind != "parquet":
-        raise ValueError("Prepare TaskSpecs before launch. Raw task archives are not training inputs.")
     stage_root = Path(scratch_dir) / "rl_data" if scratch_dir else Path("/tmp/skyrl_rl_data")
     resolved: list[str] = []
     sources: list[str | dict[str, Any]] = []

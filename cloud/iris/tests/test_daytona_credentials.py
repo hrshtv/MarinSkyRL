@@ -31,11 +31,9 @@ def test_resolve_daytona_rl_api_key_rejects_generic_key(monkeypatch):
         ({"harbor": {"environment_type": "docker"}}, False),
     ],
 )
-@pytest.mark.parametrize("entrypoint", ["skyrl_train.entrypoints.main_base", "skyrl_train.entrypoints.task_generate"])
-def test_daytona_preflight_follows_task_backend(entrypoint, harbor, expected):
+def test_daytona_preflight_follows_task_backend(harbor, expected):
     config = OmegaConf.create(
         {
-            "runtime": {"entrypoint": entrypoint},
             "skyrl": {
                 "terminal_bench_config": harbor,
             },

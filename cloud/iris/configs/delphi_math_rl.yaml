@@ -78,6 +78,5 @@ extra_env:
   NCCL_SOCKET_IFNAME: "^ibs,ibp,lo,docker,veth,cilium,lxc"
 
 data:
-  kind: parquet
   train_data: []
   val_data: []

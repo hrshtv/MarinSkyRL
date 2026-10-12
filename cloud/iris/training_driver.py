@@ -144,13 +144,13 @@ class LocalRLRunner:
         with filesystem.open(path, "w") as destination:
             json.dump(record, destination, sort_keys=True)
 
-    def _resolve_data_inputs(self, data_kind: str) -> None:
+    def _resolve_data_inputs(self) -> None:
         for role, attribute in (("train", "train_data"), ("validation", "val_data")):
             values = getattr(self.config, attribute)
             if not values:
                 continue
-            print(f"\nResolving {role} data (kind={data_kind}): {values}")
-            resolved = resolve_rl_train_data_with_sources(values, kind=data_kind)
+            print(f"\nResolving {role} data: {values}")
+            resolved = resolve_rl_train_data_with_sources(values)
             paths = list(resolved.paths)
             sources = list(resolved.sources)
             setattr(self.config, attribute, paths)
@@ -168,7 +168,7 @@ class LocalRLRunner:
         if launch_config.run.mode == RunMode.CHECKPOINT_EXPORT:
             self._write_resolved_config(launch_config)
             return self._run_skyrl(launch_config)
-        self._resolve_data_inputs(str(launch_config.inputs.data_kind))
+        self._resolve_data_inputs()
         self._setup_environment()
         skyrl_config = apply_task_local_values(
             skyrl_config,

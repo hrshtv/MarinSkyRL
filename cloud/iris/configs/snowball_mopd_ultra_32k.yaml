@@ -8,9 +8,7 @@
 # blend, so rows keep their teacher_route column and the stock shuffle preserves the blend's mix.
 # Skipped grading belongs to the prepared TaskSpec, not the training config.
 #
-# Harbor SWE rows (--swe-rows N) use TaskRolloutWorker. Supply the sample's
 # Prepare SWE packages as TaskSpecs before launch.
-# verifiers. Without that task data the Harbor settings below are unused.
 #
 # Pass the student with --model-path (open-athena/Snowball-67B-A2B-10T-Mixed-RLVR-Sync-Step92
 # pinned to a commit) and the sample's train.parquet with --train-data.
@@ -204,7 +202,6 @@ teacher_routing:
         weight: 1.0
 
 data:
-  kind: parquet
   train_data: []
   val_data: []
   shuffle: true

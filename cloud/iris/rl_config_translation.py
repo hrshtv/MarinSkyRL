@@ -405,10 +405,6 @@ class ParsedRLConfig:
     trajectory_runner: Dict[str, Any] = field(default_factory=dict)
     terminal_bench: Optional[Dict[str, Any]] = None
     tensor_parallel_size: int = 1
-    # "tasks" (default; terminal_bench task-dir extraction) or "parquet" (single-turn
-    # RLVR: an HF id / .parquet is passed through to PromptDataset, NOT task-extracted).
-    # Launcher-only (popped out of the `data` section so it never reaches Hydra).
-    data_kind: str = "parquet"
 
 
 @dataclass(frozen=True)
@@ -531,8 +527,6 @@ def parse_rl_config(
     data = dict(raw.get("data", {}))
     environment = raw.get("environment", {})
     trajectory_runner = raw.get("trajectory_runner", {})
-    # data.kind selects launcher staging and is not part of SkyRL's data config.
-    data_kind = data.pop("kind", "parquet")
 
     # Validate engine_init_kwargs doesn't contain SkyRL-internal keys.
     engine_init_kwargs = generator.get("engine_init_kwargs", {})
@@ -580,7 +574,6 @@ def parse_rl_config(
         trajectory_runner=trajectory_runner,
         terminal_bench=terminal_bench,
         tensor_parallel_size=tensor_parallel_size,
-        data_kind=data_kind,
     )
 
 
@@ -820,6 +813,9 @@ def _merge_config_mapping(config: DictConfig, values: Mapping[str, Any], prefix:
         if isinstance(value, Mapping) and not value:
             continue
         path = f"{prefix}.{key}" if prefix else key
+        if path == "environment.task_sessions.sources":
+            OmegaConf.update(config, path, copy.deepcopy(value), merge=True)
+            continue
         current = OmegaConf.select(config, path, default=...)
         key_exists = current is not ...
         if isinstance(value, Mapping):
