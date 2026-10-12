@@ -11,9 +11,22 @@ from pathlib import Path
 from typing import Optional
 
 from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi
 
-from marinskyrl.hugging_face_retry import load_hugging_face_with_retry
-from marinskyrl.resource_locator import parse_hf_dataset_selector
+from marinskyrl.hugging_face_retry import call_with_hugging_face_retry, load_hugging_face_with_retry
+from marinskyrl.resource_locator import HFDatasetSelector, parse_hf_dataset_selector
+
+
+def resolve_hf_dataset_selector(value: str) -> HFDatasetSelector:
+    """Resolve a prepared dataset selector to an immutable Hub commit."""
+    selector = parse_hf_dataset_selector(value)
+    if selector is None:
+        raise ValueError(f"Invalid Hugging Face dataset selector: {value!r}")
+    info = call_with_hugging_face_retry(
+        lambda: HfApi().dataset_info(selector.repo_id, revision=selector.revision),
+        operation=f"resolve Hugging Face dataset {selector.repo_id}@{selector.revision or 'main'}",
+    )
+    return HFDatasetSelector(selector.repo_id, info.sha, selector.subdir)
 
 
 def is_raw_tasks_directory(snapshot_dir) -> bool:

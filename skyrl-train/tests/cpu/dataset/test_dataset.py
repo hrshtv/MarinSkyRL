@@ -17,11 +17,26 @@ from taskcompendium.models import (
 )
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import TASK_SPEC_COLUMN, TaskSpecDataset
+from skyrl_train.dataset.tasks import TaskSpecDataset
+from marinskyrl.task_format import TASK_SPEC_COLUMN
 from marinskyrl.task_preparation import source_row_task
 from tests.cpu.task_specs import session_spec, task_dataset
 from skyrl_train.entrypoints.main_base import BasePPOExp
 from skyrl_train.rollouts.task_lowering import source_execution_settings
+
+
+def test_prepared_hf_selector_reads_the_requested_revision_and_subdirectory(monkeypatch):
+    revision = "a" * 40
+
+    def read_hub_dataset(path, *, revision=None, data_dir=None, keep_in_memory=False):
+        prompt = (
+            "Pinned question" if (path, revision, data_dir) == ("org/tasks", "a" * 40, "prepared") else "Wrong source"
+        )
+        return {"train": Dataset.from_list([task_row(prompt, 0)])}
+
+    monkeypatch.setattr("datasets.load_dataset", read_hub_dataset)
+    dataset = task_dataset([f"org/tasks@{revision}::prepared"], _StubTokenizer(), num_workers=1)
+    assert dataset[0].lowered.task.context.events[0].content == "Pinned question"
 
 
 def task_row(prompt: str, index: int) -> dict:

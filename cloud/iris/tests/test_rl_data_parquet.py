@@ -9,15 +9,18 @@ disk (datasets.load_dataset refuses a remote URI under HF_HUB_OFFLINE=1 → Offl
 from pathlib import Path
 
 import fsspec
+from types import SimpleNamespace
+from huggingface_hub import HfApi
 
 from cloud.iris.rl_data import resolve_rl_train_data, resolve_rl_train_data_with_sources
 
 
-def test_parquet_local_and_hf_pass_through(tmp_path):
+def test_local_parquet_and_hf_inputs_keep_immutable_source_references(tmp_path, monkeypatch):
     p = tmp_path / "train.parquet"
     p.write_bytes(b"local")
-    out = resolve_rl_train_data([str(p), "allenai/RLVR-MATH"], verbose=False)
-    assert out == [str(p), "allenai/RLVR-MATH"]  # unchanged: no staging for local path / HF id
+    monkeypatch.setattr(HfApi, "dataset_info", lambda *_args, **_kwargs: SimpleNamespace(sha="a" * 40))
+    out = resolve_rl_train_data_with_sources([str(p), "org/tasks::train"], verbose=False)
+    assert out.paths == out.sources == (str(p), "org/tasks@" + "a" * 40 + "::train")
 
 
 def test_structured_directory_source_resolves_to_materialized_parquet():
