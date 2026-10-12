@@ -9,7 +9,7 @@ data:
   train_data: ["${oc.env:HOME}/data/gsm8k/train.parquet"]
   val_data: ["${oc.env:HOME}/data/gsm8k/validation.parquet"]
   shuffle: true
-  preference_pair_format: text # text completions or tokenized conversations with assistant masks
+  preference_pair_format: null # null = TaskSpecs; text or tokenized = static preference pairs
   sampling:
     kind: null # null = seeded passes (data.shuffle); domain-weighted|naive|thompson|learnability|grade-uniform|grade-adaptive|grade-prior
     domain_weights: {} # exact teacher-route mixture in every train_batch_size prompts drawn when kind=domain-weighted
@@ -201,7 +201,7 @@ trainer:
     # FTPOConfig owns the defaults; set policy_loss_type=ftpo to activate.
     ftpo: {}
     # DPO pairing parameters; set policy_loss_type=dpo (and loss_reduction=pair_mean,
-    # environment.env_class=preference_pair) to activate.
+    # data.preference_pair_format=text) to activate.
     dpo:
       beta: 0.1
       label_smoothing: 0.0
@@ -521,9 +521,6 @@ generator:
 
   rope_scaling: ${trainer.rope_scaling}
   rope_theta: ${trainer.rope_theta}
-
-environment:
-  env_class: "gsm8k"
 
 trajectory_runner:
   command_timeout: 120

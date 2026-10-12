@@ -479,6 +479,11 @@ def validate_hf_export_config(cfg: DictConfig) -> None:
 
 
 def validate_cfg(cfg: DictConfig):
+    if "env_class" in cfg.environment:
+        raise ValueError(
+            "environment.env_class is unsupported. Select environment.task_sessions.session.task_session for tasks "
+            "or data.preference_pair_format for static preference pairs."
+        )
     validate_mismatch_probe_config(cfg)
     if cfg.trainer.strategy != "megatron":
         raise ValueError(f"Unsupported training strategy: {cfg.trainer.strategy}")

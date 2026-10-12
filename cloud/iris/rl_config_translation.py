@@ -801,7 +801,6 @@ _FTPO_CONFIG_PATHS = frozenset(f"trainer.algorithm.ftpo.{item.name}" for item in
 def _path_allows_new_keys(path: str) -> bool:
     return (
         path in _FTPO_CONFIG_PATHS
-        or path.startswith("environment.task_sessions.sources.")
         or path.split(".", 1)[0] in _OPEN_CONFIG_ROOTS
         or any(pattern in f".{path}" for pattern in _OPTIONAL_HYDRA_PATTERNS)
     )

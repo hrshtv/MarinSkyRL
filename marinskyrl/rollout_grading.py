@@ -12,7 +12,7 @@ def validate_task_grading(task: TaskSpec, cfg: DictConfig, distillation_plan: Di
     """Reject skipped task grading when training or evaluation uses the reward."""
     if not isinstance(task.grader, SessionGrader):
         return
-    grading = RolloutGrading(session_parameters(task).config.get("grading", "verify"))
+    grading = RolloutGrading(session_parameters(task).config.get("grading", RolloutGrading.VERIFY))
     if grading is RolloutGrading.VERIFY:
         return
     prefix = f"Task {task.id!r} with skipped grading requires"

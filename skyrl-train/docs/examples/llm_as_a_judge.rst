@@ -117,7 +117,7 @@ The training configuration uses GRPO with colocated training and generation. Key
      generator.n_samples_per_prompt=5 \
      
      # Environment and LLM judge configuration
-     environment.env_class=llm_as_a_judge \
+     environment.task_sessions.session.task_session=llm_as_a_judge \
      environment.task_sessions.llm_as_a_judge.model="gpt-4o-mini" \
      
      # Other parameters (see the `examples/llm_as_a_judge/run_llm_judge.sh` for the full script)

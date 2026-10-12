@@ -81,10 +81,7 @@ def reference_model_required(algorithm: Mapping[str, Any]) -> bool:
 
 def static_preference_pairs_requested(config: Mapping[str, Any]) -> bool:
     """Return whether training reads static chosen/rejected completions instead of generating rollouts."""
-    environment = config.get("environment") if isinstance(config, Mapping) else None
-    if environment is None:
-        return False
-    return environment.get("env_class") == PREFERENCE_PAIR_ENV_CLASS
+    return config.get("data", {}).get("preference_pair_format") is not None
 
 
 def inference_engines_required(config: Mapping[str, Any]) -> bool:
