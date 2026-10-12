@@ -150,7 +150,7 @@ class InputsConfig:
     """Immutable model and data locators resolved by Marin."""
 
     model: LaunchModelLocator = field(default_factory=LaunchModelLocator)
-    data_kind: str = "tasks"
+    data_kind: str = "parquet"
     train_data: list[dict[str, Any]] = field(default_factory=list)
     validation_data: list[dict[str, Any]] = field(default_factory=list)
 
@@ -303,7 +303,7 @@ def validate_launch_config(config: DictConfig) -> LaunchTopology:
         raise ValueError(f"unsupported run.mode: {raw['run']['mode']!r}")
     if raw["run"]["submission"] not in set(SubmissionMode):
         raise ValueError(f"unsupported run.submission: {raw['run']['submission']!r}")
-    if raw["inputs"]["data_kind"] not in {"tasks", "parquet"}:
+    if raw["inputs"]["data_kind"] != "parquet":
         raise ValueError(f"unsupported inputs.data_kind: {raw['inputs']['data_kind']!r}")
     if raw["iris"]["timeout"] < 0:
         raise ValueError("iris.timeout cannot be negative")

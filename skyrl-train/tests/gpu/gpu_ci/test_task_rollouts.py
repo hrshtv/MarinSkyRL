@@ -3,15 +3,14 @@ uv run --frozen pytest skyrl-train/tests/gpu/gpu_ci/test_task_rollouts.py
 """
 
 import os
+from dataclasses import replace
 import pytest
 import ray
-from datasets import Dataset
 from shellbox.backends.docker.machine import DockerMachineFactory
 from transformers import AutoTokenizer
 from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
-from skyrl_train.dataset.tasks import source_row_task
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
 from skyrl_train.trajectory_runners.model_clients import DirectModelClient
@@ -127,18 +126,6 @@ async def run_trajectory_runner_end_to_end(
     )
 
     generator_cfg = default_cfg.generator
-    OmegaConf.update(
-        default_cfg,
-        "environment.task_sessions",
-        {
-            "search": {
-                "log_requests": True,
-                "search_url": "http://127.0.0.1:8000/retrieve",
-            },
-            "max_verifier_workers": max_verifier_workers,
-        },
-    )
-    env_cfg = default_cfg.environment.task_sessions
 
     cfg = get_test_actor_config()
     cfg.trainer.policy.model.path = model
@@ -168,42 +155,23 @@ async def run_trajectory_runner_end_to_end(
         max_prompt_length=max_prompt_length,
         data_path=data_path,
         env_class=env_class,
+        max_turns=max_turns,
     )
-    rows = Dataset.from_list(
-        [
-            {"prompt": prompt, "env_class": env_class, **extras}
-            for prompt, extras in zip(
-                input_batch["prompts"][::n_samples_per_prompt],
-                input_batch["env_extras"][::n_samples_per_prompt],
-                strict=True,
-            )
-        ]
-    )
-    input_batch["env_extras"] = [
-        {
-            "lowered_task_spec": source_row_task(
-                row,
-                index,
-                source_name="gpu-test",
-                environment_configs=OmegaConf.to_container(env_cfg, resolve=True),
-            ).model_dump_json()
-        }
-        for index, row in enumerate(rows)
-        for _ in range(n_samples_per_prompt)
-    ]
-    # Attach request-time sampling params into the trajectory request
-    input_batch["sampling_params"] = get_sampling_params_for_backend(
-        "vllm",
-        DictConfig(
-            {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_generate_length": max_generate_length,
-                "min_p": 0.0,
-                "logprobs": None,
-                "stop": ["</search>", "</answer>"] if env_class == "search" else None,
-            }
+    input_batch = replace(
+        input_batch,
+        sampling_params=get_sampling_params_for_backend(
+            "vllm",
+            DictConfig(
+                {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_generate_length": max_generate_length,
+                    "min_p": 0.0,
+                    "logprobs": None,
+                    "stop": ["</search>", "</answer>"] if env_class == "search" else None,
+                }
+            ),
         ),
     )
 

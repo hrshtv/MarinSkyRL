@@ -9,11 +9,8 @@ disk (datasets.load_dataset refuses a remote URI under HF_HUB_OFFLINE=1 → Offl
 from pathlib import Path
 
 import fsspec
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 from cloud.iris.rl_data import resolve_rl_train_data, resolve_rl_train_data_with_sources
-from infra.rl_data.nemotron_ultra_swe import _tar_bytes
 
 
 def test_parquet_local_and_hf_pass_through(tmp_path):
@@ -55,23 +52,11 @@ def test_parquet_remote_uri_staged_to_local(tmp_path):
     assert staged.read_bytes() == b"PARQUET-BYTES"
 
 
-def test_remote_task_parquet_is_staged_and_extracted(tmp_path):
-    archive = _tar_bytes(
-        {
-            "instruction.md": (b"Repair the project.\n", 0o644),
-            "environment/Dockerfile": (b"FROM ubuntu:22.04\n", 0o644),
-            "task.toml": (b'version = "1.0"\n', 0o644),
-        }
-    )
-    remote = "memory://snowball/swe-tasks.parquet"
-    with fsspec.open(remote, "wb") as destination:
-        pq.write_table(
-            pa.Table.from_pylist([{"path": "task-one", "task_binary": archive}]),
-            destination,
-        )
-
-    out = resolve_rl_train_data([remote], scratch_dir=str(tmp_path), kind="tasks", verbose=False)
-
-    task_root = Path(out[0])
-    assert task_root.is_dir()
-    assert (task_root / "task-one" / "instruction.md").read_text() == "Repair the project.\n"
+def test_remote_inputs_with_the_same_filename_keep_distinct_contents(tmp_path):
+    uris = ["memory://first/train.parquet", "memory://second/train.parquet"]
+    for uri, content in zip(uris, [b"FIRST", b"SECOND"], strict=True):
+        with fsspec.open(uri, "wb") as destination:
+            destination.write(content)
+    paths = resolve_rl_train_data(uris, scratch_dir=str(tmp_path), verbose=False)
+    assert paths[0] != paths[1]
+    assert [Path(path).read_bytes() for path in paths] == [b"FIRST", b"SECOND"]

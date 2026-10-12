@@ -28,13 +28,15 @@ from taskcompendium.models import (
     VerifierArtifact,
 )
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
-from skyrl_train.dataset.tasks import TaskDataset, write_tasks
-from skyrl_train.dataset.protocol_replay import ReplayPartition, replay_tasks
-from skyrl_train.dataset.harbor import HarborTaskDataset
+from marinskyrl.task_preparation import write_tasks
+from marinskyrl.protocol_replay import ReplayPartition, replay_tasks
+from marinskyrl.harbor_preparation import materialize_harbor_tasks
+from tests.cpu.task_specs import task_dataset
+from skyrl_train.rollouts.task_lowering import TaskExecutionSettings
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
-from rolloutengine.spec import LoweredTaskSpec
+from rolloutengine.spec import TaskRuntimeSpec
 from tests.cpu.task_specs import NATIVE_ENVIRONMENT, SHELL_ENVIRONMENT, lowered_task, session_spec, task_input
 from skyrl_train.trajectory_runners.types import BatchMetadata, TokenProvenance, TrajectoryID
 from skyrl_train.trajectory_runners.model_clients import ModelServerError
@@ -165,26 +167,21 @@ async def test_disabled_harbor_verification_keeps_tokens_but_masks_training(
         '[verifier]\nenvironment_mode = "separate"\nuser = "candidate"\n'
     )
     (source / "tests/test.sh").write_text("echo private-grade-only\n")
-    native = HarborTaskDataset(
-        [str(source)], Tokenizer(), 100, session=session_spec(), cache_dir=tmp_path / "native", num_workers=1
-    )
-    assert LoweredTaskSpec.model_validate_json(native[0][2]["lowered_task_spec"]).task.resources.verifier
+    native = materialize_harbor_tasks([str(source)], cache_dir=tmp_path / "native")
+    assert task_dataset([str(native)], Tokenizer())[0].lowered.task.resources.verifier
     settings = HarborTaskSettings.from_config(OmegaConf.create({"harbor": {"verifier_disable": True}}))
-    prepared = HarborTaskDataset(
+    path = materialize_harbor_tasks(
         [str(source)],
-        Tokenizer(),
-        100,
-        session=session_spec(),
         cache_dir=tmp_path / "disabled",
         grader_override=settings.grader_override(),
-        num_workers=1,
     )
-    prompt, env, extras, uid = prepared[0]
-    assert LoweredTaskSpec.model_validate_json(extras["lowered_task_spec"]).task.resources.verifier == ()
+    prepared = task_dataset([str(path)], Tokenizer())
+    task = prepared[0]
+    assert task.lowered.task.resources.verifier == ()
     request = replace(
         request,
-        rows=(task_input(LoweredTaskSpec.model_validate_json(extras["lowered_task_spec"]), metric_class=env),),
-        trajectory_ids=(TrajectoryID(uid, 0),),
+        rows=(task,),
+        trajectory_ids=(TrajectoryID(task.metadata.uid, 0),),
     )
     request = replace(request, batch_metadata=BatchMetadata(0, phase))
 
@@ -783,36 +780,35 @@ async def test_harbor_source_materialization_runs_without_the_original_directory
             manifest["train_task_ids"],
         )
     manifest_path.write_text(json.dumps(manifest))
-    write_tasks(replay_path, replay_tasks(cases_path, manifest_path, session_spec(), partition=partition))
+    write_tasks(replay_path, replay_tasks(cases_path, manifest_path, partition=partition))
     # Reject contamination before a validation artifact can enter the mixed loader.
     original_train = manifest["train_task_ids"]
     manifest["train_task_ids"] = manifest["diagnostic_reserved_task_ids"]
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="overlap"):
-        replay_tasks(cases_path, manifest_path, session_spec(), partition=partition)
+        replay_tasks(cases_path, manifest_path, partition=partition)
     manifest["train_task_ids"] = original_train
     manifest_path.write_text(json.dumps(manifest))
     cases_path.write_text(cases_path.read_text().replace("128000", "128001"))
     with pytest.raises(ValueError, match="immutable manifest"):
-        replay_tasks(cases_path, manifest_path, session_spec(), partition=partition)
-    prepared = HarborTaskDataset(
-        [str(source), str(replay_path)],
+        replay_tasks(cases_path, manifest_path, partition=partition)
+    path = materialize_harbor_tasks([str(source)], cache_dir=tmp_path / "tasks")
+    execution = TaskExecutionSettings(
+        runtime=TaskRuntimeSpec(task_machine=None, verifier_machine=None),
+        session=session_spec("tool_protocol_replay", max_turns=1),
+    )
+    restored = task_dataset(
+        [str(path), str(replay_path)],
         Tokenizer(),
-        100,
-        session=session_spec(),
-        cache_dir=tmp_path / "tasks",
-        num_workers=1,
+        source_executions={"tool-protocol-replay": execution},
     )
-    assert prepared.uid(0) == "source"
+    assert restored.uid(0) == "source"
     shutil.rmtree(source)
-    restored = TaskDataset([str(prepared.task_path)], Tokenizer(), 100, num_workers=1)
     assert len(restored) == 2
-    assert restored[1][1] == "tool_protocol_replay"
-    replay_session = ToolProtocolReplaySession(
-        LoweredTaskSpec.model_validate_json(restored[1][2]["lowered_task_spec"]), None
-    )
+    assert restored[1].metadata.metric_class == "tool_protocol_replay"
+    replay_session = ToolProtocolReplaySession(restored[1].lowered, None)
     assert (await replay_session.prepare()).prompt_token_ids == (128000, 128005)
-    prompt, env, extras, uid = restored[0]
+    task = restored[0]
 
     class ImageFactory:
         backend = Backend.DOCKER
@@ -844,8 +840,8 @@ async def test_harbor_source_materialization_runs_without_the_original_directory
     config, request = task_inputs
     request = replace(
         request,
-        rows=(task_input(LoweredTaskSpec.model_validate_json(extras["lowered_task_spec"]), metric_class=env),),
-        trajectory_ids=(TrajectoryID(uid, 0),),
+        rows=(task,),
+        trajectory_ids=(TrajectoryID(task.metadata.uid, 0),),
     )
     worker = TaskRolloutWorker(
         config,
@@ -855,7 +851,9 @@ async def test_harbor_source_materialization_runs_without_the_original_directory
         shutdown_timeout=30,
     )
     writer = Writer()
-    await worker.run_task(RolloutTask(RolloutLease("lease", 0, 1), {"uid": uid}, request), writer)
+    await worker.run_task(
+        RolloutTask(RolloutLease("lease", 0, 1), {"uid": request.rows[0].metadata.uid}, request), writer
+    )
     batch = writer.groups[0][1].trajectory_batch
     assert batch["unshaped_rewards"] == [0.75]
     assert batch["rollout_metrics"]["generate/task_rollout/tool_tasks"] == 1.0

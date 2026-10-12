@@ -13,10 +13,7 @@ from tests.gpu.utils import get_test_actor_config, get_test_trajectory_request
 def create_dataset(tmp_path, model_name: str):
     input_batch = get_test_trajectory_request(model=model_name, num_prompts=1, n_samples_per_prompt=1)
     data = {
-        "prompt": input_batch["prompts"][0],
-        "env_class": input_batch["env_classes"][0],  # defaults to "gsm8k"
-        "data_source": "test",
-        **(input_batch["env_extras"][0] or {}),
+        "task_spec": input_batch.rows[0].lowered.task.model_dump_json(),
     }
     path = tmp_path / "data.json"
     with open(path, "w") as f:
@@ -41,6 +38,7 @@ def test_main_generate(tmp_path):
     cfg.generator.eval_n_samples_per_prompt = 1
 
     cfg.environment.task_sessions.max_verifier_workers = 1
+    cfg.environment.task_sessions.session.task_session = "gsm8k"
 
     initialize_ray(cfg)
     try:

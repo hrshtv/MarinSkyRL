@@ -4,7 +4,7 @@ from examples.livecodebench.lcb_dataset import LIVECODEBENCH, process_example
 from skyrl_gym.source_task import session_parameters
 from taskcompendium.submission import conversation_messages
 
-from skyrl_train.dataset.tasks import source_row_task
+from tests.cpu.task_specs import prepared_source_task
 from tests.cpu.task_specs import session_spec
 
 
@@ -25,7 +25,7 @@ def test_lcb_example_builder_preserves_executable_reference_tests():
         split="test",
     )
 
-    task = source_row_task(
+    task = prepared_source_task(
         row,
         0,
         source_name=LIVECODEBENCH,

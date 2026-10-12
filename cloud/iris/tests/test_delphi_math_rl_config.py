@@ -37,7 +37,7 @@ def test_delphi_config_composes_environment_and_caps_into_hydra_config():
     parsed = parse_rl_config(_CONFIG)
     exp_args = {"job_name": "delphi-math-rl-test", "experiments_dir": "/tmp/exp", "num_nodes": 4}
     cfg = compose_skyrl_config(parsed, exp_args, _HPCStub()).config
-    assert cfg.environment.env_class == "aime"
+    assert cfg.environment.task_sessions.session.task_session == "aime"
     assert cfg.generator.engine_init_kwargs.max_model_len == 4096
     assert cfg.trainer.algorithm.advantage_estimator == "grpo"
     assert "kind" not in cfg.data

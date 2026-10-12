@@ -15,7 +15,9 @@ context_budget:
   max_turns: 1
 
 environment:
-  env_class: gsm8k
+  task_sessions:
+    session:
+      task_session: gsm8k
 
 trainer:
   strategy: megatron

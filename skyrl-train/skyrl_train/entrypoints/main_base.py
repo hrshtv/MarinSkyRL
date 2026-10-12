@@ -388,11 +388,15 @@ class BasePPOExp:
 
     def task_dataset(self, data_files):
         from skyrl_train.dataset.tasks import TaskSpecDataset  # noqa: PLC0415 - optional training dependencies
+        from marinskyrl.rollout_grading import validate_task_grading  # noqa: PLC0415 - optional task dependencies
+        from marinskyrl.task_preparation import TASK_SPEC_COLUMN  # noqa: PLC0415 - optional task dependencies
+        from taskcompendium.models import TaskSpec  # noqa: PLC0415 - optional task dependencies
+        from marinskyrl.distillation import compile_distillation_plan_from_config  # noqa: PLC0415
 
         execution, source_executions = source_execution_settings(
             OmegaConf.to_container(self.cfg.environment.task_sessions, resolve=True)
         )
-        return TaskSpecDataset(
+        dataset = TaskSpecDataset(
             datasets=data_files,
             execution=execution,
             source_executions=source_executions,
@@ -400,6 +404,10 @@ class BasePPOExp:
             max_prompt_length=self.cfg.trainer.max_prompt_length,
             num_workers=8,
         )
+        plan = compile_distillation_plan_from_config(self.cfg)
+        for record in dataset.dataframe:
+            validate_task_grading(TaskSpec.model_validate_json(record[TASK_SPEC_COLUMN]), self.cfg, plan)
+        return dataset
 
     def get_eval_dataset(self):
         """Load validation prompts for evaluation or new mismatch-probe generation."""

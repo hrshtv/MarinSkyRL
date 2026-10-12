@@ -117,6 +117,22 @@ An empty response becomes one fully masked token in the trainer row. Its behavio
 logprob is zero. The original rollout evidence remains unchanged.
 
 Prepare source rows and Harbor packages as TaskSpecs before training.
+The trainer does not extract task archives or join source datasets.
+
+For source rows that already contain prompts and private grader inputs, use an
+explicit preparation command:
+
+.. code-block:: bash
+
+   uv run python -m marinskyrl.task_preparation \
+     --input raw.parquet --output tasks.parquet --source my-dataset \
+     --config grader.json --environment task-environment.json
+
+``grader.json`` contains task grader parameters. ``task-environment.json``
+contains ``EnvironmentRequirements``. Omit these options for tasks that use
+neither extra grader parameters nor a machine environment.
+Select the session factory in the run config. The preparation command does not
+select a backend, session factory, or deadline.
 The trainer does not convert source rows or open task directories.
 All generated RL uses the same worker, with retries and group grading before projection.
 Static DPO uses a separate chosen/rejected dataset path.

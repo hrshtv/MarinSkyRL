@@ -29,6 +29,11 @@ cloud/iris/telemetry_env.py
 cloud/iris/tilelang_cache_sync.py
 cloud/iris/training_driver.py
 marinskyrl/__init__.py
+marinskyrl/harbor_import.py
+marinskyrl/harbor_preparation.py
+marinskyrl/nemotron_preparation.py
+marinskyrl/protocol_replay.py
+marinskyrl/task_preparation.py
 marinskyrl/checkpoint_paths.py
 marinskyrl/distillation.py
 marinskyrl/hf_model.py

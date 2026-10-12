@@ -5,7 +5,6 @@ from unittest.mock import patch
 from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
-from rolloutengine.spec import LoweredTaskSpec
 from taskcompendium.models import (
     AnswerType,
     ConversationInput,
@@ -18,7 +17,9 @@ from taskcompendium.models import (
 )
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TASK_SPEC_COLUMN, SourceTaskDataset, TaskSpecDataset
+from skyrl_train.dataset.tasks import TASK_SPEC_COLUMN, TaskSpecDataset
+from marinskyrl.task_preparation import source_row_task
+from tests.cpu.task_specs import session_spec, task_dataset
 from skyrl_train.entrypoints.main_base import BasePPOExp
 from skyrl_train.rollouts.task_lowering import source_execution_settings
 
@@ -153,18 +154,25 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
         for index, content in enumerate(("First question", "x" * 200, "Last question"))
     ]
     source = tmp_path / "source.jsonl"
-    source.write_text("\n".join(json.dumps(row) for row in rows))
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {TASK_SPEC_COLUMN: source_row_task(row, index, source_name="fixture", config={}).model_dump_json()}
+            )
+            for index, row in enumerate(rows)
+        )
+    )
 
-    dataset = SourceTaskDataset(
+    dataset = task_dataset(
         [str(source)],
         _StubTokenizer(),
         100,
-        environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
+        session=session_spec("gsm8k"),
         num_workers=num_workers,
     )
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [row["prompt"] for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in prepared]
+    tasks = [row["input"].lowered.task for row in prepared]
+    assert [task.context.events[0].content for task in tasks] == ["First question", "Last question"]
     assert [task.source.row for task in tasks] == ["0", "2"]
     assert dataset.dataframe.cache_files == []
 

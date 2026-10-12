@@ -52,41 +52,6 @@ def test_download_selects_only_the_requested_subdirectory(monkeypatch, tmp_path)
     ]
 
 
-def test_task_selectors_use_distinct_revision_pinned_caches(monkeypatch, tmp_path):
-    commits = {"a": "commit-a", "b": "commit-b"}
-    commands = []
-
-    def resolve(value):
-        selector = parse_hf_dataset_selector(value)
-        assert selector is not None and selector.subdir is not None
-        return HFDatasetSelector(selector.repo_id, commits[selector.subdir], selector.subdir)
-
-    def run(command, **_kwargs):
-        commands.append(command)
-        output = Path(command[command.index("--output_dir") + 1])
-        (output / "task-1").mkdir(parents=True)
-        (output / "task-1" / "instruction.md").write_text("task")
-        return SimpleNamespace(stdout="")
-
-    monkeypatch.setattr(rl_data, "resolve_hf_dataset_selector", resolve)
-    monkeypatch.setattr(rl_data.subprocess, "run", run)
-    monkeypatch.setattr(rl_data, "_fix_task_permissions", lambda *_args, **_kwargs: None)
-
-    resolved = rl_data.resolve_rl_train_data_with_sources(
-        ["fixture-org/fixture-trove::a", "fixture-org/fixture-trove::b"],
-        scratch_dir=str(tmp_path),
-        verbose=False,
-    )
-
-    assert resolved.sources == (
-        "fixture-org/fixture-trove@commit-a::a",
-        "fixture-org/fixture-trove@commit-b::b",
-    )
-    assert resolved.paths[0] != resolved.paths[1]
-    assert all((Path(path) / "task-1" / "instruction.md").read_text() == "task" for path in resolved.paths)
-    assert [command[command.index("--parquet") + 1] for command in commands] == list(resolved.sources)
-
-
 def test_revision_resolution_uses_the_requested_revision(monkeypatch):
     calls = []
 
@@ -125,7 +90,7 @@ def test_runner_resolves_and_records_training_and_validation_selectors(monkeypat
             "run": {"mode": "train"},
             "inputs": {"data_kind": "parquet"},
             "skyrl": {
-                "data": {"train_data": [], "val_data": [], "terminal_bench_data": []},
+                "data": {"train_data": [], "val_data": []},
             },
         }
     )

@@ -21,7 +21,9 @@ context_budget:
   max_turns: 1
 
 environment:
-  env_class: nemotron_ultra
+  task_sessions:
+    session:
+      task_session: nemotron_ultra
 
 trainer:
   strategy: megatron

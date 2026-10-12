@@ -22,7 +22,8 @@ from cloud.iris.rl_config_translation import (
     parse_rl_config,
 )
 from skyrl_train.distributed.step_policy import NonfiniteStepPolicy, nonfinite_step_policy
-from skyrl_train.dataset.tasks import source_row_task
+from marinskyrl.task_preparation import source_row_task
+from skyrl_train.rollouts.task_lowering import source_execution_settings, lowered_task
 
 
 def _raw_config() -> dict[str, Any]:
@@ -77,7 +78,7 @@ def _raw_config() -> dict[str, Any]:
                 "tokenizer_uri": "s3://models/qwen-tokenizer",
                 "tokenizer_revision": "a" * 40,
             },
-            "data_kind": "tasks",
+            "data_kind": "parquet",
             "train_data": [],
             "validation_data": [],
         },
@@ -119,7 +120,7 @@ async def test_custom_session_settings_reach_private_grading_through_the_launch_
     tmp_path: Path, text: str, reward: float
 ) -> None:
     raw = _raw_config()
-    raw["skyrl"]["environment"] = {"task_sessions": {"custom_math": {"reward_method": "final_line"}}}
+    raw["skyrl"]["environment"] = {"task_sessions": {"session": {"task_session": "custom_math"}}}
     path = tmp_path / "launch.yaml"
     path.write_text(yaml.safe_dump(raw))
     config = load_launch_config(path)
@@ -131,8 +132,12 @@ async def test_custom_session_settings_reach_private_grading_through_the_launch_
         },
         0,
         source_name="fixture",
-        environment_configs=OmegaConf.to_container(config.skyrl.environment.task_sessions, resolve=True),
+        config={"reward_method": "final_line"},
     )
+    execution, _ = source_execution_settings(
+        OmegaConf.to_container(config.skyrl.environment.task_sessions, resolve=True)
+    )
+    task = lowered_task(task, execution)
     session = AnswerTaskSession(task, None, grader=grade_gsm8k)
     start = await session.prepare()
     try:

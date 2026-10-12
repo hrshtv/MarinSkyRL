@@ -28,7 +28,6 @@ from marinskyrl.distillation import DistillationPlan, compile_distillation_plan,
 from marinskyrl.resource_locator import join_resource_path, model_source_for_path
 from marinskyrl.speculative_decoding import STANDARD_TRAINING_ENTRYPOINT, parse_speculative_decoding_config
 from marinskyrl.remote_io import filesystem_and_path, open_output_stream
-from marinskyrl.rollout_grading import validate_nemotron_ultra_grading
 
 # Directory containing the bundled example RL config YAML files.
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
@@ -409,7 +408,7 @@ class ParsedRLConfig:
     # "tasks" (default; terminal_bench task-dir extraction) or "parquet" (single-turn
     # RLVR: an HF id / .parquet is passed through to PromptDataset, NOT task-extracted).
     # Launcher-only (popped out of the `data` section so it never reaches Hydra).
-    data_kind: str = "tasks"
+    data_kind: str = "parquet"
 
 
 @dataclass(frozen=True)
@@ -533,7 +532,7 @@ def parse_rl_config(
     environment = raw.get("environment", {})
     trajectory_runner = raw.get("trajectory_runner", {})
     # data.kind selects launcher staging and is not part of SkyRL's data config.
-    data_kind = data.pop("kind", "tasks")
+    data_kind = data.pop("kind", "parquet")
 
     # Validate engine_init_kwargs doesn't contain SkyRL-internal keys.
     engine_init_kwargs = generator.get("engine_init_kwargs", {})
@@ -665,7 +664,6 @@ class TaskLocalSkyRLValues:
 
     train_data: tuple[str, ...]
     validation_data: tuple[str, ...]
-    terminal_bench_data: tuple[str, ...]
     policy_model_path: str | None = None
     draft_model_uri: str | None = None
 
@@ -674,7 +672,6 @@ TASK_LOCAL_SKYRL_PATHS = MappingProxyType(
     {
         "train_data": ("data.train_data",),
         "validation_data": ("data.val_data",),
-        "terminal_bench_data": ("data.terminal_bench_data",),
         "policy_model_path": ("trainer.policy.model.path", "trainer.ref.model.path"),
         "draft_model_uri": ("generator.speculative_decoding.model.source_uri",),
     }
@@ -811,7 +808,7 @@ _FTPO_CONFIG_PATHS = frozenset(f"trainer.algorithm.ftpo.{item.name}" for item in
 def _path_allows_new_keys(path: str) -> bool:
     return (
         path in _FTPO_CONFIG_PATHS
-        or path.startswith("environment.task_sessions.")
+        or path.startswith("environment.task_sessions.sources.")
         or path.split(".", 1)[0] in _OPEN_CONFIG_ROOTS
         or any(pattern in f".{path}" for pattern in _OPTIONAL_HYDRA_PATTERNS)
     )
@@ -856,7 +853,6 @@ def compose_skyrl_config(
     """Compose the final SkyRL subtree from its config groups and launch values."""
     config = _compose_config_groups(parsed.config_groups, config_name="ppo_base_config")
     _merge_config_mapping(config, _skyrl_config_sections(parsed, exp_args, hpc))
-    validate_nemotron_ultra_grading(config, parsed.distillation_plan)
     validate_objective(config)
     return CompiledSkyRLConfig(
         entrypoint=registered_rl_entrypoint_module(parsed.entrypoint),
