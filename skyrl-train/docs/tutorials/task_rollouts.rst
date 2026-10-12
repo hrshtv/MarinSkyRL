@@ -150,9 +150,9 @@ response or grade and does not enter loss or baseline calculations.
 Training data and failures
 --------------------------
 
-The projections read ``RolloutData`` directly. ``WholeTaskProjection`` emits one
-row with the full token sequence per rollout. ``StepTaskProjection`` emits one row
-per model turn, with that turn's exact served prompt and sampled response.
+``WholeTaskProjection`` emits one row with the full token sequence per rollout.
+``StepTaskProjection`` emits one row per retained model turn, with that turn's
+exact served prompt and sampled response.
 Select step projection with
 ``trainer.step_wise_training=true``. The two projections preserve exact tokens,
 behavior log probabilities, token rewards, expert routes, and teacher routes.

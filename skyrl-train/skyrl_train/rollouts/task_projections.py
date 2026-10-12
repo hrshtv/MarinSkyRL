@@ -7,6 +7,7 @@ import json
 
 import numpy as np
 from omegaconf import DictConfig
+from transformers import PreTrainedTokenizerBase
 from skyrl_gym.verification import (
     VERIFIER_RUNTIME_ERROR,
     RewardResult,
@@ -20,7 +21,7 @@ from rolloutengine.contracts import RolloutContractError, RolloutData
 from skyrl_train.error_treatment import ErrorTreatment
 from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TASKCOMPENDIUM_ENVIRONMENT
 from skyrl_train.distillation import INVALID_TOPK_INDEX
-from skyrl_train.metric_names import TASK_ROLLOUT_METRIC_PREFIX, TOKEN_PROVENANCE_RECONSTRUCTED_FRACTION_METRIC
+from skyrl_train.metric_names import TASK_ROLLOUT_METRIC_PREFIX
 from skyrl_train.trajectory_runners.trajectory_processing import (
     apply_overlong_filtering,
     get_batch_failure_metrics,
@@ -232,7 +233,7 @@ class WholeTaskProjection:
     """Emit one training sample from each RolloutEngine record."""
 
     runner_config: DictConfig
-    tokenizer: object
+    tokenizer: PreTrainedTokenizerBase
     error_handling: ErrorHandlingConfig = DEFAULT_ERROR_HANDLING_CONFIG
     harbor_error_handling: ErrorHandlingConfig | None = None
 
@@ -244,7 +245,7 @@ class WholeTaskProjection:
             for rollout, policy in zip(rollouts, policies, strict=True)
         ]
         batch = _training_batch(
-            rollouts, decisions, request, self.runner_config, self.tokenizer, request.get("env_classes")
+            rollouts, decisions, required, self.runner_config, self.tokenizer, request.get("env_classes")
         )
         _merge_task_metrics(batch, rollouts, request)
         return batch
@@ -255,7 +256,7 @@ class StepTaskProjection:
     """Emit one training sample per model turn, with its exact served prompt."""
 
     runner_config: DictConfig
-    tokenizer: object
+    tokenizer: PreTrainedTokenizerBase
     error_handling: ErrorHandlingConfig = DEFAULT_ERROR_HANDLING_CONFIG
     harbor_error_handling: ErrorHandlingConfig | None = None
 
@@ -289,7 +290,7 @@ class StepTaskProjection:
                 projected_id.step = index
                 projected_ids.append(projected_id)
                 final_steps.append(last)
-        batch = _training_batch(samples, decisions, request, self.runner_config, self.tokenizer, None)
+        batch = _training_batch(samples, decisions, required, self.runner_config, self.tokenizer, None)
         batch["trajectory_ids"] = projected_ids
         batch["is_last_step"] = final_steps
         _merge_task_metrics(batch, rollouts, request)
@@ -306,10 +307,10 @@ def logprobs_requested(request: TrajectoryRequestBatch, runner_config: DictConfi
 def _training_batch(
     rollouts: Sequence[RolloutData],
     decisions: Sequence[_TrainingDecision],
-    request: TrajectoryRequestBatch,
+    logprobs_required: bool,
     runner_config: DictConfig,
-    tokenizer,
-    environments: Sequence[str] | None,
+    tokenizer: PreTrainedTokenizerBase,
+    env_metric_classes: Sequence[str] | None,
 ) -> TrajectoryBatch:
     responses = [list(rollout.response_token_ids) or [MASKED_TOKEN_ID] for rollout in rollouts]
     rewards = [decision.reward.to_trainer_reward() for decision in decisions]
@@ -327,12 +328,8 @@ def _training_batch(
     if runner_config.apply_overlong_filtering:
         masks = apply_overlong_filtering(masks, responses, tokenizer.eos_token_id)
     logprobs = [
-        np.asarray(rollout.logprobs, dtype=np.float32)
-        if rollout.logprobs is not None and rollout.response_token_ids
-        else np.zeros(len(response), dtype=np.float32)
-        if not decision.disposition.loss_eligible or not rollout.response_token_ids
-        else None
-        for rollout, decision, response in zip(rollouts, decisions, responses, strict=True)
+        _row_logprobs(rollout, decision, logprobs_required)
+        for rollout, decision in zip(rollouts, decisions, strict=True)
     ]
     verification = [decision.verification for decision in decisions]
     batch = TrajectoryBatch(
@@ -344,15 +341,55 @@ def _training_batch(
         loss_masks=masks,
         stop_reasons=[rollout.stop_reason for rollout in rollouts],
         rollout_metrics={},
-        rollout_logprobs=logprobs
-        if logprobs_requested(request, runner_config) and all(values is not None for values in logprobs)
-        else None,
+        rollout_logprobs=logprobs if logprobs_required else None,
         exclude_from_baseline=[not decision.disposition.baseline_eligible for decision in decisions],
-        unshaped_rewards=[decision.reward.unshaped_reward or 0.0 for decision in decisions],
     )
+    _attach_reward_channels(batch, decisions)
+    _attach_failure_channels(batch, decisions)
+    _attach_student_topk(batch, rollouts)
+    _attach_routed_experts(batch, rollouts)
+    _attach_span_tags(batch, rollouts)
+    metrics = None
+    if env_metric_classes is not None:
+        metrics = [
+            {} if environment == TASKCOMPENDIUM_ENVIRONMENT else dict(rollout.metrics)
+            for rollout, environment in zip(rollouts, env_metric_classes, strict=True)
+        ]
+        if any(metrics):
+            batch["env_metrics"] = metrics
+            batch["env_classes"] = list(env_metric_classes)
+    batch["rollout_metrics"] = get_rollout_metrics(responses, rewards, metrics, env_metric_classes, verification)
+    return batch
+
+
+def _row_logprobs(rollout: RolloutData, decision: _TrainingDecision, required: bool) -> np.ndarray | None:
+    if not rollout.response_token_ids:
+        return np.zeros(1, dtype=np.float32)
+    if rollout.logprobs is not None:
+        values = np.asarray(rollout.logprobs, dtype=np.float32)
+        if values.shape != (len(rollout.response_token_ids),) or not np.isfinite(values).all():
+            raise RolloutContractError("Behavior logprobs must be finite and align with response tokens")
+        return values
+    if not decision.disposition.loss_eligible:
+        return np.zeros(len(rollout.response_token_ids), dtype=np.float32)
+    if required:
+        raise RolloutContractError("A trainable rollout is missing requested behavior logprobs")
+    return None
+
+
+def _attach_reward_channels(batch: TrajectoryBatch, decisions: Sequence[_TrainingDecision]) -> None:
+    batch["unshaped_rewards"] = [decision.reward.unshaped_reward or 0.0 for decision in decisions]
     availability = [decision.reward.unshaped_reward is not None for decision in decisions]
     if not all(availability):
         batch["unshaped_reward_available"] = availability
+    if any(decision.reward.token_credit is not None for decision in decisions):
+        batch["token_level_shaping"] = [
+            list(decision.reward.token_credit) if decision.reward.token_credit is not None else [0.0] * len(response)
+            for decision, response in zip(decisions, batch["response_ids"], strict=True)
+        ]
+
+
+def _attach_failure_channels(batch: TrajectoryBatch, decisions: Sequence[_TrainingDecision]) -> None:
     exception_types = [decision.disposition.exception_type for decision in decisions]
     if any(value is not None for value in exception_types):
         batch["exception_types"] = exception_types
@@ -371,27 +408,9 @@ def _training_batch(
     ]
     if any(error is not None for error in server_errors):
         batch["server_errors"] = server_errors
-    if any(decision.reward.token_credit is not None for decision in decisions):
-        batch["token_level_shaping"] = [
-            list(decision.reward.token_credit) if decision.reward.token_credit is not None else [0.0] * len(response)
-            for decision, response in zip(decisions, responses, strict=True)
-        ]
-    _attach_model_metadata(batch, rollouts)
-    metrics = None
-    if environments is not None:
-        metrics = [
-            {} if environment == TASKCOMPENDIUM_ENVIRONMENT else dict(rollout.metrics)
-            for rollout, environment in zip(rollouts, environments, strict=True)
-        ]
-        if any(metrics):
-            batch["env_metrics"] = metrics
-            batch["env_classes"] = list(environments)
-    batch["rollout_metrics"] = get_rollout_metrics(responses, rewards, metrics, environments, verification)
-    batch["rollout_metrics"][TOKEN_PROVENANCE_RECONSTRUCTED_FRACTION_METRIC] = 0.0
-    return batch
 
 
-def _attach_model_metadata(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
+def _attach_student_topk(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
     selected = [_student_topk(rollout) for rollout in rollouts]
     template = next((value for value in selected if value is not None), None)
     if template is not None:
@@ -411,32 +430,38 @@ def _attach_model_metadata(batch: TrajectoryBatch, rollouts: Sequence[RolloutDat
             scores.append(value.topk_logprobs)
         batch["student_topk_indices"] = indices
         batch["behavior_topk_logprobs"] = scores
+
+
+def _model_channel(
+    rollout: RolloutData, key: str, length: int, trailing_shape: tuple[int, ...], dtype: np.dtype | type[np.generic]
+) -> np.ndarray:
+    values = np.zeros((length, *trailing_shape), dtype=dtype)
+    for step in rollout.steps:
+        captured = step.turn.metadata.get(key)
+        if captured is None:
+            continue
+        if len(captured) != len(step.turn.response_token_ids):
+            raise ValueError(f"{key} must align with generated tokens")
+        values[step.response_end + 1 - len(captured) : step.response_end + 1] = captured
+    return values
+
+
+def _attach_routed_experts(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
     routes = [step.turn.metadata.get("routed_experts") for rollout in rollouts for step in rollout.steps]
     route_template = next((value for value in routes if value is not None and len(value)), None)
     if route_template is not None:
-        projected = []
-        for rollout, response in zip(rollouts, batch["response_ids"], strict=True):
-            values = np.zeros((len(response), *route_template.shape[1:]), dtype=route_template.dtype)
-            for step in rollout.steps:
-                captured = step.turn.metadata.get("routed_experts")
-                if captured is not None:
-                    if len(captured) != len(step.turn.response_token_ids):
-                        raise ValueError("Expert routes must align with generated tokens")
-                    values[step.response_end + 1 - len(captured) : step.response_end + 1] = captured
-            projected.append(values)
-        batch["rollout_routed_experts"] = projected
+        batch["rollout_routed_experts"] = [
+            _model_channel(rollout, "routed_experts", len(response), route_template.shape[1:], route_template.dtype)
+            for rollout, response in zip(rollouts, batch["response_ids"], strict=True)
+        ]
+
+
+def _attach_span_tags(batch: TrajectoryBatch, rollouts: Sequence[RolloutData]) -> None:
     if any(step.turn.metadata.get("response_span_tags") is not None for rollout in rollouts for step in rollout.steps):
-        spans = []
-        for rollout, response in zip(rollouts, batch["response_ids"], strict=True):
-            tags = [0] * len(response)
-            for step in rollout.steps:
-                captured = step.turn.metadata.get("response_span_tags")
-                if captured is not None:
-                    if len(captured) != len(step.turn.response_token_ids):
-                        raise ValueError("Span tags must align with generated tokens")
-                    tags[step.response_end + 1 - len(captured) : step.response_end + 1] = captured
-            spans.append(tags)
-        batch["response_span_tags"] = spans
+        batch["response_span_tags"] = [
+            _model_channel(rollout, "response_span_tags", len(response), (), np.int64).tolist()
+            for rollout, response in zip(rollouts, batch["response_ids"], strict=True)
+        ]
 
 
 def _task_error_policies(

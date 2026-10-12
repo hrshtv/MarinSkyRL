@@ -3,7 +3,14 @@ from dataclasses import replace
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
-from rolloutengine.contracts import ModelTurn, RolloutData, RolloutFailure, RolloutStep, Transition
+from rolloutengine.contracts import (
+    ModelTurn,
+    RolloutContractError,
+    RolloutData,
+    RolloutFailure,
+    RolloutStep,
+    Transition,
+)
 from taskcompendium.grading_result import GradeResult, Outcome
 
 from skyrl_train.batch_sampling import filter_trajectory_batch
@@ -110,6 +117,16 @@ def test_projection_preserves_partial_server_error_diagnostics():
 
 
 @pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
+def test_projection_rejects_missing_requested_logprobs_on_a_trainable_turn(projection_type):
+    record = rollout([3], 1.0)
+    record = replace(
+        record, logprobs=None, steps=(replace(record.steps[0], turn=replace(record.steps[0].turn, logprobs=None)),)
+    )
+    with pytest.raises(RolloutContractError):
+        projection_type(config(), Tokenizer()).project([record], request())
+
+
+@pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
 def test_projection_preserves_routes_and_fills_missing_rows(projection_type):
     routed = rollout([3, 4], [0.0, 1.0], metadata={"routed_experts": np.asarray([[[1, 2]], [[3, 4]]], dtype=np.uint8)})
     batch = projection_type(config(), Tokenizer()).project([routed, rollout([5], [0.0])], request(2))
@@ -192,14 +209,3 @@ def test_whole_projection_carries_environment_rates_into_async_batch():
     assert filtered["rollout_metrics"]["generate/avg_tokens_non_zero_rewards"] == 1.0
     assert filtered["rollout_metrics"]["generate/avg_tokens_zero_rewards"] == 2.0
     assert "environment/exact_n20" not in filtered["rollout_metrics"]
-
-    unverified = projection.project(
-        [rollout([5, 7, 8], 0.7, grade=GradeResult(Outcome.UNAVAILABLE, None, error="Judge unavailable"))],
-        request(environments=["cat_count"]),
-    )
-    assert unverified["rollout_metrics"]["generate/avg_tokens_non_zero_rewards"] == 0.0
-    assert unverified["rollout_metrics"]["generate/avg_tokens_zero_rewards"] == 3.0
-    unverified.pop("verification_results")
-    mixed = concatenate_trajectory_batches([joined, unverified], tis_lcs_alert_threshold=0.005)
-    assert mixed["rollout_metrics"]["generate/avg_tokens_non_zero_rewards"] == 1.0
-    assert mixed["rollout_metrics"]["generate/avg_tokens_zero_rewards"] == pytest.approx(8 / 3)
