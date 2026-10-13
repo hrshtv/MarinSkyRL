@@ -24,6 +24,7 @@ from skyrl_gym.envs.nemotron_ultra import math_with_judge
 from skyrl_gym.envs.nemotron_ultra.math_with_judge import grade_math
 from skyrl_gym.envs.nemotron_ultra.mcqa import grade_mcqa
 from skyrl_gym.envs.nemotron_ultra.nvarc import grade_transductive_arc, parse_grid
+from skyrl_gym.envs.nemotron_ultra.pivot_verifyit import SWE_PIVOT_AGENT, TERMINUS_AGENT
 from skyrl_gym.envs.nemotron_ultra.rdkit_chemistry import grade_rdkit_chemistry
 from skyrl_gym.envs.nemotron_ultra.structured_outputs import grade_structured_output
 from skyrl_gym.envs.nemotron_ultra.tool_call import grade_expected_action
@@ -283,7 +284,6 @@ def test_tool_call_reward_requires_the_expected_tool_and_recursive_arguments():
     assert grade_expected_action(expected, wrong)[0] == 0.0
 
 
-SWE_PIVOT_AGENT = "swe_pivot_single_step_tool_use_with_argument_comparison_agent"
 SWE_PIVOT_RECORD = {
     "expected_action": {"type": "function_call", "name": "bash", "arguments": '{"command": "grep -rn foo src"}'}
 }
@@ -311,7 +311,7 @@ async def test_swe_pivot_rows_train_on_the_configured_verdict_component(nemotron
 async def test_terminus_pivot_rows_reward_keystroke_similarity(nemotron_session, model_turn):
     action = {"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls -la /workspace\n", "duration": 0.1}]}
     record = {"expected_answer": json.dumps(action)}
-    session = await nemotron_session("terminus_judge_string_only_simple_agent", record, {"pivot_reward": "string_90"})
+    session = await nemotron_session(TERMINUS_AGENT, record, {"pivot_reward": "string_90"})
 
     result = await session.advance(model_turn(json.dumps(action)))
 

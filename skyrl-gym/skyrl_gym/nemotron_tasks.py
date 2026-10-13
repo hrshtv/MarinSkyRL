@@ -41,7 +41,12 @@ from skyrl_gym.envs.nemotron_ultra.math_judge_verifyit import grade_math_verifyi
 from skyrl_gym.envs.nemotron_ultra.math_with_judge import grade_math
 from skyrl_gym.envs.nemotron_ultra.mcqa import grade_mcqa
 from skyrl_gym.envs.nemotron_ultra.nvarc import extract_python, valid_grid, grade_transductive_arc
-from skyrl_gym.envs.nemotron_ultra.pivot_verifyit import PIVOT_COMPONENTS, TERMINUS_AGENT, grade_pivot
+from skyrl_gym.envs.nemotron_ultra.pivot_verifyit import (
+    PIVOT_COMPONENTS,
+    SWE_PIVOT_AGENT,
+    TERMINUS_AGENT,
+    grade_pivot,
+)
 from skyrl_gym.envs.nemotron_ultra.lean_feedback import build_correction_prompt, format_error_feedback
 from skyrl_gym.envs.nemotron_ultra.lean_proof import build_lean4_proof, determine_proof_status
 from skyrl_gym.envs.nemotron_ultra.rdkit_chemistry import grade_rdkit_chemistry
@@ -65,7 +70,7 @@ PYTHON_TOOL_TURN_LIMIT = 50
 LEAN_TURN_LIMIT = 3
 TOOL_COMPARISON_AGENTS = {
     "single_step_tool_use_with_argument_comparison_agent",
-    "swe_pivot_single_step_tool_use_with_argument_comparison_agent",
+    SWE_PIVOT_AGENT,
     "toolcall_schema_single_step_tool_use_with_argument_comparison_agent",
 }
 FORMAT_AGENTS = {"citation_format_simple_agent", "freeform_formatting_simple_agent"}
