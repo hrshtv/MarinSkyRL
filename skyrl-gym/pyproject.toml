@@ -17,7 +17,7 @@ dependencies = [
 "marin-rolloutengine @ git+https://github.com/marin-community/marin.git@f6acc0157a3008d8aae6fe0a12cf573a03a0fed9#subdirectory=lib/rolloutengine",
     "marin-shellbox @ git+https://github.com/marin-community/marin.git@f6acc0157a3008d8aae6fe0a12cf573a03a0fed9#subdirectory=lib/shellbox",
     "marin-taskcompendium @ git+https://github.com/marin-community/marin.git@f6acc0157a3008d8aae6fe0a12cf573a03a0fed9#subdirectory=lib/taskcompendium",
-    "marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@f6acc0157a3008d8aae6fe0a12cf573a03a0fed9#subdirectory=lib/verifyit",
+    "marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@e5c273f8a8f335ffb07a1b2f468ecbb72cce1701#subdirectory=lib/verifyit",
     "func_timeout",
     "loguru",
     "numpy",
@@ -51,7 +51,11 @@ line-length = 120
 
 [tool.uv]
 # Select a published package instead of the enclosing Git workspace.
-override-dependencies = ["marin-rigging>=0.2.144.dev37540375919"]
+override-dependencies = [
+    "marin-rigging>=0.2.144.dev37540375919",
+    # Ahead of the other Marin libraries, which otherwise pull verifyit from their own revision.
+    "marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@e5c273f8a8f335ffb07a1b2f468ecbb72cce1701#subdirectory=lib/verifyit",
+]
 
 [tool.ruff.lint]
 ignore = [

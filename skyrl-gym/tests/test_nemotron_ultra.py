@@ -283,6 +283,42 @@ def test_tool_call_reward_requires_the_expected_tool_and_recursive_arguments():
     assert grade_expected_action(expected, wrong)[0] == 0.0
 
 
+SWE_PIVOT_AGENT = "swe_pivot_single_step_tool_use_with_argument_comparison_agent"
+SWE_PIVOT_RECORD = {
+    "expected_action": {"type": "function_call", "name": "bash", "arguments": '{"command": "grep -rn foo src"}'}
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "reward"),
+    [
+        ({}, 0.0),
+        ({"pivot_reward": "nemo"}, 1.0),
+        ({"pivot_reward": "exact"}, 0.0),
+    ],
+)
+async def test_swe_pivot_rows_train_on_the_configured_verdict_component(nemotron_session, model_turn, config, reward):
+    session = await nemotron_session(SWE_PIVOT_AGENT, SWE_PIVOT_RECORD, config)
+    call = {"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls -la src"}'}}
+
+    result = await session.advance(model_turn("", message={"role": "assistant", "content": "", "tool_calls": [call]}))
+
+    assert result.reward == reward
+
+
+@pytest.mark.asyncio
+async def test_terminus_pivot_rows_reward_keystroke_similarity(nemotron_session, model_turn):
+    action = {"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls -la /workspace\n", "duration": 0.1}]}
+    record = {"expected_answer": json.dumps(action)}
+    session = await nemotron_session("terminus_judge_string_only_simple_agent", record, {"pivot_reward": "string_90"})
+
+    result = await session.advance(model_turn(json.dumps(action)))
+
+    assert result.reward == 1.0
+    assert result.metrics["pivot_schema_completion"] == 1.0
+
+
 def test_tool_call_reward_accepts_any_text_when_a_message_is_expected():
     expected = {"type": "message", "content": "the reference text is intentionally not compared"}
 

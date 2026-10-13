@@ -11,7 +11,7 @@ version = "0.1.0"
 description = "Marin's typed launcher and RL training runtime"
 requires-python = "==3.12.*"
 dependencies = [
-"marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@f6acc0157a3008d8aae6fe0a12cf573a03a0fed9#subdirectory=lib/verifyit",
+"marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@e5c273f8a8f335ffb07a1b2f468ecbb72cce1701#subdirectory=lib/verifyit",
     "aiohttp>=3.13.3",
     "boto3",
     "datasets>=4.0.0",
@@ -184,6 +184,8 @@ no-build-isolation-package = [
 ]
 override-dependencies = [
     "marin-rigging[secrets,prometheus]==0.2.144.dev37540375919",
+    # Ahead of the other Marin libraries, which otherwise pull verifyit from their own revision.
+    "marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@e5c273f8a8f335ffb07a1b2f468ecbb72cce1701#subdirectory=lib/verifyit",
     "harbor-config @ git+https://github.com/marin-community/harbor@6b2e76e1dae5c084eed05edefefffcec8c0c1ad9#subdirectory=packages/harbor-config",
     # Megatron Bridge declares this native extension but does not import or use it.
     "fast-hadamard-transform ; sys_platform == 'never'",

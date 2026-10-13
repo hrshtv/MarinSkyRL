@@ -41,6 +41,7 @@ from skyrl_gym.envs.nemotron_ultra.math_judge_verifyit import grade_math_verifyi
 from skyrl_gym.envs.nemotron_ultra.math_with_judge import grade_math
 from skyrl_gym.envs.nemotron_ultra.mcqa import grade_mcqa
 from skyrl_gym.envs.nemotron_ultra.nvarc import extract_python, valid_grid, grade_transductive_arc
+from skyrl_gym.envs.nemotron_ultra.pivot_verifyit import PIVOT_COMPONENTS, TERMINUS_AGENT, grade_pivot
 from skyrl_gym.envs.nemotron_ultra.lean_feedback import build_correction_prompt, format_error_feedback
 from skyrl_gym.envs.nemotron_ultra.lean_proof import build_lean4_proof, determine_proof_status
 from skyrl_gym.envs.nemotron_ultra.rdkit_chemistry import grade_rdkit_chemistry
@@ -106,8 +107,14 @@ class NemotronTaskSession:
         if ultra["route"] != "task_session":
             raise ValueError("Terminal source rows require a portable Harbor task")
         self.agent = ultra["agent"]
-        if self.agent not in NEMOTRON_ULTRA_MOPD_AGENTS:
+        if self.agent not in NEMOTRON_ULTRA_MOPD_AGENTS | {TERMINUS_AGENT}:
             raise ValueError(f"Unsupported Nemotron source agent: {self.agent!r}")
+        # The verdict component a PivotRL run trains on; other rows in the blend ignore it.
+        self.pivot_reward = self.config.get("pivot_reward")
+        if self.agent == TERMINUS_AGENT and self.pivot_reward is None:
+            raise ValueError("Terminus pivot rows need pivot_reward")
+        if self.agent in PIVOT_COMPONENTS and self.pivot_reward not in {None, *PIVOT_COMPONENTS[self.agent]}:
+            raise ValueError(f"{self.agent} has no pivot component {self.pivot_reward!r}")
         self.record = json.loads(ultra["record_json"])
         self.request = json.loads(ultra["request_json"])
         self.ipi_session = create_session(self.record) if self.agent == IPI_AGENT else None
@@ -279,6 +286,8 @@ class NemotronTaskSession:
         return observations
 
     def _answer_grade(self, action, message):
+        if self.agent in PIVOT_COMPONENTS and self.pivot_reward is not None:
+            return grade_pivot(self.agent, self.record, action, message, self.pivot_reward)
         if self.agent in GENRM_AGENTS:
             return float(self.config.get("genrm", {}).get("default_score", 3.0)), {"cohort_reward_pending": True}
         if self.agent in {NS_TOOLS_AGENT, "math_with_judge_simple_agent"}:
