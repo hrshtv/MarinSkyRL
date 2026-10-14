@@ -73,7 +73,6 @@ NCCL_DEBUG_INFO_TEMP_FILE_ENV = "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"
 NCCL_BUFFER_SIZE_ENV_VAR = "NCCL_BUFFSIZE"
 PYTHONPATH_ENV = "PYTHONPATH"
 VLLM_USE_V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
-VLLM_USE_DEEP_GEMM_ENV = "VLLM_USE_DEEP_GEMM"
 VLLM_BATCH_INVARIANT_ENV = "VLLM_BATCH_INVARIANT"
 VLLM_ALLOW_INSECURE_SERIALIZATION_ENV = "VLLM_ALLOW_INSECURE_SERIALIZATION"
 RUNAI_STREAMER_LOG_TO_STDERR_ENV = "RUNAI_STREAMER_LOG_TO_STDERR"
@@ -168,12 +167,6 @@ ENV_VAR_SPECS = (
         EnvVarSource.DERIVED,
         frozenset({EnvVarScope.INFERENCE_WORKER}),
         frozenset({EnvVarWriter.PYTHON_ASSIGNMENT}),
-    ),
-    EnvVarSpec(
-        VLLM_USE_DEEP_GEMM_ENV,
-        "ci.marin_nightly.grug",
-        EnvVarSource.EXTERNAL,
-        frozenset({EnvVarScope.DRIVER}),
     ),
     EnvVarSpec(
         VLLM_BATCH_INVARIANT_ENV,
@@ -714,10 +707,7 @@ def grug_gpu_gate_environment(repository_root: str, *, environ: Mapping[str, str
     source_paths = f"{repository_root}/skyrl-gym:{repository_root}/skyrl-train"
     if pythonpath := ambient.get(PYTHONPATH_ENV):
         source_paths = f"{source_paths}:{pythonpath}"
-    return {
-        PYTHONPATH_ENV: source_paths,
-        VLLM_USE_DEEP_GEMM_ENV: "0",
-    }
+    return {PYTHONPATH_ENV: source_paths}
 
 
 def wandb_launch_environment(*, entity: str | None, environ: Mapping[str, str] | None = None) -> dict[str, str]:
