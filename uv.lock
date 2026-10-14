@@ -26,9 +26,6 @@ conflicts = [[
     { package = "marinskyrl", extra = "vllm" },
 ]]
 
-[options]
-prerelease-mode = "allow"
-
 [manifest]
 constraints = [
     { name = "opentelemetry-api", specifier = "==1.43.0" },
