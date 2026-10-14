@@ -18,7 +18,6 @@ def test_ray_workers_inherit_frozen_cuda_library_path(monkeypatch):
     monkeypatch.setenv("TRITON_PTXAS_BLACKWELL_PATH", f"{cuda_root}/bin/ptxas")
     monkeypatch.setenv("LIBRARY_PATH", "/app/.venv/lib")
     monkeypatch.setenv("MAX_JOBS", "8")
-    monkeypatch.setattr("skyrl_train.utils.utils.peer_access_supported", lambda **_: True)
 
     runtime_environment = prepare_runtime_environment(example_dummy_config())
 

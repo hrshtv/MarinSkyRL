@@ -12,13 +12,11 @@ import torch
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from ray.util.placement_group import (
-    placement_group,
     PlacementGroupSchedulingStrategy,
     PlacementGroup,
     placement_group_table,
 )
 
-from skyrl_train.batch_invariant import BATCH_INVARIANT_NCCL_ENV
 from skyrl_train.config.callbacks import validate_hf_export_config
 from skyrl_train.config.utils import generation_context_limit
 from skyrl_train.config.query_bias import resolve_grug_query_bias_update
@@ -33,7 +31,6 @@ from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 from skyrl_train.env_vars import (
     DEBUG_ARTIFACT_DIR_ENV,
     DEBUG_MODE_ENV,
-    VLLM_BATCH_INVARIANT_ENV,
     EnvVarManager,
     EnvVarScope,
 )
@@ -51,7 +48,6 @@ from marinskyrl.distillation import (
 from marinskyrl.inference_placement import validate_expert_block_transport
 from marinskyrl.runtime_options import GDNBackend, R3Transport
 
-from .constants import DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS
 from .algorithm_registry import (
     AdvantageEstimatorRegistry,
     NoGroupAdvantage,
@@ -1049,28 +1045,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         # selecting native IPC alone does not remove its pickle requirement.
         env_vars["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    # Use max of available GPU counts, defaulting to 1 if none found
-    gpu_counts = []
-    if hasattr(cfg.generator, "inference_engine_tensor_parallel_size"):
-        gpu_counts.append(cfg.generator.inference_engine_tensor_parallel_size)
-    if hasattr(cfg, "trainer") and hasattr(cfg.trainer, "placement"):
-        placement = cfg.trainer.placement
-        gpu_counts.extend(
-            [
-                placement.policy_num_gpus_per_node,
-                placement.critic_num_gpus_per_node,
-                placement.ref_num_gpus_per_node,
-            ]
-        )
-    max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
-    if not peer_access_supported(
-        max_num_gpus_per_node=max_num_gpus_per_node,
-        placement_group_timeout_seconds=int(cfg.trainer.distributed.placement_group_timeout_seconds),
-    ):
-        logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
-        env_vars["NCCL_P2P_DISABLE"] = "1"
-        env_vars["NCCL_SHM_DISABLE"] = "1"
-
     # TODO: this can be removed if we standardize on env files.
     # But it's helpful for a quickstart
     if os.environ.get("WANDB_API_KEY"):
@@ -1119,11 +1093,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         if os.environ.get(_net_env):
             logger.info(f"Exporting `{_net_env}` to ray runtime env: {os.environ[_net_env]}")
             env_vars[_net_env] = os.environ[_net_env]
-
-    if env_vars.get(VLLM_BATCH_INVARIANT_ENV) == "1" or os.environ.get(VLLM_BATCH_INVARIANT_ENV) == "1":
-        # Megatron and vLLM share a weight-update NCCL group; mismatched settings broke its first broadcast.
-        # Remove this override if publication no longer joins their ranks; it also affects learner collectives.
-        env_vars.update(BATCH_INVARIANT_NCCL_ENV)
 
     # EnvVarManager owns NCCL verbosity through trainer.debug_mode. Do not copy
     # ambient NCCL_DEBUG values into Ray workers: stale launcher extra_env once
@@ -1290,48 +1259,6 @@ def print_mem(tag: str, mem: dict):
         f"Free: {format_gib(mem['free'])}, "
         f"Total: {format_gib(mem['total'])}"
     )
-
-
-def run_p2p_access_check():
-    device_count = torch.cuda.device_count()
-    if device_count < 2:
-        return False
-
-    # Check P2P access between all GPU pairs
-    for i in range(device_count):
-        for j in range(device_count):
-            if i != j:
-                # This checks if device i can access device j's memory
-                can_access = torch.cuda.can_device_access_peer(i, j)
-                if not can_access:
-                    return False
-
-    return True
-
-
-def peer_access_supported(
-    max_num_gpus_per_node: int,
-    placement_group_timeout_seconds: int = DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS,
-):
-    # whatever the max num gpus per node is, we can check p2p access if there are at least 2 GPUs
-    # if max is 1, p2p access is not supported
-    if max_num_gpus_per_node <= 1:
-        return False
-
-    if not torch.cuda.is_available():
-        # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
-        ray.init()
-        pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
-        get_ray_pg_ready_with_timeout(pg, timeout=placement_group_timeout_seconds)
-        result = ray.get(
-            ray.remote(num_gpus=2, scheduling_strategy=PlacementGroupSchedulingStrategy(pg))(
-                run_p2p_access_check
-            ).remote()
-        )
-        ray.shutdown()
-        return result
-    else:
-        return run_p2p_access_check()
 
 
 def update_model_config(module_config, override_config_kwargs):
