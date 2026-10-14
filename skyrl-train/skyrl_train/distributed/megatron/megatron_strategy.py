@@ -329,8 +329,12 @@ class MegatronStrategy(DistributedStrategy):
         model_sharded_state_dict = model.sharded_state_dict()
         sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer:
-            # An empty training selection can reach checkpointing before the first
-            # update. Megatron's serializer still requires the lazy optimizer state.
+            # Core 0.19.2 only initializes lazy state when is_loading is true:
+            # https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/optimizer/optimizer.py#L1145
+            # An empty training selection can save before its first update.
+            # Initialize missing moments without changing existing state. Remove
+            # when native serialization supports that first save; verify the
+            # chained/unchained pre-update save and checkpoint continuation tests.
             optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
             for child in optimizers:
                 if child.optimizer is not None and child.init_state_fn is not None:
