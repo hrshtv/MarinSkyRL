@@ -100,6 +100,10 @@ def _muonh_fp32_substates(optimizer_state: dict) -> list[dict]:
 
 def _muonh_fp32_groups_as_mapping(optimizer_state: dict) -> None:
     """Avoid mixed empty/nonempty list merges across PP and EP ranks."""
+    # Core 0.19.2 extracts populated lists as dicts but keeps empty lists, then
+    # its native merge rejects the mixed types across Hero PP/EP ranks:
+    # https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/dist_checkpointing/dict_utils.py
+    # Remove after native mixed empty/populated FP32 group save/resume works.
     for state in _muonh_fp32_substates(optimizer_state):
         groups = state.get("fp32_from_fp16_params")
         if groups is not None:
@@ -132,6 +136,10 @@ def _muonh_adamh_states(optimizer):
 
 def _muonh_adamh_step(optimizer) -> int:
     """Return the shared AdamH step, including ranks without an output head."""
+    # Core's wrapper checkpoints per-parameter tensor state; our scalar AdamH
+    # step is absent on PP ranks without that route. Preserve the recipe's shared
+    # counter explicitly until native optimizer sharding preserves it across
+    # empty PP groups. Verify continued updates against the unbroken reference.
     local_steps = {
         int(step.item()) for state, _ in _muonh_adamh_states(optimizer) if (step := state.get("step")) is not None
     }

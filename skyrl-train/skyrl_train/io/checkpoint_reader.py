@@ -17,6 +17,13 @@ from torch.futures import Future
 class RecordCheckpointReader(FileSystemReader):
     """Buffer one S3 record and release its decoded tensor before the next read."""
 
+    # Torch 2.14.1 leaves the last decoded tensor alive while loading the next,
+    # and torch.load's zip seeks become multiple uncached S3 range requests:
+    # https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/distributed/checkpoint/filesystem.py
+    # Remove when a native remote reader releases each decoded record and matches
+    # bounded memory/request cost. Verify real S3 continuation and repeated load
+    # timings; local correctness or one local timing does not establish that cost.
+
     def __init__(self, path: str) -> None:
         super().__init__(path)
         self.storage_read_seconds = 0.0

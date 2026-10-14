@@ -61,6 +61,11 @@ VERIFIED_GPU_WORKAROUND_INPUTS = {
     "nvidia-nccl-cu13": "2.30.7",
     "ray": "2.51.1",
     "uvloop": "0.23.0",
+    # Native remote checkpoint storage and the temporary offline Hub override.
+    "multi-storage-client": "0.51.0",
+    "fsspec": "2026.4.0",
+    "s3fs": "2026.4.0",
+    "huggingface-hub": "1.32.0",
 }
 
 VERIFIED_PATCH_SOURCES = {
@@ -218,6 +223,13 @@ def test_policy_closures_match_supported_architectures(architecture: str) -> Non
     assert selected == VERIFIED_GPU_WORKAROUND_INPUTS, (
         "Unverified GPU workaround/dependency combination. Test removal and "
         "record new necessity evidence before updating coverage."
+    )
+    # HF exports also feed the existing TF4 control. Its native class lookup
+    # establishes why hf_model retains the TF5 tokenizer metadata normalization.
+    control = json.loads((REPOSITORY_ROOT / "cloud/iris/configs/open_mopd_fidelity.json").read_text())
+    assert control["environment"]["packages"]["transformers"] == "4.57.6", (
+        "Unverified tokenizer metadata consumer. Test native TF5 export loading "
+        "before extending normalization coverage."
     )
 
 

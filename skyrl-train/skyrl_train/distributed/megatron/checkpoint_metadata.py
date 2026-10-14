@@ -18,6 +18,9 @@ def _stage_common_state(checkpoint_dir: str, destination: Path) -> None:
     # Core 0.19 stores common data as ShardedObject("common_state", ..., (1,), (0,)).
     # Its reader still accepts a common.pt view. Read just that DCP record; copying
     # its containing rank shard would also download the model and optimizer tensors.
+    # https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/dist_checkpointing/serialization.py
+    # Remove when native common-state loading accepts our S3 storage reader.
+    # Verify common metadata restoration without reading model/optimizer records.
     key = "common_state/shard_0_1"
     state = {key: BytesIO()}
     reader = s3_checkpoint_reader(checkpoint_dir, create_s3_filesystem(default_cache_type="none"))

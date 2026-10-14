@@ -21,8 +21,12 @@ from skyrl_train.io.torch_distributed_checkpoint import StreamingFsspecWriter
 from skyrl_train.io.checkpoint_reader import s3_checkpoint_reader
 
 
-# MCore 0.18 does not expose a storage-writer hook. Keep the adapter narrow: it
-# preserves MCore's state translation and planner and replaces only the writer.
+# Core 0.19.2's native MSC path passes a tiny real S3 round trip, but its save
+# interface selects an aggregated writer without a per-tensor layout option:
+# https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/dist_checkpointing/strategies/torch.py
+# MSC 0.51 buffers that entire rank object until close. Keep Core's translation
+# and planners while using our bounded stream. Remove when native Core/MSC
+# bounds remote staging; verify full-model save/resume memory and throughput.
 class DirectS3TorchDistSaveShardedStrategy(TorchDistSaveShardedStrategy):
     """Save MCore torch-dist shards directly to S3 through PyTorch DCP."""
 
