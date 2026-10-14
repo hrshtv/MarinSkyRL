@@ -5,9 +5,6 @@ from functools import partial
 import os
 
 from daytona import AsyncDaytona, DaytonaConfig
-from harbor_config.models.job.config import RetryConfig
-from harbor_config.models.environment_type import EnvironmentType
-from harbor_config.models.trial.config import EnvironmentConfig, VerifierConfig
 from omegaconf import DictConfig
 from shellbox.backends.daytona.machine import DaytonaMachineFactory, DaytonaNetworkMode, DaytonaNetworkPolicy
 from shellbox.machine import Backend, MachineFactory
@@ -16,13 +13,15 @@ from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec
 from taskcompendium.grading_result import GradingFailure, Outcome
 from rolloutengine.contracts import RolloutData, RolloutFailure
 
+from skyrl_train.rollouts.harbor_settings import EnvironmentConfig, EnvironmentType, RetryConfig, VerifierConfig
+
 from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
 from skyrl_train.trajectory_runners.harbor.identity_aware_reward import (
     IDENTITY_AWARE_SHAPER,
     identity_aware_pass_ratios,
 )
 from skyrl_train.trajectory_runners.harbor.truncation_penalty import apply_truncation_penalty, detect_turn_truncation
-from skyrl_train.trajectory_runners.types import TrajectoryRequestBatch
+from skyrl_train.trajectory_runners.types import RESPONSE_SPAN_TAGS_KEY, TrajectoryRequestBatch
 from skyrl_train.metric_names import IDENTITY_AWARE_REWARD_METRIC_PREFIX
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig, ErrorTreatment, classify_exception_type
 from skyrl_train.utils.pbs_shaping import compute_pbs_token_shaping
@@ -347,7 +346,7 @@ def shape_harbor_rollouts(
                 turn = step.turn
                 if config["enable_span_tagging"]:
                     turn = replace(
-                        turn, metadata={**turn.metadata, "response_span_tags": tags[start : step.response_end + 1]}
+                        turn, metadata={**turn.metadata, RESPONSE_SPAN_TAGS_KEY: tags[start : step.response_end + 1]}
                     )
                 annotated.append(
                     replace(

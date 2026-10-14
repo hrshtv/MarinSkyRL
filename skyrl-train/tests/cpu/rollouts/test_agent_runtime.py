@@ -10,7 +10,7 @@ from harbor.models.trial.config import AgentConfig
 from rolloutengine.contracts import ModelTurn
 from rolloutengine.spec import LoweredTaskSpec
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import MachineSpec, ShellSimBuiltins
+from shellbox.machine import MachineSpec, PackageSpec
 from taskcompendium.models import ConversationInput, TextMessage
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -21,7 +21,6 @@ from skyrl_train.rollouts.agent_runtime import InstalledAgentRuntime, InstalledA
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
-from skyrl_train.trajectory_runners.projections import WholeTrajectoryProjection
 from tests.cpu.rollouts.engine_fakes import InferenceClient, Tokenizer as ProjectionTokenizer
 from tests.cpu.task_specs import SHELL_ENVIRONMENT, lowered_task
 
@@ -103,14 +102,14 @@ async def test_native_runtime_routes_through_proxy_and_publishes_failed_attempts
         backend="shellsim",
         total_turn_timeout=5,
     )
-    machine = await ShellSimMachineFactory().create(MachineSpec(ShellSimBuiltins()))
+    machine = await ShellSimMachineFactory().create(MachineSpec(PackageSpec()))
     await runtime.startup()
     try:
         if path == "worker":
             request["env_extras"] = [{"lowered_task_spec": lowered.model_dump_json()}]
             worker = TaskRolloutWorker(
                 worker_config,
-                WholeTaskProjection(WholeTrajectoryProjection(worker_config, ProjectionTokenizer())),
+                WholeTaskProjection(worker_config, ProjectionTokenizer()),
                 InferenceClient(),
                 {"shellsim": ShellSimMachineFactory()},
                 harbor=HarborTaskSettings.from_config(OmegaConf.create({"harbor": {"max_retries": 0}})),

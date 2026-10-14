@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 from rolloutengine.contracts import GenerationLimitReached, RolloutContractError
 from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec, TaskRuntimeSpec, TaskSessionSpec
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import Backend, Command, NetworkPolicy, ShellSimBuiltins
+from shellbox.machine import Backend, Command, NetworkPolicy, PackageSpec
 from taskcompendium.grader import verifyit_package
 from taskcompendium.models import (
     AnswerType,
@@ -46,7 +46,6 @@ from skyrl_train.rollouts.buffer import (
 from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TASKCOMPENDIUM_ENVIRONMENT
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
-from skyrl_train.trajectory_runners.projections import WholeTrajectoryProjection
 from skyrl_train.trajectory_runners.model_clients import ModelServerError
 from skyrl_train.trajectory_runners.types import TokenProvenance, TrajectoryID
 
@@ -94,6 +93,9 @@ class ReplayClient:
 class ImageFactory:
     backend = Backend.DOCKER
 
+    def check_environment(self, _requirements, _spec):
+        pass
+
     machines: list = field(default_factory=list)
     failure: Exception | None = None
     failure_after: int = 0
@@ -102,7 +104,7 @@ class ImageFactory:
         if self.failure is not None and len(self.machines) == self.failure_after:
             raise self.failure
         machine = await ShellSimMachineFactory().create(
-            replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+            replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
         )
         self.machines.append(machine)
         return machine
@@ -195,7 +197,7 @@ def runner(client, factories=None, *, error_handling=None):
     )
     return TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         client,
         factories or {},
         shutdown_timeout=30,

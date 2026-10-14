@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from skyrl_gym.task_sessions import AnswerTaskSession
 from taskcompendium.grading_result import GradeResult, Outcome
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import Backend, Command, MachineSpec, ShellSimBuiltins
+from shellbox.machine import Backend, Command, MachineSpec, PackageSpec
 from taskcompendium.models import (
     AnswerType,
     ArtifactKind,
@@ -25,7 +25,6 @@ from taskcompendium.models import (
     VerifierArtifact,
 )
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
-from skyrl_train.trajectory_runners.projections import StepWiseTrajectoryProjection, WholeTrajectoryProjection
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.group_grader import GroupGraderSpec
@@ -61,6 +60,9 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             if operation == "create":
                 raise error_type("Provider operation failed")
@@ -69,7 +71,7 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
     factory = OwnedMachineFactory(Factory(), "fixture")
     try:
         with pytest.raises(expected_type) as failure:
-            machine = await factory.create(MachineSpec(ShellSimBuiltins()))
+            machine = await factory.create(MachineSpec(PackageSpec()))
             if operation == "run":
                 await machine.run(Command(("true",)))
             elif operation == "upload":
@@ -117,19 +119,19 @@ async def test_one_machine_cleanup_failure_does_not_abort_the_buffer_group(task_
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             return Machine(machine) if len(machines) == 1 else machine
 
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         InferenceClient(),
         {"shellsim": Factory()},
         shutdown_timeout=30,
@@ -193,13 +195,16 @@ async def test_worker_shutdown_cancels_model_and_deletes_its_machine(task_inputs
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(spec)
             return DeletionMachine(machine, deletions, deleted)
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         Client(),
         {"fixture": Factory()},
         shutdown_timeout=30,
@@ -231,6 +236,9 @@ async def test_worker_shutdown_owns_late_creation_and_bounds_a_blocked_provider(
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             started.set()
             await release.wait()
@@ -239,7 +247,7 @@ async def test_worker_shutdown_owns_late_creation_and_bounds_a_blocked_provider(
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {"fixture-provider": Factory()},
         shutdown_timeout=0.05 if not complete_during_shutdown else 5,
@@ -348,9 +356,12 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
     class Factory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             return Machine(machine)
@@ -378,12 +389,9 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
             ]
             return output
 
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         Client(),
         {"docker": Factory(), "harbor": Factory()},
         harbor=settings,
@@ -500,7 +508,7 @@ async def test_blocking_grader_cannot_extend_attempt_or_cleanup_deadlines(task_i
     request["env_classes"] = ["blocking"]
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {},
         sessions={"blocking": partial(AnswerTaskSession, grader=grade)},
@@ -555,7 +563,7 @@ async def test_worker_shutdown_cancels_the_whole_request_before_buffer_commit(ta
         ).model_dump_json()
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {},
         group_graders={"fixture": blocking_grader},
@@ -606,13 +614,16 @@ async def test_worker_shutdown_reports_late_provider_close_failure_without_unhan
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(spec)
             return DelayedFailureMachine(machine, deletions, deleted)
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {"fixture-provider": Factory()},
         shutdown_timeout=0.02,

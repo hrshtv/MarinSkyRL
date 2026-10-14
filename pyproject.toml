@@ -11,7 +11,7 @@ version = "0.1.0"
 description = "Marin's typed launcher and RL training runtime"
 requires-python = "==3.12.*"
 dependencies = [
-"marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@f94d01a5280c0e0eb8ebd3699de30fdb06c50326#subdirectory=lib/verifyit",
+    "marin-verifyit[math,schema,reasoning-gym,judge]>=0.2.171.dev38477406391",
     "aiohttp>=3.13.3",
     "boto3",
     "datasets>=4.0.0",
@@ -20,7 +20,6 @@ dependencies = [
     "filelock>=3.16",
     "fsspec>=2024.0.0",
     "func_timeout",
-    "harbor-config @ git+https://github.com/marin-community/harbor@6b2e76e1dae5c084eed05edefefffcec8c0c1ad9#subdirectory=packages/harbor-config",
     "hf_transfer",
     "huggingface-hub>=0.34.0",
     "ijson>=3.5",
@@ -36,8 +35,8 @@ dependencies = [
     "marin-iris>=0.2.144.dev37540375919",
     "marin-iris-native",
     "marin-rigging[secrets]>=0.2.144.dev37540375919",
-    "marin-rolloutengine @ git+https://github.com/marin-community/marin.git@f94d01a5280c0e0eb8ebd3699de30fdb06c50326#subdirectory=lib/rolloutengine",
-    "marin-shellbox[daytona,shellsim] @ git+https://github.com/marin-community/marin.git@f94d01a5280c0e0eb8ebd3699de30fdb06c50326#subdirectory=lib/shellbox",
+    "marin-rolloutengine>=0.2.171.dev38477406391",
+    "marin-shellbox[daytona,shellsim]",
     "ninja",
     "nvidia-ml-py",
     "omegaconf",
@@ -54,7 +53,7 @@ dependencies = [
     "s3fs",
     "smart_open",
     "tensorboard",
-    "marin-taskcompendium @ git+https://github.com/marin-community/marin.git@f94d01a5280c0e0eb8ebd3699de30fdb06c50326#subdirectory=lib/taskcompendium",
+    "marin-taskcompendium",
     "tqdm>=4.66",
     "tokenizers==0.22.2",
     "transformers==5.12.1",
@@ -120,7 +119,6 @@ megatron = [
     "fast-hadamard-transform==1.1.0 ; sys_platform == 'linux'",
     "megatron-bridge==0.6.2+marin.torch2141.2 ; sys_platform == 'linux'",
     "megatron-core==0.19.2+marin.torch2141.4 ; sys_platform == 'linux'",
-    "harbor-config ; sys_platform == 'linux'",
     "nvidia-modelopt==0.47.0 ; sys_platform == 'linux'",
     "peft>=0.19 ; sys_platform == 'linux'",
     "tensordict ; sys_platform == 'linux'",
@@ -188,13 +186,12 @@ environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
 ]
-override-dependencies = [
-    "marin-rigging[secrets,prometheus]==0.2.158.dev37984346192",
-]
+override-dependencies = []
 constraint-dependencies = [
     "opentelemetry-api==1.43.0",
     "opentelemetry-sdk==1.43.0",
@@ -255,7 +252,6 @@ fast-hadamard-transform = [
     { url = "https://github.com/marin-community/MarinSkyRL/releases/download/trainer-native-cu132-torch2141-20261004-db1a32ca/fast_hadamard_transform-1.1.0-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 nvidia-cusparselt-cu13 = { url = "https://github.com/marin-community/MarinSkyRL/releases/download/native-cu132-cusparselt081-armtag-20261004/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }
-harbor-config = { git = "https://github.com/marin-community/harbor", rev = "6b2e76e1dae5c084eed05edefefffcec8c0c1ad9", subdirectory = "packages/harbor-config" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

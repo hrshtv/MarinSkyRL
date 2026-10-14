@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from skyrl_gym.verification import VerificationStatus
 from skyrl_gym.tool_protocol_task import ToolProtocolReplaySession
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import Backend, Command, ShellSimBuiltins, NetworkPolicy
+from shellbox.machine import Backend, Command, PackageSpec, NetworkPolicy
 from taskcompendium.models import (
     AnswerType,
     ArtifactKind,
@@ -31,7 +31,6 @@ from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskP
 from skyrl_train.dataset.tasks import TaskDataset, write_tasks
 from skyrl_train.dataset.protocol_replay import ReplayPartition, replay_tasks
 from skyrl_train.dataset.harbor import HarborTaskDataset
-from skyrl_train.trajectory_runners.projections import StepWiseTrajectoryProjection, WholeTrajectoryProjection
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
@@ -60,13 +59,16 @@ async def test_mixed_harbor_and_native_tasks_keep_separate_providers_and_machine
     class Factory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         def __init__(self, provider):
             self.provider = provider
 
         async def create(self, spec):
             machines[self.provider].append(spec)
             return await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), cpus=None, workdir="/workspace")
+                replace(spec, source=PackageSpec(), cpus=None, workdir="/workspace")
             )
 
     settings = HarborTaskSettings.from_config(
@@ -86,7 +88,7 @@ async def test_mixed_harbor_and_native_tasks_keep_separate_providers_and_machine
     }
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {provider: Factory(provider) for provider in machines},
         harbor=settings,
@@ -188,21 +190,21 @@ async def test_disabled_harbor_verification_keeps_tokens_but_masks_training(
     assert LoweredTaskSpec.model_validate_json(extras["lowered_task_spec"]).task.resources.verifier == ()
     request.update(prompts=[prompt], env_classes=[env], env_extras=[extras], trajectory_ids=[TrajectoryID(uid, 0)])
     request["batch_metadata"] = BatchMetadata(0, phase)
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
 
     class ImageFactory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             return await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
 
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         ConversationClient(["Done"]),
         {"harbor": ImageFactory()},
         harbor=settings,
@@ -257,13 +259,16 @@ async def test_harbor_retries_close_failed_attempts_and_commit_only_the_selected
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             nonlocal attempts
             attempts += 1
             if failure_stage == "startup" and attempts < 3:
                 raise TimeoutError("Sandbox startup timed out")
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             if failure_stage not in {"verifier", "cancel"} or attempts == 3:
@@ -312,9 +317,12 @@ async def test_harbor_retries_close_failed_attempts_and_commit_only_the_selected
     class VerifierFactory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             return machine
@@ -351,7 +359,7 @@ async def test_harbor_retries_close_failed_attempts_and_commit_only_the_selected
     )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         Client(),
         {"shellsim": Factory(), "verifier": VerifierFactory()},
         harbor=settings,
@@ -467,11 +475,14 @@ async def test_harbor_retry_policy_preserves_terminal_grades(task_inputs, phase,
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             nonlocal attempts
             attempts += 1
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             await machine.run(Command(("sh", "-c", f"echo {attempts} > /workspace/attempt")))
             return machine
@@ -479,13 +490,16 @@ async def test_harbor_retry_policy_preserves_terminal_grades(task_inputs, phase,
     class VerifierFactory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             nonlocal verifier_starts
             verifier_starts += 1
             if failure.startswith("grade_timeout"):
                 raise TimeoutError("Verifier machine startup timed out")
             return await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
 
     class Client(InferenceClient):
@@ -534,7 +548,7 @@ async def test_harbor_retry_policy_preserves_terminal_grades(task_inputs, phase,
     )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         Client(),
         {"shellsim": Factory(), "verifier": VerifierFactory()},
         harbor=settings,
@@ -604,7 +618,7 @@ async def test_harbor_completion_reward_uses_the_engine_stop_reason(task_inputs,
     )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         Client(),
         {"docker": FixtureImageFactory(), "harbor": FixtureImageFactory()},
         harbor=settings,
@@ -668,7 +682,7 @@ async def test_strict_harbor_parser_masks_only_the_affected_response(task_inputs
     )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {"docker": FixtureImageFactory(), "harbor": FixtureImageFactory()},
         harbor=settings,
@@ -725,7 +739,7 @@ async def test_harbor_concurrency_does_not_queue_gym_tasks(task_inputs, phase):
     )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         WaitingClient(),
         {},
         harbor=HarborTaskSettings.from_config(OmegaConf.create({"harbor": {"n_concurrent_trials": 2}})),
@@ -823,9 +837,12 @@ async def test_harbor_source_materialization_runs_without_the_original_directory
     class ImageFactory:
         backend = Backend.DOCKER
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             return await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
 
     client = ConversationClient(
@@ -851,7 +868,7 @@ async def test_harbor_source_materialization_runs_without_the_original_directory
     request.update(prompts=[prompt], env_classes=[env], env_extras=[extras], trajectory_ids=[TrajectoryID(uid, 0)])
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         client,
         {"docker": ImageFactory()},
         shutdown_timeout=30,
