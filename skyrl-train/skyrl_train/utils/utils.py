@@ -1051,54 +1051,12 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     """
     env_vars = {}
 
-    # Force CPython stock asyncio (epoll SelectorEventLoop), NOT uvloop, in EVERY
-    # Ray worker/actor process spawned under this runtime env.
-    #
-    # Ray installs uvloop globally in every worker by default
-    # (RAY_USE_UVLOOP defaults True -> ray default_worker.py try_install_uvloop).
-    # libuv's epoll-ctl machinery SIGABRTs under Daytona sandbox-teardown socket
-    # churn (uv__epoll_ctl_prep / uv__io_poll asserts; present across libuv
-    # 1.45-1.49+). The driver/orchestrator is already protected by
-    # asyncio.set_event_loop_policy(DefaultEventLoopPolicy()) in
-    # BasePPOExp.run() (entrypoints/main_base.py), but that ONLY covers the
-    # skyrl_entrypoint driver process -- it does NOT propagate into the Ray
-    # *actor* processes (rollout workers, inference engines, policy/ref
-    # workers), which still install uvloop and still abort. Observed on the 80B
-    # production run (job 669177): a rollout worker's CoreWorker aborted at
-    # Fatal Python error: Aborted -> uv__epoll_ctl_prep inside
-    # CoreWorker.initialize_eventloops_for_actor_concurrency_group AFTER a full
-    # clean step 1, taking the run down. The EnvVarManager projection below sets
-    # RAY_USE_UVLOOP=0 before actor imports, making Ray's uvloop install a no-op.
-    # Actors are network-RTT-bound (vLLM/Daytona HTTP) so uvloop's throughput
-    # edge is moot. See feedback_uvloop_libuv_019_pin.
     # Ray's job runtime environment is the explicit contract for worker-wide
     # settings. Forward NUMA placement when the launcher opts in so the early
     # worker hook and actor constructors observe the same value as the driver.
     if NUMA_AFFINITY_ENV in os.environ:
         env_vars[NUMA_AFFINITY_ENV] = os.environ[NUMA_AFFINITY_ENV]
 
-    # Disable libuv's io_uring backend in EVERY Ray actor/worker process.
-    #
-    # WHY (job 930208, the SSL re-abort): RAY_USE_UVLOOP=0 + the policy hook
-    # were STILL insufficient -- 930208 SIGABRT'd in a rollout worker at
-    # uvloop/sslproto.pyx:517 SSLProtocol._on_handshake_complete (the
-    # litellm->Daytona HTTPS handshake), proving a live uvloop.Loop() was
-    # running an SSL transport in the actor despite the stock-asyncio POLICY.
-    # uvloop.new_event_loop() constructs uvloop.Loop() DIRECTLY (it does NOT
-    # consult asyncio's event-loop policy), so a policy reset cannot stop a
-    # uvloop loop that Ray's C++ CoreWorker or aiohttp brings up by calling
-    # uvloop.new_event_loop() outright.
-    #
-    # The crash is libuv 1.48.0's io_uring epoll-ctl race (uv__epoll_ctl_prep;
-    # fixed in 1.49.0). libuv reads UV_USE_IO_URING via getenv() inside
-    # uv__use_io_uring() AT FIRST USE and caches it atomically; "0" -> io_uring
-    # is never armed and the buggy path is dead, while uvloop otherwise keeps
-    # working on plain epoll. The var was INERT before because it lived only in
-    # the driver/launcher (host) env and was NEVER propagated into the Ray
-    # ACTOR process env -- Ray actors derive their environment from the managed
-    # runtime_env contract, not from arbitrary driver env. EnvVarManager puts it
-    # in the actor's process env before the actor imports uvloop/libuv, so
-    # libuv's first uv__use_io_uring() reads 0.
     env_vars.update(EnvVarManager.from_config(cfg).environment_for(EnvVarScope.RAY_WORKER))
     # Resolve the actual collective deadline last so the debug preset's heartbeat
     # cannot exceed a shorter explicitly configured process-group timeout.
@@ -1108,12 +1066,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
             collective_timeout_seconds=int(cfg.trainer.distributed.worker_collective_timeout_seconds),
         )
     )
-
-    # NOTE (charlie): See https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
-    # and https://docs.vllm.ai/en/v0.9.2/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-    # Same for SGLang as we set `NCCL_CUMEM_ENABLE` to 0 in `sglang_engine.py`'s _patched_set_envs_and_config
-    if cfg.generator.weight_sync_backend == "nccl":
-        env_vars["NCCL_CUMEM_ENABLE"] = "0"
 
     # Useful when TP > 1 (and thus Megatron sequence parallel is enabled).
     # See https://github.com/NVIDIA/Megatron-LM/issues/533#issuecomment-1760193239
@@ -1125,34 +1077,13 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     if cfg.generator.backend == "vllm":
         env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
 
-        # NOTE (sumanthrh): In vllm >= 0.9.0, we need to explicitly allow for serialization via pickle for collective RPCs.
-        # During weight transfer, we use IPC handles, which contains a `function` object and requires pickling.
+        # vLLM 0.30 rejects IPC rebuild callbacks in MsgpackEncoder without this
+        # option. Its native IPC backend also requires it for HTTP pickled handles:
+        # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/serial_utils.py#L221
+        # Remove when our IPC payload uses a native callback-free wire format.
+        # Verify repeated colocated/expert-block transfer with serialization off;
+        # selecting native IPC alone does not remove its pickle requirement.
         env_vars["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-
-        # NOTE (sumanthrh): In vLLM >= 0.9.0, we've observed compilatiion failures with torch compile. removing the compilation directory and trying
-        # again does not fix the issue. Temporarily we disable compilation cache, which seems to fix the issue.
-        # This should not have any effect on performance - compilation will still happen, it's just not cached
-        # TODO (sumanthrh): remove this once vLLM fixes the issue
-        env_vars["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-
-        if not os.environ.get("VLLM_USE_V1", False):
-            logger.info(
-                "`VLLM_USE_V1` is not specified, setting `VLLM_USE_V1` to 1. To override, set `VLLM_USE_V1` explicitly"
-            )
-            env_vars["VLLM_USE_V1"] = "1"
-            # The `mp` executor backend (Qwen3-Next R3 capture path, opt-in
-            # generator.inference_engine_mp_backend) REQUIRES v1 multiprocessing to
-            # spawn its TP worker subprocesses; forcing it to 0 here (the default,
-            # for scheduling determinism) cancels the mp executor's shm message
-            # queue at warm-up. Keep it ON (unset => vLLM default 1) for mp.
-            mp_backend = bool(getattr(cfg.generator, "inference_engine_mp_backend", False))
-            if not mp_backend:
-                env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-            else:
-                logger.info(
-                    "inference_engine_mp_backend=true: NOT setting VLLM_ENABLE_V1_MULTIPROCESSING=0 "
-                    "(the mp executor needs v1 multiprocessing to spawn TP workers)."
-                )
 
     # Use max of available GPU counts, defaulting to 1 if none found
     gpu_counts = []
@@ -1295,13 +1226,7 @@ def initialize_ray(cfg: DictConfig):
             logger.info(f"On-demand all-thread stack capture active (SIGUSR2): {stack_path}")
 
     env_vars = prepare_runtime_environment(cfg)
-    # worker_process_setup_hook runs ONCE at the start of every Ray worker process,
-    # BEFORE the C++ CoreWorker builds actor threads. It installs the inherited
-    # host-memory policy and forces CPython stock asyncio (no uvloop/libuv) in every
-    # worker -- the only reliable place to cover concurrency-group loops that are
-    # created before an actor constructor can reset their event-loop policy.
-    # Referenced by fully-qualified name string (importable in every worker via the
-    # editable skyrl_train install) so Ray does not have to cloudpickle it.
+    # Install the inherited host-memory policy and diagnostics before actor threads.
     ray.init(
         runtime_env={
             "env_vars": env_vars,

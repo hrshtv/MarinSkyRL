@@ -43,7 +43,8 @@ VERIFIED_GPU_WORKAROUND_INPUTS = {
     "vllm": "0.0.0.dev20261012+marin.3a054c458ca8.cu132",
     "torchvision": "0.29.1+cu132",
     "torchaudio": "2.11.0+cpu",
-    "setuptools": "84.0.0",
+    # Native 0.30 bounds allow this version; both GPU architectures installed it.
+    "setuptools": "80.10.2",
     "apache-tvm-ffi": "0.1.12",
     "tilelang": "0.1.14",
     "tokenspeed-mla": "0.1.9",
@@ -54,6 +55,11 @@ VERIFIED_GPU_WORKAROUND_INPUTS = {
     "nvidia-cuda-cccl": "13.2.86",
     "nvidia-cuda-crt": "13.2.86",
     "nvidia-cuda-nvrtc": "13.2.86",
+    "nvidia-nvvm": "13.2.86",
+    # Cross-world NCCL group creation and Ray's actor CUDA-device assignment.
+    "nvidia-nccl-cu13": "2.30.7",
+    "ray": "2.51.1",
+    "uvloop": "0.23.0",
 }
 
 VERIFIED_PATCH_SOURCES = {
