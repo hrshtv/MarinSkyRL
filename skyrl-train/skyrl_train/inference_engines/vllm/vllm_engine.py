@@ -118,17 +118,14 @@ def _create_async_engine(engine_args, stat_loggers, data_parallel_master_ports):
 
 def _create_async_engine_with_port_collision_retries(engine_args, stat_loggers):
     """Start one independent engine, retrying opportunistically selected ports."""
-    import random
-
+    # Native 0.30 returns an unreserved port after closing its probe socket:
+    # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/utils/network_utils.py#L243
+    # Remove retries when native startup owns the socket through worker bind.
+    # Verify an owned port conflict and cleanup; this independent-engine retry
+    # must not be used for a multi-rank DP gang with peers awaiting old ports.
     max_attempts = 5
     backoff_base_seconds = 15.0
     for attempt in range(max_attempts):
-        stagger = random.uniform(1.5, 3.0)
-        logger.info(
-            f"Engine startup stagger: sleeping {stagger:.2f}s "
-            f"(attempt {attempt + 1}/{max_attempts}) to avoid port collisions"
-        )
-        time.sleep(stagger)
         try:
             return _create_async_engine(engine_args, stat_loggers, data_parallel_master_ports=None)
         except (DistNetworkError, RuntimeError, ZMQError) as error:
