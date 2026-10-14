@@ -14,6 +14,8 @@ from skyrl_train.objective.reduction import step_counts
 from skyrl_train.objective.score_centering import ppo_tis_score_centering_correction
 from skyrl_train.utils.advantage_estimators import compute_grpo_outcome_advantage
 
+PAPER_TIS_CAP = 2
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -48,10 +50,10 @@ def main() -> None:
                 chosen = logp.gather(-1, labels[..., None]).squeeze(-1)
                 old = chosen.detach().clone()
                 head = logp.gather(-1, ids)
-                tis = (old - chosen_q).exp().clamp(max=2)
+                tis = (old - chosen_q).exp().clamp(max=PAPER_TIS_CAP)
                 correction = ppo_tis_score_centering_correction(
                     head, head.detach(), head_q, advantages, masks,
-                    tis_cap=2, eps_clip_low=0.2, eps_clip_high=0.2,
+                    tis_cap=PAPER_TIS_CAP, eps_clip_low=0.2, eps_clip_high=0.2,
                 ) * enabled
                 batch = build_objective_micro_batch(
                     action_log_probs=chosen, old_action_log_probs=old, base_action_log_probs=None,
@@ -72,7 +74,7 @@ def main() -> None:
                 # The released modeled-tail scalar also retains detached E_p[log p].
                 q_tail = (1 - head_q.exp().sum(-1)).clamp_min(1e-6)
                 p_tail = (1 - head.exp().sum(-1)).clamp_min(1e-6)
-                alpha = (2 * q_tail / p_tail).clamp(max=1)
+                alpha = (PAPER_TIS_CAP * q_tail / p_tail).clamp(max=1)
                 plogp = (logp.exp() * logp).sum(-1)
                 scalar_offset = advantages * (tis * (1 - chosen) + enabled * alpha * plogp)
                 aligned = objective.optimization_loss.detach() + (scalar_offset * masks).sum() / masks.sum()
@@ -83,7 +85,7 @@ def main() -> None:
                     "reference_loss": reference_value, "skyrl_loss_after_scalar_offset": float(aligned),
                     "max_gradient_error": float(delta.max()), "mean_gradient_error": float(delta.mean()),
                     "ppo_clip_ratio": objective.metrics["ppo_clip_ratio"], "masked_tokens": int(masks.sum()),
-                    "tis_capped_fraction": float((((old - chosen_q).exp() > 2) * masks).sum() / masks.sum()),
+                    "tis_capped_fraction": float((((old - chosen_q).exp() > PAPER_TIS_CAP) * masks).sum() / masks.sum()),
                 })
     args.output.write_text(json.dumps({"scope": "FP32 p=o, actual +1/-1 group centering; masks; TIS2; natural head and modeled tail", "cases": results}, indent=2) + "\n")
 

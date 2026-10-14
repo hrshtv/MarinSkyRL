@@ -3,6 +3,7 @@ import base64
 from skyrl_gym.verification import VerificationResult
 import gzip
 import json
+import os
 from pathlib import Path
 import asyncio
 import threading
@@ -789,6 +790,31 @@ def test_storage_worker_is_terminated_at_the_publication_deadline(reuse):
 
     assert result.timed_out
     assert result.error is not None
+
+
+def _exit_without_result(request):
+    os._exit(23)
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_storage_worker_exit_is_reported_to_execute_and_submit(tmp_path, reuse):
+    publisher = ProcessTrajectoryPublisher(
+        _exit_without_result,
+        publish_timeout_seconds=120,
+        shutdown_timeout_seconds=30,
+        reuse_process=reuse,
+    )
+    request = PublicationRequest("worker-exit", PublicationOperation.PUBLISH, str(tmp_path), record_count=1)
+    try:
+        result = publisher.execute(request)
+        assert result.request_id == request.request_id and result.record_count == 1
+        assert result.error is not None and not result.timed_out
+        assert publisher.submit(request)
+        result = publisher.close()
+        assert result is not None and result.request_id == request.request_id
+        assert result.error is not None and not result.timed_out
+    finally:
+        publisher.close()
 
 
 def test_storage_worker_process_writes_archives_and_returns_the_ledger(tmp_path):

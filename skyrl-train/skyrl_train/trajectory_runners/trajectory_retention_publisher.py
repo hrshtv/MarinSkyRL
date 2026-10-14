@@ -196,6 +196,9 @@ class ProcessTrajectoryPublisher:
                         record_count=request.record_count,
                         error=f"storage worker exited with code {process.exitcode} without a result",
                     )
+        except (EOFError, BrokenPipeError, OSError) as error:
+            self._stop_process(process)
+            return PublicationResult(request.request_id, request.record_count, error=str(error))
         finally:
             receiver.close()
             sender.close()

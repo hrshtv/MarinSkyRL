@@ -232,7 +232,10 @@ class TrainingContext:
         ray.kill(self._buffer)
 
     async def publish(self, policy_step: int, *, sampler_policy_step: int | None = None) -> None:
-        """Acknowledge the previous batch and lease rollouts at ``policy_step``, whose weights are now live."""
+        """Acknowledge the learner batch and lease rollouts using the live ``sampler_policy_step`` weights.
+
+        Fresh sampling defaults to ``policy_step``; a frozen sampler can name an older weight version separately.
+        """
         if sampler_policy_step is None:
             publication = self._buffer.publish.remote(policy_step)
         else:

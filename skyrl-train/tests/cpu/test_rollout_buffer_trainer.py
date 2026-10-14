@@ -75,7 +75,7 @@ def test_weight_sync_respects_optimizer_offload_policy(reason, offload_enabled):
 
 
 @pytest.mark.asyncio
-async def test_periodic_refresh_changes_actual_serving_weights_only_at_the_declared_boundary(monkeypatch):
+async def test_periodic_refresh_preserves_simulated_sampler_weights_across_evaluation(monkeypatch):
     trainer = object.__new__(RayPPOTrainer)
     trainer.cfg = OmegaConf.create(
         {
