@@ -15,6 +15,8 @@ def merge_adjacent_checkpoint_shards(
     alive until optimizer restore finishes. Other shard layouts use the
     factory's original merge.
     """
+    # Tensor subclasses such as DTensor have distributed layout semantics;
+    # only ordinary local Tensor storage can safely use this aliasing path.
     if not shards or any(type(shard) is not torch.Tensor or shard.numel() == 0 for shard in shards):
         return fallback(shards)
     first = shards[0]

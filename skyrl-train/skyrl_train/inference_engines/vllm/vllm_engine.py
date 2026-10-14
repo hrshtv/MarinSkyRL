@@ -16,6 +16,7 @@ from zmq.error import ZMQError
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.exceptions import VLLMValidationError
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_pp_group
 from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -180,22 +181,22 @@ def _build_error_response(message: str, type_phrase: str, code: int) -> Dict[str
 _NORM_META_FAKES_REGISTERED = False
 
 
+# Upstream vLLM 0.30 registers these ops for CUDA only:
+# https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/csrc/libtorch_stable/torch_bindings.cpp#L792
+# Direct Meta calls with Torch 2.14.1 and Marin wheel 3a054c458ca8 raise
+# NotImplementedError without this helper; both succeed with it. This primitive
+# probe establishes the missing dispatch, not complete CP/PP transfer parity.
+# The ops mutate their inputs and return nothing, so their fake returns None.
+# Actual CUDA execution continues to use the native normalization kernels.
+#
+# Remove after native Meta registrations exist or reload no longer traces these
+# ops on Meta tensors. Verify the unpatched primitive calls and the existing
+# repeated expert-block/ShortConv transfer gates on H100 and GB200. Register
+# after loading the extension; retry later if its schemas are not loaded yet.
+
+
 def ensure_norm_meta_fakes_registered() -> None:
-    """Supply the two missing mutating-op Meta kernels used during layerwise reload.
-
-    Upstream vLLM 0.30 registers these ops for CUDA only:
-    https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/csrc/libtorch_stable/torch_bindings.cpp#L792
-    Direct Meta calls with Torch 2.14.1 and Marin wheel 3a054c458ca8 raise
-    NotImplementedError without this helper; both succeed with it. This primitive
-    probe establishes the missing dispatch, not complete CP/PP transfer parity.
-    The ops mutate their inputs and return nothing, so their fake returns None.
-    Actual CUDA execution continues to use the native normalization kernels.
-
-    Remove after native Meta registrations exist or reload no longer traces these
-    ops on Meta tensors. Verify the unpatched primitive calls and the existing
-    repeated expert-block/ShortConv transfer gates on H100 and GB200. Register
-    after loading the extension; retry later if its schemas are not loaded yet.
-    """
+    """Register both missing mutating-op Meta kernels once their schemas exist."""
     global _NORM_META_FAKES_REGISTERED
     if _NORM_META_FAKES_REGISTERED:
         return
@@ -1784,8 +1785,6 @@ class AsyncVLLMInferenceEngine(InferenceEngineInterface):
             # entrypoint actor's file descriptors and aborts its uvloop event
             # loop (uv__epoll_ctl_prep SIGABRT) -> ray.WorkerCrashedError.
             # See project notes: nemotron-junit a3 #11 (chain 521442-448).
-            from vllm.exceptions import VLLMValidationError
-
             is_input_overflow = isinstance(e, VLLMValidationError) and (
                 e.parameter == "input_tokens" or "input tokens" in str(e)
             )
@@ -1882,8 +1881,6 @@ class AsyncVLLMInferenceEngine(InferenceEngineInterface):
                 yield ensure_token_ids_in_sse_chunk(chunk)
 
         except Exception as e:
-            from vllm.exceptions import VLLMValidationError
-
             is_input_overflow = isinstance(e, VLLMValidationError) and (
                 e.parameter == "input_tokens" or "input tokens" in str(e)
             )

@@ -22,7 +22,8 @@ PYPROJECT = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
 # These are necessity/qualification coverage, not a preferred-version list.
 # A changed input must first test removal of the affected workaround and retain
 # new causal evidence beside its patch before extending this coverage.
-# Original coverage: https://echo.oa.dev/wiki/610 and PR944's release handoff.
+# Initial qualified group: https://echo.oa.dev/wiki/610. Necessity evidence is
+# beside each retained patch; dependency drift requires a new removal attempt.
 VERIFIED_GPU_WORKAROUND_INPUTS = {
     # Core optimizer routes, optional FA4 import order and frontend requirement.
     "megatron-core": "0.19.2+marin.torch2141.4",
