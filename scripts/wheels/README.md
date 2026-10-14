@@ -133,19 +133,17 @@ NVIDIA's cuSPARSELt 0.8.1 aarch64 wheel contains an aarch64 ELF library but decl
 `py3-none-manylinux2014_aarch64`. This mismatch makes `uv pip check` reject a clean
 ARM installation of Torch 2.14.1+cu132, which requires cuSPARSELt 0.8.1.
 
-`repair_cusparselt_wheel.py` accepts only the upstream wheel with SHA-256
-`4dca476c50bf4780d46cd0bfbd82e2bc10a08e4fef7950917ce8d7578d22a23f`. It verifies
-the native ELF architecture, corrects the internal platform tag, and regenerates
-`RECORD`. All other members, including the native library and license, retain
-their exact bytes. The output includes a provenance JSON file with input and
-output hashes and hashes of every preserved member.
+The completed one-time repair used the exact upstream wheel with SHA-256
+`4dca476c50bf4780d46cd0bfbd82e2bc10a08e4fef7950917ce8d7578d22a23f`.
+Its [archived recipe](https://github.com/marin-community/MarinSkyRL/blob/cb2565d6207549199ecd4c31c343d0bb7af03a6c/scripts/wheels/repair_cusparselt_wheel.py)
+checks the native ELF architecture and changes only `WHEEL` and `RECORD`.
+The native library and license bytes remain identical. The published wheel and
+its provenance remain available under `native-cu132-cusparselt081-armtag-20261004`.
 
-```bash
-python3 scripts/wheels/repair_cusparselt_wheel.py \
-  /tmp/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl \
-  /tmp/repaired-wheels
-```
-
-Install and check the repaired wheel on an ARM host before adoption. Pin the
-published wheel by URL and SHA-256. This packaging correction preserves the
-vendor's native code and its compiler provenance.
+The repair script is retired from the active build tools. Current builds reuse
+the immutable repaired artifact by URL and SHA-256. This retains an artifact
+exception; retiring its one-time tool does not remove that exception. Remove
+the URL override when a qualified Torch release accepts a correctly tagged
+native NVIDIA wheel. Newer cuSPARSELt 0.9/0.10 releases cannot replace 0.8.1
+under Torch 2.14.1's exact native requirement. Verify native ARM installation
+with `uv pip check` and the existing GPU/serving gates before removal.
