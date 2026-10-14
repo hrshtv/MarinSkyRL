@@ -11,9 +11,8 @@ if [[ "$package" == megatron-bridge || "$package" == speculators ]]; then
 fi
 bootstrap_python="$(uv python find "$python_version")"
 native_local_version="$("$bootstrap_python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["local_version"])' "$script_dir/native_versions.json")"
-flash_attn_upstream_version="$("$bootstrap_python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["flash_attn_upstream_version"])' "$script_dir/native_versions.json")"
 source_subdir=.
-source_patch=
+source_patches=()
 architecture="$(uname -m)"
 case "$architecture" in
     x86_64) cuda_architecture=90; torch_cuda_architecture=9.0 ;;
@@ -25,42 +24,38 @@ package_environment=()
 case "$package" in
     flash-attn)
         repository=Dao-AILab/flash-attention
-        source_commit=a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2
-        source_patch=flash-attn.patch
-        package_environment+=(FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_LOCAL_VERSION= "FLASH_ATTN_CUDA_ARCHS=$cuda_architecture")
+        source_patches+=(flash-attn.patch)
+        # Upstream's native option sets both wheel and metadata versions.
+        package_environment+=(FLASH_ATTENTION_FORCE_BUILD=TRUE "FLASH_ATTN_LOCAL_VERSION=$native_local_version" "FLASH_ATTN_CUDA_ARCHS=$cuda_architecture")
         ;;
     transformer-engine-torch)
         repository=NVIDIA/TransformerEngine
-        source_commit=6ea2a74a9e98c99e6d7b164a33775cc457520027
         source_subdir=transformer_engine/pytorch
         package_environment+=(NVTE_PYTORCH_FORCE_BUILD=TRUE NVTE_NO_LOCAL_VERSION=1 NVTE_BUILD_MAX_JOBS=1)
         max_jobs=1
         ;;
     megatron-core)
         repository=NVIDIA/Megatron-LM
-        source_commit=4b4acac9a1d28ea6829c8d4f566d75698a21249d
-        source_patch=megatron-core.patch
+        source_patches+=(megatron-core-optimizer-routes.patch megatron-core-fa4-import.patch megatron-core-frontend.patch megatron-core-version.patch)
         package_environment+=(NO_VCS_VERSION=1)
         ;;
     megatron-bridge)
         repository=NVIDIA-NeMo/Megatron-Bridge
-        source_commit=c0e164ed2aedac4ad1c877780e2564a19d5d54ec
-        source_patch=megatron-bridge.patch
+        source_patches+=(megatron-bridge-flashinfer.patch megatron-bridge-version.patch)
         package_environment+=(NO_VCS_VERSION=1)
         ;;
     speculators)
         repository=marin-community/speculators
-        source_commit=ecac1b16278063e9640004135153882c02de5801
-        source_patch=speculators.patch
+        source_patches+=(speculators-transformers.patch speculators-version.patch)
         package_environment+=(SPECULATORS_BUILD_TYPE=nightly SPECULATORS_BUILD_ITERATION=16)
         ;;
     fast-hadamard-transform)
         repository=Dao-AILab/fast-hadamard-transform
-        source_commit=e7706faf8d1c3b9f241e36860640ad1dac644ede
         package_environment+=(FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE)
         ;;
     *) echo "unsupported package: $package" >&2; exit 2 ;;
 esac
+source_commit="$("$bootstrap_python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["sources"][sys.argv[2]])' "$script_dir/native_versions.json" "$package")"
 
 mkdir -p "$build_dir"
 uv venv --allow-existing --python "$python_version" "$build_dir/venv"
@@ -98,10 +93,10 @@ fi
 git -C "$build_dir/source" submodule update --init --recursive
 git -C "$build_dir/source" submodule foreach --quiet --recursive \
     'test -z "$(git status --porcelain --untracked-files=all --ignore-submodules=none)"'
-if [[ -n "$source_patch" ]]; then
+for source_patch in "${source_patches[@]}"; do
     git -C "$build_dir/source" apply --unidiff-zero --check "$script_dir/patches/$source_patch"
     git -C "$build_dir/source" apply --unidiff-zero "$script_dir/patches/$source_patch"
-fi
+done
 
 virtual_env="$build_dir/venv"
 site_packages="$virtual_env/lib/python${python_version%.*}/site-packages"
@@ -126,8 +121,10 @@ fi
 {
     printf 'package=%s\narchitecture=%s\nsource=%s\n' "$package" "$architecture" "$source_commit"
     sha256sum "$0" "$build_requirements" "$script_dir/native_versions.json"
-    if [[ -n "$source_patch" ]]; then
+    for source_patch in "${source_patches[@]}"; do
         sha256sum "$script_dir/patches/$source_patch"
+    done
+    if [[ ${#source_patches[@]} -gt 0 ]]; then
         git -C "$build_dir/source" diff --binary
     fi
     git -C "$build_dir/source" submodule status --recursive
@@ -148,12 +145,4 @@ uv pip freeze --python "$virtual_env/bin/python" > "$build_dir/BUILD_REQUIREMENT
 cat "$build_dir/BUILD_INFO"
 env "${build_environment[@]}" uv build --wheel --no-build-isolation --python "$virtual_env/bin/python" \
     --out-dir "$build_dir/dist" "$build_dir/source/$source_subdir"
-if [[ "$package" == flash-attn ]]; then
-    upstream_wheel="$build_dir/dist/flash_attn-$flash_attn_upstream_version-cp312-cp312-linux_$architecture.whl"
-    source_sha256="$(sha256sum "$upstream_wheel" | cut -d ' ' -f 1)"
-    "$virtual_env/bin/python" "$script_dir/retag_flash_attn.py" "$upstream_wheel" \
-        --source-sha256 "$source_sha256" --output "$build_dir/dist" --proof "$build_dir/RETAG_PROOF.json"
-    mkdir -p "$build_dir/upstream-wheel"
-    mv "$upstream_wheel" "$build_dir/upstream-wheel/"
-fi
 (cd "$build_dir/dist" && sha256sum -- *.whl) > "$build_dir/SHA256SUMS"

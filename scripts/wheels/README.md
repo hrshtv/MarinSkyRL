@@ -19,15 +19,10 @@ bounds are preserved. Bridge preserves its native Transformers upper bound at
 Core uses the local version `+marin.torch2141.4`; Bridge uses
 `+marin.torch2141.2`.
 
-`restore_core_bounds.py` produces the new Core wheels from the checksum-pinned
-qualified `.3` artifacts. It fetches the exact upstream source and applies the
-current patch, checks that the optimizer and attention source still match the
-input wheel, and changes only package version fields and the FLA/OTEL metadata.
-It rejects changes to other source paths. `REPACK_PROOF.json` proves that every
-other payload, including the native dataset helper, retains its exact bytes.
-This avoids recompiling unchanged native code; the new dependency group still
-needs runtime qualification. The shared archive writer also preserves the
-qualified FlashAttention retagging output.
+The one-time Core `.3` to `.4` metadata migration is complete. Its
+[recipe](https://github.com/marin-community/MarinSkyRL/blob/cb2565d6207549199ecd4c31c343d0bb7af03a6c/scripts/wheels/restore_core_bounds.py)
+remains at the qualified source, and the published wheels remain available.
+New Core wheels build directly from the pinned source and current patches.
 
 Bridge is pure Python. Its separate `bridge-build.txt` environment uses
 setuptools 79.0.1 under the native `<80` requirement and CPU Torch 2.14.1;
@@ -69,6 +64,19 @@ dependencies and commands; separate builds can produce different archive bytes.
 compiler versions, recipe hashes and Torch ABI. `BUILD_REQUIREMENTS.txt` records
 the installed build dependencies.
 
+The existing CPU packaging suite checks retained workaround coverage against
+the actual frozen GPU export on both architectures, the source commits in
+`native_versions.json`, and the native and pure Python build requirements:
+
+```bash
+uv run --frozen --group dev pytest infra/tests/test_marinskyrl_packaging.py -q
+```
+
+A dependency or patched source outside that coverage fails even when the patch
+still applies. Extend coverage only after testing removal and retaining new
+necessity evidence beside the affected patch. This CPU check establishes input
+coverage; accelerator behavior still needs the runtime gates below.
+
 Use CPython 3.12.14 for native extensions and 3.12.13 for the pure Bridge and
 Speculators builders on Linux with git and uv. Native builds also need a C++ compiler. The multiarch Iris
 build image is
@@ -86,7 +94,6 @@ bash scripts/wheels/build_native.sh megatron-bridge /tmp/build-bridge
 bash scripts/wheels/build_native.sh speculators /tmp/build-speculators
 bash scripts/wheels/build_native.sh flash-attn /tmp/build-flash-attn
 bash scripts/wheels/build_native.sh fast-hadamard-transform /tmp/build-hadamard
-python scripts/wheels/restore_core_bounds.py /tmp/megatron_core-0.19.2+marin.torch2141.3-cp312-cp312-linux_x86_64.whl /tmp/repack-core-x86
 ```
 
 Use a fresh build directory for a patched source. The applied patch stays in the
@@ -95,13 +102,12 @@ applying its declared patch; it rejects unexpected tracked or untracked changes.
 Unpatched sources may retain Git-ignored build caches. Wheels appear in `dist/`,
 with digests in `SHA256SUMS`.
 
-FlashAttention is built with its upstream version, then `retag_flash_attn.py`
-applies the qualified local version. It rewrites the METADATA version and
-RECORD paths and checks that every other payload, including native libraries,
-keeps its exact bytes. `RETAG_PROOF.json` records the original and retagged
-hashes. The original wheel remains in `upstream-wheel/`. Applying this step to
-the original qualified wheels reproduces the published archive bytes on both
-architectures.
+FlashAttention uses the upstream
+[`FLASH_ATTN_LOCAL_VERSION` option](https://github.com/Dao-AILab/flash-attention/blob/a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2/setup.py#L429)
+to write its local version into the wheel filename, METADATA and dist-info
+paths during the build. No archive rewrite is needed. The former retagger and
+shared repacker are retired; their recipes remain at the qualified source.
+The currently published wheel bytes and hashes remain unchanged.
 
 FlashAttention selects SM90 on x86_64 and SM100 on aarch64. The other recipes set
 `TORCH_CUDA_ARCH_LIST` to the corresponding target, though upstream build scripts

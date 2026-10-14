@@ -1,3 +1,11 @@
+# Core 0.19.2 sends secondary registered Hero routes into the Adam/SGD/Lion fallback, which raises unsupported-optimizer at line 626.
+# Source: https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/optimizer/__init__.py#L884
+# Using one native optimizer with a custom grug_route field loses the QKV/AdamH
+# distinction on restore: Core's fixed identifiers collapse those saved groups.
+# The exact-method CPU probe exercises group matching, not a full GPU restore.
+# Source: https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/optimizer/optimizer.py#L597
+# Remove when the native factory dispatches each same-class registered route through its own entry. Verify independent MuonH/AdamH values, gradients, clipping and checkpoint continuation on both architectures with skyrl-train/tests/gpu/test_grug_megatron_muonh.py.
+
 diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
 index 70f757f..ca57766 100644
 --- a/megatron/core/optimizer/__init__.py
@@ -18,25 +26,3 @@ index 70f757f..ca57766 100644
 @@ -889 +893 @@ def _get_megatron_emerging_optimizer(
 -                config, groups, eopt_name, model_chunks, pg_collection
 +                config, groups, opt_name, model_chunks, pg_collection
-diff --git a/megatron/core/package_info.py b/megatron/core/package_info.py
-index 24c6794..2269224 100644
---- a/megatron/core/package_info.py
-+++ b/megatron/core/package_info.py
-@@ -8 +8 @@ PATCH = 2
--PRE_RELEASE = ""
-+PRE_RELEASE = "+marin.torch2141.4"
-diff --git a/pyproject.toml b/pyproject.toml
-index b2474f7..eb43dae 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -104 +104 @@ dev = [
--    "nvidia-cudnn-frontend[cutedsl]==1.26.0",
-+    "nvidia-cudnn-frontend[cutedsl]==1.30.0",
-diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
---- a/megatron/core/transformer/attention.py
-+++ b/megatron/core/transformer/attention.py
-@@ -94 +93,0 @@
--    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
-@@ -100,0 +100,2 @@
-+    if HAVE_FA4:
-+        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
