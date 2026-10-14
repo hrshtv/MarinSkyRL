@@ -1037,10 +1037,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # Useful when TP > 1 (and thus Megatron sequence parallel is enabled).
     # See https://github.com/NVIDIA/Megatron-LM/issues/533#issuecomment-1760193239
     env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-    if cfg.trainer.flash_attn:
-        # TransformerEngine otherwise overrides the FlashAttention choice on Hopper+.
-        env_vars["NVTE_FUSED_ATTN"] = "0"
-
     if cfg.generator.backend == "vllm":
         if cfg.trainer.policy.model.lora.rank > 0:
             env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
