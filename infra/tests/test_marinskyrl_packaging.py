@@ -5,16 +5,64 @@ from __future__ import annotations
 from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path
+import json
 import subprocess
 import tomllib
+from urllib.parse import unquote, urlsplit
 import zipfile
 
 from packaging.requirements import Requirement
+from packaging.utils import parse_wheel_filename
 import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 PYPROJECT = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+
+# These are necessity/qualification coverage, not a preferred-version list.
+# A changed input must first test removal of the affected workaround and retain
+# new causal evidence beside its patch before extending this coverage.
+# Original coverage: https://echo.oa.dev/wiki/610 and PR944's release handoff.
+VERIFIED_GPU_WORKAROUND_INPUTS = {
+    # Core optimizer routes, optional FA4 import order and frontend requirement.
+    "megatron-core": "0.19.2+marin.torch2141.4",
+    "flash-attn": "2.8.3.post1+marin.cu132torch2141.1",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "nvidia-cudnn-frontend": "1.30.0",
+    # Bridge's two exact FlashInfer requirements must share vLLM's pair.
+    "megatron-bridge": "0.6.2+marin.torch2141.2",
+    "flashinfer-python": "0.6.18.post1",
+    "flashinfer-cubin": "0.6.18.post1",
+    # FA2's C++20 build, Speculators' Torch cap, and checkpoint adapters.
+    "torch": "2.14.1+cu132",
+    "speculators": "0.9.0a16.post1",
+    "transformers": "5.12.1",
+    "transformer-engine": "2.20.2",
+    "transformer-engine-torch": "2.20.2",
+    # Serving ABI/metadata departures and the CPU audio exception.
+    "vllm": "0.0.0.dev20261012+marin.3a054c458ca8.cu132",
+    "torchvision": "0.29.1+cu132",
+    "torchaudio": "2.11.0+cpu",
+    "setuptools": "84.0.0",
+    "apache-tvm-ffi": "0.1.12",
+    "tilelang": "0.1.14",
+    "tokenspeed-mla": "0.1.9",
+    # ARM cuSPARSELt tag repair and the compiler profile used for these wheels.
+    "nvidia-cusparselt-cu13": "0.8.1",
+    "cuda-toolkit": "13.2.2",
+    "nvidia-cuda-nvcc": "13.2.86",
+    "nvidia-cuda-cccl": "13.2.86",
+    "nvidia-cuda-crt": "13.2.86",
+    "nvidia-cuda-nvrtc": "13.2.86",
+}
+
+VERIFIED_PATCH_SOURCES = {
+    "flash-attn": "a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2",
+    "megatron-core": "4b4acac9a1d28ea6829c8d4f566d75698a21249d",
+    "megatron-bridge": "c0e164ed2aedac4ad1c877780e2564a19d5d54ec",
+    "speculators": "ecac1b16278063e9640004135153882c02de5801",
+}
+
 @dataclass(frozen=True)
 class BuiltWheel:
     names: set[str]
@@ -147,3 +195,49 @@ def test_policy_closures_match_supported_architectures(architecture: str) -> Non
     }.issubset(names)
     vllm = next(requirement for requirement in exported if requirement.name == "vllm")
     assert vllm.url is not None and vllm.url.endswith(f"manylinux_2_28_{architecture}.whl")
+
+    # Exercise the real frozen export, including transitive dependencies. CPU
+    # Torch has separate coverage and must not mask a stale GPU combination.
+    selected = {}
+    for requirement in exported:
+        if requirement.name not in VERIFIED_GPU_WORKAROUND_INPUTS:
+            continue
+        if requirement.url:
+            filename = unquote(urlsplit(requirement.url).path.rsplit("/", 1)[-1])
+            selected[requirement.name] = str(parse_wheel_filename(filename)[1])
+        else:
+            selected[requirement.name] = str(requirement.specifier).removeprefix("==")
+    assert selected == VERIFIED_GPU_WORKAROUND_INPUTS, (
+        "Unverified GPU workaround/dependency combination. Test removal and "
+        "record new necessity evidence before updating coverage."
+    )
+
+
+def test_native_build_inputs_remain_within_patch_coverage() -> None:
+    recipes = REPOSITORY_ROOT / "scripts" / "wheels"
+    sources = json.loads((recipes / "native_versions.json").read_text())["sources"]
+    assert {name: sources[name] for name in VERIFIED_PATCH_SOURCES} == VERIFIED_PATCH_SOURCES, (
+        "Unverified upstream patch revision; test removal before extending coverage."
+    )
+    # The compiler and Torch used to rebuild patched extensions can change
+    # independently of the runtime lock. Check their actual recipe as well.
+    native_names = {"torch", "cuda-toolkit", "nvidia-cuda-nvcc", "nvidia-cuda-cccl", "nvidia-cuda-crt"}
+    build_coverage = {
+        "native-cu132.txt": {name: VERIFIED_GPU_WORKAROUND_INPUTS[name] for name in native_names},
+        "bridge-build.txt": {"torch": "2.14.1+cpu", "setuptools": "79.0.1"},
+        "speculators-build.txt": {"setuptools": "84.0.0", "setuptools-git-versioning": "2.1.0"},
+    }
+    for filename, covered in build_coverage.items():
+        requirements = [
+            Requirement(line)
+            for line in (recipes / filename).read_text().splitlines()
+            if line and not line.startswith("#")
+        ]
+        selected = {
+            requirement.name: str(requirement.specifier).removeprefix("==")
+            for requirement in requirements
+            if requirement.name in covered
+        }
+        assert selected == covered, (
+            f"Unverified {filename} dependency; test removal before extending coverage."
+        )
