@@ -11,9 +11,10 @@ authors = [
 ]
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 dependencies = [
+    "marin-verifyit[schema] @ git+https://github.com/marin-community/marin.git@d015f39ca6260d3b1829cea030920a70dc5822b0#subdirectory=lib/verifyit",
     "func_timeout",
     "loguru",
     "numpy",

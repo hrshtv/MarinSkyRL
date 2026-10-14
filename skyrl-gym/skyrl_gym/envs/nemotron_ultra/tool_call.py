@@ -9,6 +9,8 @@ from collections import Counter
 from enum import StrEnum
 from typing import Any
 
+from verifyit.adapters.nemotron_pivot import grade_tool_call
+
 
 class StepRewardCategory(StrEnum):
     NO_ACTION_FOUND = "No tool call or chat message was found in the response"
@@ -219,24 +221,9 @@ PIVOT_VERIFIERS = ("tool_name", "nemo", "exact")
 
 
 def grade_pivot_verifiers(expected_action: dict[str, Any], assistant_message: dict[str, Any]) -> dict[str, Any]:
-    """Score one saved or online response with the three frozen pilot verifiers."""
+    """Score SWE pivots with the same pinned grader used for frozen pass rates."""
+    verdict = grade_tool_call(expected_action, assistant_message)
     calls = assistant_message.get("tool_calls") or []
-    if expected_action["type"] not in {"message", "function_call"}:
-        raise ValueError("The SWE pilot requires a single demonstrated action")
-    if expected_action["type"] == "function_call" and len(calls) != 1:
-        return {
-            "scores": dict.fromkeys(PIVOT_VERIFIERS, 0.0),
-            "categories": dict.fromkeys(PIVOT_VERIFIERS, StepRewardCategory.UNEXPECTED_CALL_COUNT.value),
-            "tool_call_count": len(calls),
-            "extra_tool_calls": max(0, len(calls) - 1),
-        }
-    names = (
-        calls[0].get("function", {}).get("name") == expected_action["name"]
-        if expected_action["type"] == "function_call"
-        else not calls
-    )
-    exact, exact_category = grade_expected_action(expected_action, assistant_message)
-    nemo, nemo_category = grade_pivot_action(expected_action, assistant_message, word_count_similarity_threshold=0.0)
     malformed = 0
     for call in calls:
         try:
@@ -244,8 +231,8 @@ def grade_pivot_verifiers(expected_action: dict[str, Any], assistant_message: di
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             malformed += 1
     return {
-        "scores": {"tool_name": float(names), "nemo": nemo, "exact": exact},
-        "categories": {"exact": exact_category.value, "nemo": nemo_category.value},
+        "scores": verdict.detail["components"],
+        "categories": dict.fromkeys(PIVOT_VERIFIERS, verdict.detail["reason"]),
         "malformed_tool_calls": malformed,
         "tool_call_count": len(calls),
         "extra_tool_calls": max(0, len(calls) - int(expected_action["type"] == "function_call")),

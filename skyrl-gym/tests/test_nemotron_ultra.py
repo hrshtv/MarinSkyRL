@@ -320,14 +320,17 @@ def test_tool_call_reward_accepts_any_text_when_a_message_is_expected():
     assert grade_expected_action(expected, {"content": None, "tool_calls": [{"function": {}}]})[0] == 0.0
 
 
-@pytest.mark.parametrize("call_names", [[], ["search", "search"], ["browse", "search"], ["search", "browse"]])
-def test_single_action_pilot_rejects_missing_or_extra_calls(call_names):
+@pytest.mark.parametrize(
+    "call_names,reward",
+    [([], 0.0), (["search", "search"], 1.0), (["browse", "search"], 1.0), (["search", "browse"], 1.0)],
+)
+def test_pivot_reward_accepts_a_matching_call_among_extra_calls(call_names, reward):
     expected = {"type": "function_call", "name": "search", "arguments": '{"query":"q"}'}
     calls = [{"function": {"name": name, "arguments": expected["arguments"]}} for name in call_names]
 
     grades = grade_pivot_verifiers(expected, {"content": None, "tool_calls": calls})
 
-    assert grades["scores"] == {"tool_name": 0.0, "nemo": 0.0, "exact": 0.0}
+    assert grades["scores"] == {"tool_name": reward, "nemo": reward, "exact": reward}
     assert grades["tool_call_count"] == len(call_names)
 
 
