@@ -100,6 +100,11 @@ def _register_grug_muonh(optim_config: Mapping) -> None:
 
 class _MegatronParamScheduler(OptimizerParamScheduler):
     def load_state_dict(self, state_dict: dict) -> None:
+        # Core 0.19.2 adds the saved step count to the current count. Reloading
+        # step 1 into a scheduler at step 2 otherwise resumes at step 3:
+        # https://github.com/NVIDIA/Megatron-LM/blob/4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/optimizer_param_scheduler.py#L390
+        # Remove after native restore assigns the saved count; verify the
+        # independent update/warmup/resume gate in test_grug_megatron_muonh.py.
         self.num_steps = 0
         super().load_state_dict(state_dict)
 
