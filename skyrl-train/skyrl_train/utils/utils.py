@@ -1042,7 +1042,8 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         env_vars["NVTE_FUSED_ATTN"] = "0"
 
     if cfg.generator.backend == "vllm":
-        env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
+        if cfg.trainer.policy.model.lora.rank > 0:
+            env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
 
         # vLLM 0.30 rejects IPC rebuild callbacks in MsgpackEncoder without this
         # option. Its native IPC backend also requires it for HTTP pickled handles:
