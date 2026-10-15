@@ -141,7 +141,7 @@ def test_all_policy_ranks_construct_before_rank_zero_rendezvous(tmp_path):
     barrier_keepalive = os.open(tmp_path / "barrier", os.O_RDWR | os.O_NONBLOCK)
     try:
         with launch_process_gang(
-            command=[sys.executable, "-m", __name__, str(tmp_path)],
+            command=[sys.executable, "-m", "tests.cpu.workers.test_worker_telemetry", str(tmp_path)],
             working_directory=Path.cwd(),
             environment=os.environ.copy(),
             control_directory=tmp_path,
