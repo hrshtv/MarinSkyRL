@@ -1540,7 +1540,11 @@ class RayPPOTrainer:
                     **get_system_memory_metrics(),
                 }
                 self._log_metrics_stdout(log_payload, step=self.global_step, kind="train")
-                self.tracker.log(log_payload, step=self.global_step, commit=self.cfg.trainer.tracker_commit_each_step)
+                self.tracker.log(
+                    log_payload,
+                    step=self.global_step,
+                    commit=self.cfg.trainer.tracker_commit_each_step and self._pending_megatron_save is None,
+                )
                 await self.callback_handler.call_event_async(
                     "on_log", step_state, self._control, logs=log_payload, trainer=self
                 )
@@ -1575,7 +1579,9 @@ class RayPPOTrainer:
                     rng_state = _driver_rng_state() if self._can_replay_driver_rng() else None
                     try:
                         self._log_metrics_stdout(metrics, step=self.global_step, kind="checkpoint")
-                        self.tracker.log(metrics, step=self.global_step, commit=False)
+                        self.tracker.log(
+                            metrics, step=self.global_step, commit=self.cfg.trainer.tracker_commit_each_step
+                        )
                     finally:
                         if rng_state is not None:
                             _restore_driver_rng_state(rng_state)

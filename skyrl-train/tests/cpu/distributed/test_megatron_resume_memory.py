@@ -106,11 +106,12 @@ def test_rank_rng_selection_preserves_exact_rank_and_maps_resized_dp(monkeypatch
     assert megatron_strategy._select_rank_rng_state(rank_states, 2)["generic"] == "dp0"
 
 
-def test_rank_rng_selection_rejects_changed_model_parallel_slice(monkeypatch):
+def test_rank_rng_selection_keeps_common_state_for_changed_model_parallel_slice(monkeypatch):
     monkeypatch.setattr(megatron_strategy.dist, "get_world_size", lambda: 3)
     monkeypatch.setattr(megatron_strategy, "_rng_parallel_coordinates", lambda: (0, 1, 0, 0, 0, 0))
-    with pytest.raises(ValueError, match="matching model-parallel geometry"):
-        megatron_strategy._select_rank_rng_state([{"coordinates": (0, 0, 0, 0, 0, 0), "generic": "saved"}], 0)
+    assert (
+        megatron_strategy._select_rank_rng_state([{"coordinates": (0, 0, 0, 0, 0, 0), "generic": "saved"}], 0) is None
+    )
 
 
 class _CheckpointOptimizer:

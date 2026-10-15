@@ -104,8 +104,8 @@ def _rng_parallel_coordinates() -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _select_rank_rng_state(rank_states: list[dict], rank: int) -> dict:
-    """Restore the exact rank on an unchanged mesh, or a matching DP replica on a resized mesh."""
+def _select_rank_rng_state(rank_states: list[dict], rank: int) -> dict | None:
+    """Select rank RNG on the same model-parallel slice, or keep common RNG when resharding."""
     if not rank_states:
         raise ValueError("Checkpoint has no rank-specific Megatron RNG states")
     coordinates = _rng_parallel_coordinates()
@@ -117,10 +117,12 @@ def _select_rank_rng_state(rank_states: list[dict], rank: int) -> dict:
         key=lambda state: state["coordinates"][5],
     )
     if not matching:
-        raise ValueError(
-            "Checkpoint has no Megatron RNG state for the current TP/PP/CP/EP/ETP slice; "
-            "full-state resume requires matching model-parallel geometry"
+        logger.warning(
+            "Checkpoint has no rank RNG for TP/PP/CP/EP/ETP slice {}; keeping common checkpoint RNG "
+            "and the initialized CUDA RNG tracker. Exact replay requires an unchanged rank layout.",
+            coordinates[:5],
         )
+        return None
     selected = matching[coordinates[5] % len(matching)]
     logger.warning(
         "Megatron RNG rank layout differs from the checkpoint (saved world {}, current world {}); "
@@ -581,9 +583,10 @@ class MegatronStrategy(DistributedStrategy):
                 self.log("Loaded client state from checkpoint.")
                 if "rank_rng_states" in extra_state:
                     rank_rng_state = _select_rank_rng_state(extra_state["rank_rng_states"], rank)
-                    self.load_rng_state(rank_rng_state["generic"])
-                    tensor_parallel.get_cuda_rng_tracker().set_states(rank_rng_state["cuda_tracker"])
-                    self.log("Loaded rank-specific Megatron RNG and CUDA RNG tracker state.")
+                    if rank_rng_state is not None:
+                        self.load_rng_state(rank_rng_state["generic"])
+                        tensor_parallel.get_cuda_rng_tracker().set_states(rank_rng_state["cuda_tracker"])
+                        self.log("Loaded rank-specific Megatron RNG and CUDA RNG tracker state.")
 
         return ckpt_dir, states
 

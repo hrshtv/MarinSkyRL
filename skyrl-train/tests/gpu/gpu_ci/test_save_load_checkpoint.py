@@ -23,6 +23,7 @@ from skyrl_train.utils.utils import print_mem
 from tests.gpu.utils import init_worker_with_type, get_model_logits_from_actor, validate_cfg
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.io import io
+from skyrl_train.io.torch_distributed_checkpoint import StreamingFsspecWriter
 from skyrl_train.distributed.megatron.checkpoint_metadata import remote_checkpoint_metadata
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -34,7 +35,17 @@ def _run_megatron_plan_cache_rank(rank: int, checkpoint_root: str, rendezvous_fi
         _SchemaGuardedMCoreSavePlanner,
         invalidate_checkpoint_plan_cache,
     )
-    from skyrl_train.io.torch_distributed_checkpoint import StreamingFsspecWriter
+
+    class ObservedPlanner(_SchemaGuardedMCoreSavePlanner):
+        def create_local_plan(self):
+            plan = super().create_local_plan()
+            assert plan.usable == (step == 1 or (rank == 1 and step in (3, 4)))
+            return plan
+
+        def create_global_plan(self, all_plans):
+            plans, metadata = super().create_global_plan(all_plans)
+            assert [plan.usable for plan in plans] == [step != 2, step != 2]
+            return plans, metadata
 
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous_file}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
@@ -45,7 +56,7 @@ def _run_megatron_plan_cache_rank(rank: int, checkpoint_root: str, rendezvous_fi
             dtype = torch.float16 if rank == 1 and step == 3 else torch.float32
             state = {f"rank_{rank}": torch.arange(6, dtype=dtype).reshape(2, 3) + step + rank}
             path = os.path.join(checkpoint_root, f"step-{step}")
-            planner = _SchemaGuardedMCoreSavePlanner(
+            planner = ObservedPlanner(
                 cache_key=cache_key,
                 dedup_replicated_tensors=False,
                 flatten_state_dict=False,

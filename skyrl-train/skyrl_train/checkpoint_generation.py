@@ -15,6 +15,7 @@ import time
 import uuid
 
 from marinskyrl.checkpoint_paths import GLOBAL_STEP_PREFIX, extract_step_from_path
+from marinskyrl.resource_locator import join_resource_path, relative_resource_path
 
 from skyrl_train.hf_export_schema import TRAINER_STATE_FILENAME
 from skyrl_train.io import io
@@ -31,13 +32,13 @@ def new_attempt_path(step_path: str) -> str:
     """Return a fresh attempt path without mutating the step's committed state."""
     if not _STEP_DIRECTORY.fullmatch(os.path.basename(step_path.rstrip("/"))):
         raise ValueError(f"Not a global-step checkpoint path: {step_path}")
-    return os.path.join(step_path.rstrip("/"), ATTEMPTS_DIRECTORY, uuid.uuid4().hex)
+    return join_resource_path(step_path.rstrip("/"), ATTEMPTS_DIRECTORY, uuid.uuid4().hex)
 
 
 def _attempt_id(step_path: str, attempt_path: str) -> str:
     step_path = step_path.rstrip("/")
     attempt_id = os.path.basename(attempt_path.rstrip("/"))
-    expected = os.path.join(step_path, ATTEMPTS_DIRECTORY, attempt_id)
+    expected = join_resource_path(step_path, ATTEMPTS_DIRECTORY, attempt_id)
     if not _ATTEMPT_ID.fullmatch(attempt_id) or attempt_path.rstrip("/") != expected:
         raise ValueError(f"Attempt path is outside step checkpoint: {attempt_path}")
     return attempt_id
@@ -55,18 +56,10 @@ def _valid_file_size(path: str, size: int) -> bool:
 def _inventory(attempt_path: str) -> dict[str, int]:
     """Inventory exact object names/sizes; cloud find may return scheme-less keys."""
 
-    def without_scheme(path: str) -> str:
-        return path.split("://", 1)[1] if "://" in path else path
-
-    normalized_root = without_scheme(attempt_path).rstrip("/")
-    prefix = f"{normalized_root}/"
     files = {}
     for path, size in io.find_files(attempt_path).items():
-        normalized_path = without_scheme(path)
-        if not normalized_path.startswith(prefix):
-            raise ValueError(f"Checkpoint object escaped attempt prefix: {path}")
-        relative = normalized_path[len(prefix) :]
-        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+        relative = relative_resource_path(attempt_path, path)
+        if relative == "." or ".." in path.split("/"):
             raise ValueError(f"Invalid checkpoint object name: {path}")
         files[relative] = int(size)
     return files
@@ -90,22 +83,22 @@ def commit_attempt(step_path: str, attempt_path: str, *, required_files: set[str
         "files": dict(sorted(files.items())),
     }
     manifest_bytes = _json_bytes(manifest)
-    io.write_bytes_atomic(os.path.join(attempt_path, MANIFEST_FILENAME), manifest_bytes)
+    io.write_bytes_atomic(join_resource_path(attempt_path, MANIFEST_FILENAME), manifest_bytes)
     commit = {
         "schema_version": _SCHEMA_VERSION,
         "step": step,
         "attempt_id": attempt_id,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
-    io.write_bytes_atomic(os.path.join(step_path, COMMIT_FILENAME), _json_bytes(commit))
+    io.write_bytes_atomic(join_resource_path(step_path, COMMIT_FILENAME), _json_bytes(commit))
     return commit
 
 
 def resolve_checkpoint_payload(step_path: str, *, verify_files: bool = False) -> str:
     """Resolve the selected committed attempt or an existing flat checkpoint."""
-    commit_path = os.path.join(step_path, COMMIT_FILENAME)
+    commit_path = join_resource_path(step_path, COMMIT_FILENAME)
     if not io.exists(commit_path):
-        if io.exists(os.path.join(step_path, TRAINER_STATE_FILENAME)):
+        if io.exists(join_resource_path(step_path, TRAINER_STATE_FILENAME)):
             return step_path
         raise FileNotFoundError(f"No committed checkpoint at {step_path}")
 
@@ -115,8 +108,8 @@ def resolve_checkpoint_payload(step_path: str, *, verify_files: bool = False) ->
     attempt_id = commit.get("attempt_id")
     if not isinstance(attempt_id, str) or not _ATTEMPT_ID.fullmatch(attempt_id):
         raise ValueError(f"Invalid checkpoint attempt ID at {commit_path}")
-    attempt_path = os.path.join(step_path, ATTEMPTS_DIRECTORY, attempt_id)
-    manifest_bytes = io.read_bytes(os.path.join(attempt_path, MANIFEST_FILENAME))
+    attempt_path = join_resource_path(step_path, ATTEMPTS_DIRECTORY, attempt_id)
+    manifest_bytes = io.read_bytes(join_resource_path(attempt_path, MANIFEST_FILENAME))
     if hashlib.sha256(manifest_bytes).hexdigest() != commit.get("manifest_sha256"):
         raise ValueError(f"Checkpoint manifest digest mismatch at {attempt_path}")
     manifest = json.loads(manifest_bytes)

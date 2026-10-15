@@ -237,6 +237,7 @@ def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_poli
         payload = Path(resolve_checkpoint_payload(str(tmp_path / "ckpts" / f"global_step_{latest}"), verify_files=True))
         rng_states.append(snapshot_value(torch.load(payload / "driver_rng_state.pt", weights_only=False)))
     assert [record["trainer/global_step"] for record in _trained_steps(tmp_path)] == expected_steps
+    assert all("timing/save_checkpoints" in record for record in _trained_steps(tmp_path))
     if action in ("ftpo_stop", "callback_stop"):
         assert_state_equal(rng_states[0], rng_states[1])
     if action == "continue":
