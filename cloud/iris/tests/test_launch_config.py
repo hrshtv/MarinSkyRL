@@ -303,21 +303,36 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
             load_launch_config(path)
 
 
-def test_dpo_launch_with_omitted_allocation_preserves_the_explicit_document(tmp_path):
+@pytest.mark.parametrize("case", ["dpo-allocation", "eagle-engine-count"])
+def test_source_launch_fills_omitted_geometry_without_document_changes(tmp_path, case):
     raw = _raw_config()
-    raw["skyrl"].pop("trainer", None)
-    raw["skyrl"].update(
-        config_groups={"algorithm_recipe": "dpo"},
-        environment={"env_class": "preference_pair"},
-        trainer={
-            "strategy": "megatron",
-            "placement": {"policy_num_nodes": 1, "ref_num_nodes": 1, "policy_num_gpus_per_node": 8},
-        },
-    )
-    path = tmp_path / "dpo.yaml"
+    if case == "dpo-allocation":
+        raw["skyrl"].update(
+            config_groups={"algorithm_recipe": "dpo"},
+            environment={"env_class": "preference_pair"},
+            trainer={
+                "strategy": "megatron",
+                "placement": {"policy_num_nodes": 1, "ref_num_nodes": 1, "policy_num_gpus_per_node": 8},
+            },
+        )
+    else:
+        raw["iris"]["allocation"]["gpus_per_node"] = 1
+        raw["skyrl"]["trainer"]["placement"].update(policy_num_gpus_per_node=1, ref_num_gpus_per_node=1)
+        raw["skyrl"]["generator"].update(
+            num_inference_engines=1,
+            speculative_decoding={
+                "method": "eagle3",
+                "model": {"source_uri": "hf://laion/draft", "source_identity": "a" * 40},
+                "num_speculative_tokens": 3,
+            },
+        )
+    path = tmp_path / "source.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
     explicit = OmegaConf.to_container(load_launch_config(path), resolve=True)
-    del raw["iris"]["allocation"]["num_nodes"]
+    if case == "dpo-allocation":
+        del raw["iris"]["allocation"]["num_nodes"]
+    else:
+        del raw["skyrl"]["generator"]["num_inference_engines"]
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
     assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(explicit)
 
