@@ -14,6 +14,7 @@ provenance record and a model manifest. The manifest is written last and marks c
 
 from __future__ import annotations
 
+import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -401,3 +402,20 @@ def truncate_checkpoint(
 def read_truncation_provenance(checkpoint_path: str) -> TruncationProvenance:
     store = _Store.at(checkpoint_path)
     return TruncationProvenance(**json.loads(store.read_bytes(TRUNCATION_PROVENANCE_FILENAME)))
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Write a k-layer prefix of a Grug HF checkpoint.")
+    parser.add_argument("--source", required=True, help="full checkpoint directory or object-store prefix")
+    parser.add_argument("--output", required=True, help="empty output directory or object-store prefix")
+    parser.add_argument("--num-layers", type=int, required=True)
+    parser.add_argument("--max-concurrent-shards", type=int, required=True)
+    args = parser.parse_args(argv)
+    provenance = truncate_checkpoint(
+        args.source, args.output, args.num_layers, max_concurrent_shards=args.max_concurrent_shards
+    )
+    print(json.dumps(asdict(provenance), indent=2, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()
