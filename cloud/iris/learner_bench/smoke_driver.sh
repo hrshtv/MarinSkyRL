@@ -7,7 +7,7 @@ py=/tmp/lb-venv/bin/python
 
 driver_args=(
   --run-name "$LB_RUN_NAME" --harness-revision "$LB_REVISION" --model-path "$LB_MODEL_PATH"
-  --tp "$LB_TP" --pp 1 --ep "$LB_EP" --cp 1 --etp 1 --num-nodes "$LB_NODES" --gpus-per-node 8
+  --tp "$LB_TP" --pp "$LB_PP" --ep "$LB_EP" --cp 1 --etp 1 --num-nodes "$LB_NODES" --gpus-per-node 8
   --optimizer MuonH --lr 1e-6 --adam-lr 1e-6 --offload-momentum
   --recompute full_layers --micro-batch-size-per-gpu "$LB_MICRO" --sample-packing --no-flash-attn
   --ensemble-root "$LB_ENSEMBLE_ROOT" --ensemble-version "$LB_ENSEMBLE_VERSION" --profiles short
