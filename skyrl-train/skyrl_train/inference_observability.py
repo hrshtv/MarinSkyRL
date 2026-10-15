@@ -26,7 +26,7 @@ HISTOGRAM_PUBLICATION_ATTRIBUTE = "histogram_publication_id"
 
 
 class VllmHistogramFormat(StrEnum):
-    """Explicit rollout modes for native vLLM histograms."""
+    """Encoding choices for exported vLLM histograms."""
 
     SCALAR = "scalar"
     DUAL = "dual"
