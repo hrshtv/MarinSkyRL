@@ -469,6 +469,7 @@ def _skyrl_config_sections(
 
 
 def _schema_admission() -> tuple[frozenset[str], frozenset[str]]:
+    """Return admitted field paths and open-mapping prefixes from the author schema."""
     paths: set[str] = set()
     mappings: set[str] = set()
 

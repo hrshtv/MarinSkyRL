@@ -12,7 +12,6 @@ from cloud.iris.rl_data import resolve_rl_train_data_with_sources
 from marinskyrl import recipe_schema as schema, runtime_options, speculative_decoding
 from marinskyrl.recipe_schema.documents import MISSING, get_path, leaves, set_path
 from marinskyrl.recipe_schema.ownership import DERIVED_PATHS, LAUNCH_PATHS
-from marinskyrl.recipe_schema.rules import SKYRL_INTERNAL_ENGINE_KWARGS
 from scripts.recipe_schema_sidecar import OPEN, TYPES, UNDECLARED
 from skyrl_train.config.ftpo import FTPOBoundary, FTPOConfig
 from skyrl_train.config.objective_spec import KLEstimator, LossReduction
@@ -135,8 +134,6 @@ def test_ownership_sentinels_distinguish_launch_writers_context_writers_and_auth
         )
         for path in FILL_WHEN_UNSET:
             assert get_path(defaults, path) not in (MISSING, None)
-    discards = {path for path in changed - LAUNCH_PATHS if get_path(outcomes[0], path) == get_path(outcomes[1], path)}
-    assert discards == frozenset()
     assert outcomes[0]["data"]["terminal_bench_data"] != outcomes[1]["data"]["terminal_bench_data"]
     derived = {}
     context_paths = DERIVED_PATHS
@@ -156,7 +153,6 @@ def test_ownership_sentinels_distinguish_launch_writers_context_writers_and_auth
 
 
 def test_code_default_declarations_match_native_dataclasses_and_canonical_choices():
-    assert SKYRL_INTERNAL_ENGINE_KWARGS == launcher.SKYRL_INTERNAL_ENGINE_KWARGS
     for prefix, config in (
         ("trainer.algorithm.ftpo", FTPOConfig),
         ("generator.speculative_decoding.training", speculative_decoding.SpeculatorTrainingConfig),

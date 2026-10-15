@@ -472,7 +472,6 @@ def test_installed_agent_artifacts_follow_launch_attempt_and_survive_reload(tmp_
 def test_null_nonfinite_limit_in_launch_fails_on_first_invalid_step(tmp_path: Path) -> None:
     raw = _raw_config()
     raw["skyrl"]["trainer"]["policy"] = {"max_consecutive_nonfinite_steps": None}
-    raw["skyrl"]["trainer"].pop("seed", None)
     raw["skyrl"] = SkyRLRecipe.from_document(raw["skyrl"]).to_skyrl()
     path = tmp_path / "launch.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
