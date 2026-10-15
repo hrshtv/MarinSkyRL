@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 import ray.exceptions
@@ -77,3 +78,15 @@ def test_cloud_retention_keeps_latest_and_pending_export_without_cluster_access(
     assert not io.exists(f"{checkpoint_root}/global_step_0")
     for step in (1, 2, 4):
         assert resolve_checkpoint_payload(f"{checkpoint_root}/global_step_{step}", verify_files=True)
+
+
+def test_cleanup_preserves_best_model_after_later_checkpoints(tmp_path):
+    for step in (1, 2, 3):
+        (tmp_path / f"global_step_{step}").mkdir()
+    (tmp_path / "best_checkpoint.json").write_text(json.dumps({"step": 1, "model_format": "native"}))
+    trainer = _make_bare_trainer(max_ckpts_to_keep=1, ckpt_path=str(tmp_path), node_ids=["local-test-node"])
+    with patch("skyrl_train.trainer.run_on_each_node"):
+        trainer._cleanup_old_checkpoints()
+    assert (tmp_path / "global_step_1").is_dir()
+    assert (tmp_path / "global_step_3").is_dir()
+    assert not (tmp_path / "global_step_2").exists()

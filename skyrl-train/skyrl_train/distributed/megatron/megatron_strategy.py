@@ -60,6 +60,7 @@ from skyrl_train.distributed.step_policy import (
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 from skyrl_train import hf_model_io
+from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 
 
 # Both formats make non-flattened ShardedTensors accepted by torch_dist. The default
@@ -130,6 +131,66 @@ def _select_rank_rng_state(rank_states: list[dict], rank: int) -> dict:
         selected["coordinates"][5],
     )
     return selected
+
+
+_MUONH_CHECKPOINT_RECIPE = "MuonH"
+
+
+def _muonh_fp32_substates(optimizer_state: dict) -> list[dict]:
+    return (
+        [optimizer_state]
+        if "fp32_from_fp16_params" in optimizer_state
+        else [value for value in optimizer_state.values() if isinstance(value, dict)]
+    )
+
+
+def _muonh_fp32_groups_as_mapping(optimizer_state: dict) -> None:
+    """Avoid mixed empty/nonempty list merges across PP and EP ranks."""
+    for state in _muonh_fp32_substates(optimizer_state):
+        groups = state.get("fp32_from_fp16_params")
+        if groups is not None:
+            state["fp32_from_fp16_params"] = {
+                group_index: {param_index: param for param_index, param in enumerate(group)}
+                for group_index, group in enumerate(groups)
+            }
+
+
+def _muonh_fp32_groups_as_lists(optimizer_state: dict) -> None:
+    """Restore the nested lists expected by Megatron's Float16 wrapper."""
+    for state in _muonh_fp32_substates(optimizer_state):
+        groups = state.get("fp32_from_fp16_params")
+        if groups is not None:
+            state["fp32_from_fp16_params"] = [
+                [params[index] for index in sorted(params)] for _, params in sorted(groups.items())
+            ]
+
+
+def _muonh_adamh_states(optimizer):
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
+    for wrapped in optimizers:
+        if not isinstance(wrapped.optimizer, MegatronGrugMuonH):
+            continue
+        for group in wrapped.optimizer.param_groups:
+            if group.get("optimizer") == "grug_adamh":
+                for parameter in group["params"]:
+                    yield wrapped.optimizer.state[parameter], parameter.device
+
+
+def _muonh_adamh_step(optimizer) -> int:
+    """Return the shared AdamH step, including ranks without an output head."""
+    local_steps = {
+        int(step.item()) for state, _ in _muonh_adamh_states(optimizer) if (step := state.get("step")) is not None
+    }
+    if len(local_steps) > 1:
+        raise ValueError(f"Hero AdamH parameters have different steps: {local_steps}")
+    shared_step = torch.tensor(max(local_steps, default=0), device=torch.cuda.current_device())
+    dist.all_reduce(shared_step, op=dist.ReduceOp.MAX)
+    return int(shared_step.item())
+
+
+def _restore_muonh_adamh_step(optimizer, step: int) -> None:
+    for state, device in _muonh_adamh_states(optimizer):
+        state["step"] = torch.tensor(step, dtype=torch.int64, device=device)
 
 
 class MegatronStrategy(DistributedStrategy):
@@ -325,10 +386,20 @@ class MegatronStrategy(DistributedStrategy):
         model_sharded_state_dict = model.sharded_state_dict()
         sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer:
+            # An empty training selection can reach checkpointing before the first
+            # update. Megatron's serializer still requires the lazy optimizer state.
+            optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
+            for child in optimizers:
+                if child.optimizer is not None and child.init_state_fn is not None:
+                    child.init_state_fn(child.optimizer, child.config)
             sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
                 model_sharded_state_dict,
                 metadata=_optimizer_checkpoint_metadata(self.megatron_config.optimizer_checkpoint_sharding_type),
             )
+            if self.optimizer_config is not None and str(self.optimizer_config.optimizer).lower() == "muonh":
+                _muonh_fp32_groups_as_mapping(sharded_state_dict["optimizer"])
+                sharded_state_dict["optimizer_recipe"] = _MUONH_CHECKPOINT_RECIPE
+                sharded_state_dict["optimizer_recipe_step"] = _muonh_adamh_step(optimizer)
         if scheduler:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
@@ -425,6 +496,7 @@ class MegatronStrategy(DistributedStrategy):
             if scheduler and load_training_state:
                 sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
+        muonh = self.optimizer_config is not None and str(self.optimizer_config.optimizer).lower() == "muonh"
         with (
             checkpoint_phase("megatron", operation, "read_and_load", rank=rank, step=step),
             remote_checkpoint_metadata(ckpt_dir) as read_dir,
@@ -432,7 +504,15 @@ class MegatronStrategy(DistributedStrategy):
             if optimizer and load_training_state:
                 with checkpoint_phase("megatron", operation, "prepare_optimizer_load", rank=rank, step=step):
                     common_state = dist_checkpointing.load_common_state_dict(read_dir)
-                    saved_type = _saved_optimizer_sharding_type(common_state)
+                    if muonh and common_state.get("optimizer_recipe") != _MUONH_CHECKPOINT_RECIPE:
+                        raise ValueError("Checkpoint does not contain Hero MuonH optimizer state")
+                    if muonh and "optimizer_recipe_step" not in common_state:
+                        raise ValueError("Checkpoint does not contain Hero AdamH step state")
+                    saved_type = (
+                        self.megatron_config.optimizer_checkpoint_sharding_type
+                        if muonh
+                        else _saved_optimizer_sharding_type(common_state)
+                    )
                     # Gradients are not checkpointed. Free their GPU buffers now: building the
                     # optimizer's sharded state dict for loading allocates a full set of moments
                     # before optimizer.load_state_dict allocates the checkpointed ones, and with the
@@ -444,10 +524,13 @@ class MegatronStrategy(DistributedStrategy):
                         is_loading=True,
                         metadata=_optimizer_checkpoint_metadata(saved_type),
                     )
+                    if muonh:
+                        _muonh_fp32_groups_as_mapping(sharded_state_dict["optimizer"])
             # Load the checkpoint in parallel.
-            load_strategy = FullyParallelLoadStrategyWrapper(
-                load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
-            )
+            if not muonh:
+                load_strategy = FullyParallelLoadStrategyWrapper(
+                    load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+                )
             with checkpoint_phase("megatron", operation, "distributed_checkpoint", rank=rank, step=step):
                 state_dict = dist_checkpointing.load(
                     sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
@@ -466,7 +549,11 @@ class MegatronStrategy(DistributedStrategy):
                 f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
             )
             with checkpoint_phase("megatron", operation, "apply_optimizer_state", rank=rank, step=step):
+                if muonh:
+                    _muonh_fp32_groups_as_lists(state_dict["optimizer"])
                 optimizer.load_state_dict(state_dict.pop("optimizer"))
+                if muonh:
+                    _restore_muonh_adamh_step(optimizer, common_state["optimizer_recipe_step"])
                 restore_offloaded_optimizer_state(optimizer)
                 load_megatron_grads_to_gpu(model)
             self.log("Loaded optimizer state dict.")
