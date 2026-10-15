@@ -51,8 +51,8 @@ from tests.gpu.test_grug_megatron import (
     _init_policy,
     _padded_batch,
     _train_step,
-    _write_tiny_checkpoint,
 )
+from tests.gpu.grug_tiny_checkpoint import write_tiny_checkpoint
 from tests.gpu.test_hero_megatron import write_tiny_hero_checkpoint
 
 # Tensors the transport slices out of fused trainer parameters (interleaved QKV, [gate;up]). The
@@ -194,7 +194,7 @@ def test_expert_block_sync_installs_every_byte_and_verification_catches_a_flippe
         if load_format != "dummy":
             remove_shortconv_from_tiny_hero_checkpoint(model_path)
     else:
-        _write_tiny_checkpoint(model_path)
+        write_tiny_checkpoint(model_path)
     cfg = _config(str(model_path), world_size=geometry.policy_gpus, pp=geometry.policy_pp, ep=geometry.policy_ep)
     cfg.generator.num_inference_engines = geometry.engines
     cfg.generator.inference_engine_data_parallel_size = geometry.engine_dp
