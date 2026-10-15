@@ -24,6 +24,7 @@ from skyrl_train.config.callbacks import validate_hf_export_config
 from skyrl_train.config.utils import generation_context_limit
 from skyrl_train.config.query_bias import resolve_grug_query_bias_update
 from skyrl_train.config.weight_sync_pause import resolve_weight_sync_pause_policy
+from skyrl_train.config.overlap_init import overlap_init_blockers
 from skyrl_train.config.behavior_logprobs import configure_behavior_logprob_sampling
 from skyrl_train.config.mismatch_probe import validate_mismatch_probe_config
 from skyrl_train.config.objective_spec import rollout_logprobs_required, validate_objective
@@ -85,16 +86,6 @@ def policy_strict_spread_eligible(cfg: DictConfig) -> bool:
     algo = cfg.trainer.algorithm
     use_ref_model = reference_model_required(algo)
     return not use_ref_model or bool(placement.colocate_policy_ref)
-
-
-def overlap_init_eligible(cfg: DictConfig) -> bool:
-    """Return whether engine initialization can overlap policy construction."""
-    return (
-        policy_strict_spread_eligible(cfg)
-        and not reference_model_required(cfg.trainer.algorithm)
-        and cfg.generator.run_engines_locally
-        and compile_distillation_plan_from_config(cfg) is None
-    )
 
 
 def resolve_pinned_local_rank(
@@ -466,16 +457,10 @@ def validate_cfg(cfg: DictConfig):
     distillation_plan = compile_distillation_plan_from_config(cfg)
     validate_distillation_runtime_support(distillation_plan)
     validate_nemotron_ultra_grading(cfg, distillation_plan)
-    if cfg.trainer.placement.overlap_init and not overlap_init_eligible(cfg):
-        conditions = {
-            "trainer.placement.colocate_all must be false": not cfg.trainer.placement.colocate_all,
-            "trainer.placement.policy_strict_spread_pg must be true": cfg.trainer.placement.policy_strict_spread_pg,
-            "the objective must not require a reference model": not reference_model_required(cfg.trainer.algorithm),
-            "generator.run_engines_locally must be true": cfg.generator.run_engines_locally,
-            "distillation must be disabled": distillation_plan is None,
-        }
-        failed = [condition for condition, satisfied in conditions.items() if not satisfied]
-        raise ValueError("trainer.placement.overlap_init requires: " + "; ".join(failed))
+    if cfg.trainer.placement.overlap_init:
+        blockers = overlap_init_blockers(cfg)
+        if blockers:
+            raise ValueError("trainer.placement.overlap_init requires: " + "; ".join(blockers))
     trajectory_selector = trajectory_selector_from_config(cfg)
     if trajectory_selector is not None:
         if cfg.trainer.step_wise_training:
