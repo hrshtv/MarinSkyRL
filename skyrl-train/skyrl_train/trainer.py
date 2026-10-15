@@ -1272,6 +1272,22 @@ class RayPPOTrainer:
             duration_seconds,
         )
 
+    async def _restore_training_checkpoint(self) -> bool:
+        """Restore learner and rollout state before starting generation."""
+        if self.resume_mode == ResumeMode.NONE:
+            return False
+        if self.cfg.generator.get("sampler_weight_noise_scale", 0) > 0:
+            # Fix the perturbation against the original model before checkpoint weights replace it.
+            await self._sync_policy_for_rollouts(reason="initial")
+        with Timer("load_checkpoints", self.all_startup_timings):
+            self.global_step, self.loaded_checkpoint_path = self.load_checkpoints()
+        logger.info(f"Resumed training from global_step {self.global_step}")
+        if self._restored_rollout_state is None:
+            return False
+        await self.context.load_state_dict(self._restored_rollout_state)
+        self._restored_rollout_state = None
+        return True
+
     async def _train_loop(self):
         await self._init_weight_sync()
 
@@ -1279,15 +1295,7 @@ class RayPPOTrainer:
         if self.colocate_all:
             self.policy_model.backload_to_gpu()
 
-        restored_data = False
-        if self.resume_mode != ResumeMode.NONE:
-            with Timer("load_checkpoints", self.all_startup_timings):
-                self.global_step, self.loaded_checkpoint_path = self.load_checkpoints()
-            logger.info(f"Resumed training from global_step {self.global_step}")
-            if self._restored_rollout_state is not None:
-                await self.context.load_state_dict(self._restored_rollout_state)
-                self._restored_rollout_state = None
-                restored_data = True
+        restored_data = await self._restore_training_checkpoint()
 
         await self._start_draft_trainer()
         await self._sync_policy_for_rollouts(reason="initial")

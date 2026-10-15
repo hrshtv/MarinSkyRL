@@ -20,6 +20,7 @@ These tests exercise the finalize handler directly, without booting Ray or model
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -121,9 +122,11 @@ def test_train_end_saves_the_last_completed_step():
     ],
 )
 def test_train_end_runs_and_logs_the_requested_evaluation(
-    eval_interval, expected_evaluations, expected_commits, delivered_telemetry
+    eval_interval, expected_evaluations, expected_commits, delivered_telemetry, tmp_path
 ):
     trainer = _make_bare_trainer(global_step=1, total_training_steps=16)
+    trainer.cfg.trainer.dump_data_batch = True
+    trainer.cfg.trainer.export_path = str(tmp_path)
     trainer.callback_handler = CallbackHandler([EvaluationCallback(eval_steps=eval_interval)])
     trainer.all_metrics = {"reward/raw_reward": 0.625}
     trainer._training_metrics_enabled = True
@@ -155,6 +158,9 @@ def test_train_end_runs_and_logs_the_requested_evaluation(
     payloads = parse_metrics("".join(mirrored))
     assert [(row.step, row.values["eval/accuracy"]) for row in payloads if row.kind == "eval"] == expected_evaluations
     assert [row.values for row in payloads if row.kind == "train"] == [{"reward/raw_reward": 0.625}]
+    assert json.loads((tmp_path / "training_metrics/train-00000016.json").read_text()) == {"reward/raw_reward": 0.625}
+    for step, score in expected_evaluations:
+        assert json.loads((tmp_path / f"training_metrics/eval-{step:08d}.json").read_text()) == {"eval/accuracy": score}
     assert tracked == [
         ({"eval/accuracy": score}, {"step": step, "commit": commit})
         for (step, score), commit in zip(expected_evaluations, expected_commits, strict=True)

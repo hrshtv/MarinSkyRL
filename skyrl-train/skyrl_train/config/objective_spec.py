@@ -305,11 +305,8 @@ def validate_objective(cfg: DictConfig, *, loss_spec: LossSpec | None = None) ->
             or cfg.trainer.placement.colocate_all
             or cfg.trainer.rollout_buffer.max_staleness_steps != 0
             or str(cfg.trainer.rollout_buffer.batch_policy) != "full_batch"
-            or str(cfg.trainer.resume_mode) != "none"
         ):
-            raise ValueError(
-                "fixed-noise reproduction requires local disaggregated vLLM, fresh full batches and no resume"
-            )
+            raise ValueError("fixed-noise reproduction requires local disaggregated vLLM and fresh full batches")
     for key in ("use_abs_kl", "use_kl_estimator_k3"):
         if key in algorithm:
             raise ValueError(f"trainer.algorithm.{key} is unsupported; configure trainer.algorithm.kl_estimator_type")

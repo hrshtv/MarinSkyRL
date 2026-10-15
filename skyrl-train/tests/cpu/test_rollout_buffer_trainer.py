@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,11 +8,115 @@ from omegaconf import OmegaConf
 
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.rollouts.buffer import RolloutGroup
+from skyrl_train.rollouts.context import TrainingContextState
+from skyrl_train.rollouts.loader import PromptLoaderState
 from skyrl_train.trainer import RayPPOTrainer
 import skyrl_train.trainer as trainer_module
 from skyrl_train.inference_engines.vllm.fixed_sampler_noise import FixedSamplerNoise
 from skyrl_train.trajectory_runners.base import TrajectoryID
 from skyrl_train.trajectory_selection import BestOfNTrajectorySelector
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("noise_scale", [0.0, 0.05])
+async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(tmp_path, monkeypatch, noise_scale):
+    original = torch.arange(1, 4, dtype=torch.float32)
+    restored_weights = original * 7
+    moments = torch.tensor([0.3, 0.6, 0.9])
+    checkpoint = tmp_path / "global_step_5"
+    policy_checkpoint = checkpoint / "policy"
+    policy_checkpoint.mkdir(parents=True)
+    torch.save({"weights": restored_weights, "moments": moments}, policy_checkpoint / "state.pt")
+    torch.save({"global_step": 5}, checkpoint / "trainer_state.pt")
+    rollout_state = TrainingContextState(
+        loader=PromptLoaderState(order={"epoch": 0, "position": 6}, retries=[]),
+        ready=[],
+        object_store_root="s3://fixture/groups",
+    )
+    torch.save(rollout_state, checkpoint / "data.pt")
+    serving = original.clone()
+
+    class Policy:
+        def __init__(self):
+            self.weights = original.clone()
+            self.moments = torch.zeros_like(moments)
+
+        def offload_to_cpu(self, *, offload_optimizer, offload_model):
+            pass
+
+        def async_run_ray_method(self, dispatch, method, **kwargs):
+            if method == "barrier_all":
+                return []
+            assert method == "load_checkpoint"
+            saved = torch.load(Path(kwargs["ckpt_dir"]) / "state.pt", weights_only=True)
+            self.weights.copy_(saved["weights"])
+            if kwargs["load_training_state"]:
+                self.moments.copy_(saved["moments"])
+            return [None]
+
+        async def async_run_method(self, dispatch, method, client):
+            assert method == "broadcast_to_inference_engines"
+            serving.copy_(self.weights)
+
+    class Engine:
+        def __init__(self):
+            self.noise = None
+
+        async def pause_generation(self):
+            pass
+
+        async def resume_generation(self):
+            pass
+
+        async def sampler_noise(self, action, scale, seed):
+            if action == "initialize":
+                self.noise = FixedSamplerNoise([("weight", serving)], scale, seed)
+            else:
+                assert action == "refresh"
+                self.noise.after_sync()
+            return self.noise.evidence()
+
+    class Context:
+        restored = None
+
+        async def load_state_dict(self, state):
+            self.restored = state
+
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = get_default_config()
+    trainer.cfg.generator.sampler_weight_noise_scale = noise_scale
+    trainer.cfg.generator.sampler_weight_noise_seed = 17
+    trainer.cfg.trainer.resume_mode = "from_path"
+    trainer.cfg.trainer.resume_path = str(checkpoint)
+    trainer.cfg.trainer.restore_dataloader_state = True
+    trainer.cfg.trainer.reset_global_step_on_resume = False
+    trainer.resume_mode = trainer_module.ResumeMode.FROM_PATH
+    trainer.colocate_all = False
+    trainer.global_step = 0
+    trainer.all_startup_timings = {}
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer._domain_balancer = None
+    trainer._restored_rollout_state = None
+    trainer.policy_model = Policy()
+    trainer.critic_model = None
+    trainer.inference_engine_client = Engine()
+    trainer.context = Context()
+    monkeypatch.setattr(trainer_module.ray, "get", lambda references: references)
+
+    # The reference sampler starts at the original model and then receives a later learner snapshot.
+    expected = original.clone()
+    reference_noise = FixedSamplerNoise([("weight", expected)], noise_scale, 17)
+    expected.copy_(restored_weights)
+    reference_noise.after_sync()
+
+    assert await trainer._restore_training_checkpoint()
+    await trainer._sync_policy_for_rollouts(reason="initial")
+
+    torch.testing.assert_close(serving, expected, rtol=0, atol=0)
+    torch.testing.assert_close(trainer.policy_model.moments, moments, rtol=0, atol=0)
+    assert trainer.context.restored == rollout_state
+    assert trainer.global_step == 5
 
 
 def _group(uid: str, policy_step: int, *, rewards: list[float] | None = None) -> RolloutGroup:
