@@ -105,7 +105,6 @@ def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(tmp
     tasks = [row["input"].lowered.task for row in prepared]
     assert [task.source.row for task in tasks] == ["0", "2"]
     assert [row["input"].metadata.data_source for row in prepared] == [expected_source, expected_source]
-    assert dataset.dataframe.cache_files == []
 
 
 @patch("datasets.load_dataset")
@@ -237,7 +236,7 @@ def fork_records(tmp_path):
 
 
 @pytest.mark.parametrize(("row_count", "uses_process_pool"), [(22, False), (20_000, True)])
-def test_task_dataset_retains_global_rows_without_caches_and_forks_only_large_inputs(
+def test_source_tasks_keep_global_row_indices_without_cache_files_and_fork_only_large_inputs(
     tmp_path, fork_records, row_count, uses_process_pool
 ):
     rows = [
