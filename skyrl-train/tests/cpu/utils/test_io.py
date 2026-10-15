@@ -425,7 +425,7 @@ class TestContextManagers:
                 # Mirror fsspec AbstractFileSystem._strip_protocol, which also rstrips separators.
                 return path.removeprefix("s3://").rstrip("/")
 
-            def get(self, source, destination, recursive):
+            def get(self, source, destination, recursive, batch_size):
                 destination_root = Path(destination)
                 if not source.endswith("/"):
                     destination_root /= Path(source).name

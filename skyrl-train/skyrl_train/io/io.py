@@ -212,7 +212,8 @@ def download_directory(cloud_path: str, local_path: str) -> None:
     # _strip_protocol, which rstrips separators and would silently undo it.
     if cloud_path.startswith("s3://"):
         source_path = fs._strip_protocol(cloud_path) + "/"
-        fs.get(source_path, local_path, recursive=True)
+        # Each export node stages a full checkpoint; bound their combined S3 fanout.
+        fs.get(source_path, local_path, recursive=True, batch_size=1)
     else:
         fs.get(cloud_path.rstrip("/") + "/", local_path, recursive=True)
     logger.info(f"Downloaded {cloud_path} to {local_path}")
