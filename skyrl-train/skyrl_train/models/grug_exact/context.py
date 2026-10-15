@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from skyrl_train.trajectory_runners.types import UNKNOWN_ENGINE_DP_RANK
+from skyrl_train.inference_engines.base import UNKNOWN_ENGINE_DP_RANK
 
 
 @dataclass(frozen=True)
