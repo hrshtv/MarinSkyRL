@@ -282,6 +282,7 @@ class RouteEngineConfig:
     max_model_len: int
     max_num_batched_tokens: int
     max_num_seqs: int
+    enable_chunked_prefill: bool
     gpu_memory_utilization: float
     enable_prefix_caching: bool
     enforce_eager: bool
@@ -298,6 +299,7 @@ def create_route_engines(config: RouteEngineConfig) -> list[InferenceEngineInter
         "max_model_len": config.max_model_len,
         "served_model_name": config.model,
         "tokenizer": config.tokenizer,
+        "enable_chunked_prefill": config.enable_chunked_prefill,
     }
     if config.tokenizer_revision is not None:
         engine_init_kwargs["tokenizer_revision"] = config.tokenizer_revision
@@ -387,6 +389,12 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, required=True, help="must exceed the longest sequence")
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int, default=256)
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="split prompts longer than --max-num-batched-tokens; routes are read once prefill completes",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -411,6 +419,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
+        enable_chunked_prefill=args.enable_chunked_prefill,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=args.enable_prefix_caching,
         enforce_eager=args.enforce_eager,
