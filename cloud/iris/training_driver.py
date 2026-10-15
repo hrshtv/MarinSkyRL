@@ -288,7 +288,7 @@ class LocalRLRunner:
         OmegaConf.save(launch_config, config_path, resolve=True)
         module = (
             "tests.gpu.fault_injection.snowball_checkpoint_parity"
-            if launch_config.run.get("checkpoint_parity_phase")
+            if OmegaConf.select(launch_config, "run.checkpoint_parity_phase")
             else "cloud.iris.skyrl_entrypoint"
         )
         cmd = [python_exe, "-m", module, "--config", str(config_path)]
