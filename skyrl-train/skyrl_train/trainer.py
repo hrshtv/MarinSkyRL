@@ -25,7 +25,7 @@ from collections import defaultdict, deque
 import numpy as np
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
-from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
+from skyrl_train.training_batch import ENGINE_DP_RANKS_KEY, TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.rollouts.buffer import RolloutGroup
 from skyrl_train.rollouts.context import TrainingContext, TrainingContextState
 from skyrl_train.trajectory_selection import trajectory_selector_from_config
@@ -33,6 +33,7 @@ from skyrl_train.trajectory_runners.base import (
     TrajectoryBatch,
     TrajectoryRunner,
 )
+from skyrl_train.trajectory_runners.types import ROLLOUT_WEIGHT_SYNCS_SPANNED_KEY
 import copy
 from skyrl_train.batch_sampling import RowOwnership, filter_trajectory_batch
 from skyrl_train.trajectory_runners.trajectory_processing import (
@@ -1707,6 +1708,16 @@ class RayPPOTrainer:
                     "async/staleness_ratio": sum(1 for s in stalenesses if s > 0) / len(stalenesses),
                 }
             )
+            spans = trajectory_batch.get(ROLLOUT_WEIGHT_SYNCS_SPANNED_KEY)
+            if spans is not None:
+                # Rows whose model turns were generated across a weight sync, by more than one policy version.
+                spanning = sum(1 for count in spans if count > 0)
+                self.all_metrics.update(
+                    {
+                        "async/responses_spanning_weight_sync": spanning,
+                        "async/responses_spanning_weight_sync_fraction": spanning / len(spans),
+                    }
+                )
 
         with Timer("postprocess_trajectory_batch", self.all_timings):
             trajectory_batch = self.postprocess_trajectory_batch(trajectory_batch, uids)
@@ -2167,6 +2178,11 @@ class RayPPOTrainer:
                 "is_last_step": (
                     torch.tensor(trajectory_batch["is_last_step"], dtype=torch.bool)
                     if trajectory_batch.get("is_last_step", None) is not None
+                    else None
+                ),
+                ENGINE_DP_RANKS_KEY: (
+                    torch.tensor(trajectory_batch[ENGINE_DP_RANKS_KEY], dtype=torch.long)
+                    if trajectory_batch.get(ENGINE_DP_RANKS_KEY) is not None
                     else None
                 ),
             },
