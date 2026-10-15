@@ -166,16 +166,17 @@ def remove_shortconv_from_tiny_hero_checkpoint(model_path):
 
 @pytest.mark.vllm
 @pytest.mark.parametrize(
-    "name,hero,load_format",
+    "name,hero,load_format,keep_shortconv",
     [
-        *(pytest.param(name, False, "auto", id=name) for name in GEOMETRIES),
-        pytest.param("equal-ep", True, "auto", id="hero-split-experts"),
-        pytest.param("single-serving-ep", True, "auto", id="hero-split-experts-single-serving"),
-        pytest.param("single-serving-ep", True, "dummy", id="hero-dummy-shortconv"),
+        *(pytest.param(name, False, "auto", False, id=name) for name in GEOMETRIES),
+        pytest.param("equal-ep", True, "auto", False, id="hero-split-experts"),
+        pytest.param("single-serving-ep", True, "auto", False, id="hero-split-experts-single-serving"),
+        pytest.param("single-serving-ep", True, "auto", True, id="hero-normal-shortconv"),
+        pytest.param("single-serving-ep", True, "dummy", True, id="hero-dummy-shortconv"),
     ],
 )
 def test_expert_block_sync_installs_every_byte_and_verification_catches_a_flipped_one(
-    tmp_path, name, hero, load_format, monkeypatch
+    tmp_path, name, hero, load_format, keep_shortconv, monkeypatch
 ):
     geometry = HERO_SINGLE_SERVING_GEOMETRY if name == "single-serving-ep" else GEOMETRIES[name]
     require_hoppers(geometry.gpus)
@@ -191,7 +192,7 @@ def test_expert_block_sync_installs_every_byte_and_verification_catches_a_flippe
     model_path.mkdir()
     if hero:
         write_tiny_hero_checkpoint(model_path)
-        if load_format != "dummy":
+        if not keep_shortconv:
             remove_shortconv_from_tiny_hero_checkpoint(model_path)
     else:
         write_tiny_checkpoint(model_path)
@@ -203,6 +204,9 @@ def test_expert_block_sync_installs_every_byte_and_verification_catches_a_flippe
     cfg.generator.weight_sync_transport = "expert_block"
     cfg.generator.fuse_weights = False
     OmegaConf.update(cfg, "generator.engine_init_kwargs.load_format", load_format, force_add=True)
+    if keep_shortconv:
+        # Hero's serving harness uses this setting with the pinned vLLM ShortConv profile path.
+        OmegaConf.update(cfg, "generator.engine_init_kwargs.enable_flashinfer_autotune", False, force_add=True)
     cfg.generator.expert_block_sync.verify = True
     tokenizer = AutoTokenizer.from_pretrained(str(model_path))
     initialize_ray(cfg)
@@ -210,7 +214,7 @@ def test_expert_block_sync_installs_every_byte_and_verification_catches_a_flippe
         client = engine_client(cfg, str(model_path), geometry)
         policy = _init_policy(cfg, geometry.policy_gpus)
         sync_names = HERO_SYNC_NAMES if hero else SYNC_NAMES
-        if load_format == "dummy":
+        if keep_shortconv:
             sync_names = [
                 *sync_names,
                 "model.layers.0.sconv_mlp.weight",
