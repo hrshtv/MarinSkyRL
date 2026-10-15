@@ -286,7 +286,12 @@ class LocalRLRunner:
         config_path = Path(tempfile.gettempdir()) / "marinskyrl" / "skyrl-launch.yaml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         OmegaConf.save(launch_config, config_path, resolve=True)
-        cmd = [python_exe, "-m", "cloud.iris.skyrl_entrypoint", "--config", str(config_path)]
+        module = (
+            "tests.gpu.fault_injection.snowball_checkpoint_parity"
+            if launch_config.run.get("checkpoint_parity_phase")
+            else "cloud.iris.skyrl_entrypoint"
+        )
+        cmd = [python_exe, "-m", module, "--config", str(config_path)]
 
         print("\nRunning SkyRL:")
         print(f"  Entrypoint: {launch_config.runtime.entrypoint}")
