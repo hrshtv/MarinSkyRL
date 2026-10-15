@@ -14,4 +14,6 @@ def validate_remote_read_config(cfg: DictConfig) -> None:
         try:
             RemoteReadMode(mode)
         except ValueError as error:
-            raise ValueError(f"trainer.{role}.model.remote_read_mode must be per_key or prefetch; got {mode!r}") from error
+            raise ValueError(
+                f"trainer.{role}.model.remote_read_mode must be per_key or prefetch; got {mode!r}"
+            ) from error

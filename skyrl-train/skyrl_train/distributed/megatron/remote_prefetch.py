@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Set
 from typing import Any
 
+
 def prefetch_items_from_tasks(
     tasks: Iterable[Any], lazy_keys: Set[str], expert_index: Callable[[str], int]
 ) -> list[tuple[str, int | None]]:
@@ -31,7 +32,8 @@ def make_prefetch_hook(bridge, source):
     def prefetch(models):
         source.store.plan_prefetch(
             prefetch_items_from_tasks(
-                bridge.get_conversion_tasks(models), source.store.lazy_first_dim_keys,
+                bridge.get_conversion_tasks(models),
+                source.store.lazy_first_dim_keys,
                 extract_expert_number_from_param,
             )
         )
