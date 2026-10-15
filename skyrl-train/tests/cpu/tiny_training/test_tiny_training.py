@@ -336,6 +336,7 @@ class _LateInferenceTinyTrainingExp(_OverlappingTinyTrainingExp):
             gate.write(b"r")
         _assert_resources_released()
         with socket.socket() as endpoint:
+            endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             endpoint.bind((self.cfg.generator.http_endpoint_host, self.cfg.generator.http_endpoint_port))
 
 
