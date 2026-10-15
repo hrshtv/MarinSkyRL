@@ -107,6 +107,7 @@ class _ResidencyInferenceClient:
     def __init__(self):
         self.awake = True
         self.wake_tags = []
+        self.generation_paused_event = threading.Event()
 
     async def sleep(self):
         self.awake = False
@@ -116,9 +117,11 @@ class _ResidencyInferenceClient:
         self.awake = True
 
     async def pause_generation(self):
+        self.generation_paused_event.set()
         self.awake = False
 
     async def resume_generation(self):
+        self.generation_paused_event.clear()
         self.awake = True
 
 
@@ -155,6 +158,7 @@ async def test_empty_ftpo_batch_sync_keeps_last_completed_model_version(complete
     trainer.inference_engine_client = _ResidencyInferenceClient()
     transport = _VersionedSync(completed_step=completed_step)
     trainer._expert_block_sync = transport
+    trainer._inference_policy_step = None
     trainer.global_step = completed_step
     trainer.all_timings = {}
     trainer.all_startup_timings = {}
