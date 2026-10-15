@@ -32,6 +32,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from skyrl_train.benchmarks.learner.numerics import canonical_parameter_group, global_layer_indices
 from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
@@ -75,6 +76,31 @@ def dp_weight_checksum_mismatch(model_chunks: list[nn.Module]) -> float:
         mismatch = torch.maximum(mismatch, (~matches).to(torch.int64))
     torch.distributed.all_reduce(mismatch, op=torch.distributed.ReduceOp.MAX)
     return float(mismatch.item())
+
+
+def numerics_parameter_shards(model_chunks: list[nn.Module]) -> list[tuple[str, str, nn.Parameter]]:
+    """Return ``(rank-local key, canonical group, parameter)`` for each parameter shard this rank owns.
+
+    Exactly one rank owns each element of the global model, so summing per-element statistics over ranks counts
+    every element once: data/context-parallel replicas defer to data-parallel rank 0 (expert-data-parallel rank 0
+    for expert weights) and tensor-parallel duplicates to (expert-)tensor-parallel rank 0.
+    """
+    dense_owner = mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    expert_owner = mpu.get_expert_data_parallel_rank() == 0
+    tensor_rank = mpu.get_tensor_model_parallel_rank()
+    expert_tensor_rank = mpu.get_expert_tensor_parallel_rank()
+    shards = []
+    for chunk_index, chunk in enumerate(model_chunks):
+        layers = global_layer_indices(chunk.named_modules())
+        for name, parameter in chunk.named_parameters():
+            expert = not bool(getattr(parameter, "allreduce", True))
+            if not (expert_owner if expert else dense_owner):
+                continue
+            partitioned = bool(getattr(parameter, "tensor_model_parallel", False))
+            if not partitioned and (expert_tensor_rank if expert else tensor_rank) != 0:
+                continue
+            shards.append((f"{chunk_index}/{name}", canonical_parameter_group(name, layers), parameter))
+    return shards
 
 
 def make_batch_generator(batches, vpp_size):

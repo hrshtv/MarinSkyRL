@@ -18,6 +18,7 @@ from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from omegaconf import OmegaConf
+from skyrl_train.benchmarks.learner.numerics import parameter_delta_statistics, statistics_to_wire
 from skyrl_train.distributed.dispatch import MeshRank
 from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
@@ -25,6 +26,7 @@ from skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
     materialize_megatron_params,
     dp_weight_checksum_mismatch,
+    numerics_parameter_shards,
     print_model_size,
 )
 from skyrl_train.distributed.megatron.optimizer import (
@@ -377,6 +379,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self.profiler: Profiler | None = None
         self._warned_exact_unit_policy_ratio = False
         self._consecutive_nonfinite_steps = 0
+        self._numerics_baseline: dict[str, torch.Tensor] | None = None
 
     def forward(self, data, *, probe_micro_batch_size: int | None = None):
         with self._memory.span("forward", step=data.metadata.get("global_step")):
@@ -823,6 +826,26 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             await cache_reset_task
         torch.cuda.empty_cache()
         torch.distributed.barrier()
+
+    def capture_numerics_baseline(self) -> None:
+        """Copy this rank's owned parameter shards to host memory for `numerics_parameter_statistics`."""
+        materialize_megatron_params(self.actor_module)
+        self._numerics_baseline = {
+            key: parameter.detach().to("cpu", copy=True)
+            for key, _, parameter in numerics_parameter_shards(self.actor_module)
+        }
+
+    def numerics_parameter_statistics(self) -> dict[str, list[float]]:
+        """Return per-group delta statistics of this rank's owned shards since the baseline, then drop it."""
+        if self._numerics_baseline is None:
+            raise RuntimeError("capture_numerics_baseline must run before numerics_parameter_statistics")
+        materialize_megatron_params(self.actor_module)
+        totals = {}
+        for key, group, parameter in numerics_parameter_shards(self.actor_module):
+            statistics = parameter_delta_statistics(self._numerics_baseline[key], parameter)
+            totals[group] = totals[group] + statistics if group in totals else statistics
+        self._numerics_baseline = None
+        return {group: statistics_to_wire(statistics) for group, statistics in totals.items()}
 
     def grug_optimizer_route_snapshot(self):
         """Return this rank and the optimizer route for each named parameter."""
