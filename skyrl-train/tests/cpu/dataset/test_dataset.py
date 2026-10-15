@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 from unittest.mock import patch
@@ -220,3 +221,44 @@ def test_prompt_dataset_uids(mock_load_dataset, sample_dataset, mock_tokenizer):
     uids_again = [row[3] for row in rows_again]
     # When sampled the second time, UIDs should not change
     assert uids_again == uids
+
+
+@pytest.fixture
+def fork_records(tmp_path):
+    records = tmp_path / "forks"
+    records.mkdir()
+    enabled = True
+
+    def record_fork():
+        if enabled:
+            (records / str(os.getpid())).touch()
+
+    os.register_at_fork(after_in_child=record_fork)
+    try:
+        yield records
+    finally:
+        enabled = False
+
+
+@pytest.mark.parametrize(("row_count", "uses_process_pool"), [(22, False), (20_000, True)])
+def test_task_dataset_maps_and_filters_small_inputs_in_the_parent(tmp_path, fork_records, row_count, uses_process_pool):
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": "x" * 200 if index % 10 == 0 else f"Question {index}"}],
+            "env_class": "gsm8k",
+            "reward_spec": {"ground_truth": "1"},
+        }
+        for index in range(row_count)
+    ]
+    source = tmp_path / "source.parquet"
+    Dataset.from_list(rows).to_parquet(source)
+    dataset = SourceTaskDataset(
+        [str(source)],
+        _StubTokenizer(),
+        100,
+        environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
+        num_workers=2,
+    )
+    expected = [row["prompt"] for index, row in enumerate(rows) if index % 10 != 0]
+    assert list(dataset.dataframe["prompt"]) == expected
+    assert bool(tuple(fork_records.iterdir())) == uses_process_pool
