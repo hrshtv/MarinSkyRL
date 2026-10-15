@@ -1,4 +1,5 @@
 import json
+from contextlib import suppress
 import os
 import select
 import sys
@@ -152,12 +153,16 @@ def test_all_policy_ranks_construct_before_rank_zero_rendezvous(tmp_path):
             result = run_after_rank_readiness(gang, expected_ranks=1, setup_timeout_seconds=120, run_timeout_seconds=45)
             assert result.returncode == 0, result.output
             assert json.loads((tmp_path / "result.json").read_text()) == {"ranks": [0, 1]}
-            gang.kill_and_reap()
         for record in tmp_path.glob("rank-*.json"):
             pid = json.loads(record.read_text())["pid"]
             assert not psutil.pid_exists(pid), f"policy rank process {pid} survived cleanup"
     finally:
         os.close(barrier_keepalive)
+        for record in tmp_path.glob("rank-*.json"):
+            with suppress(psutil.NoSuchProcess):
+                process = psutil.Process(json.loads(record.read_text())["pid"])
+                process.kill()
+                process.wait(timeout=5)
 
 
 if __name__ == "__main__":
