@@ -20,14 +20,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from pathlib import Path
 import posixpath
 import re
+import tempfile
 from typing import Any, BinaryIO
 
 import numpy as np
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from loguru import logger
+from transformers import AutoTokenizer
 
 from marinskyrl.model_manifest import (
     HF_WEIGHT_INDEX_FILENAME,
@@ -39,6 +42,7 @@ from marinskyrl.model_manifest import (
     build_safetensors_weight_index,
     read_safetensors_header,
 )
+from marinskyrl.hf_model import validate_portable_hf_model_files
 from marinskyrl.remote_io import filesystem_and_path, open_output_stream
 from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.models.grug_moe import GRUG_MOE_MODEL_TYPE, GrugMoeConfig
@@ -77,6 +81,24 @@ class TruncationProvenance:
     source_manifest_identity: str | None
     source_num_layers: int
     num_layers: int
+    tokenizer: str | None = None
+
+
+@dataclass(frozen=True)
+class TokenizerSource:
+    """A Hugging Face tokenizer to save into a truncated checkpoint whose source has no tokenizer files."""
+
+    model_id: str
+    revision: str
+
+    def files(self) -> dict[str, bytes]:
+        """Return the saved tokenizer files by name; a missing pad token is set to the EOS token."""
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        with tempfile.TemporaryDirectory() as directory:
+            tokenizer.save_pretrained(directory)
+            return {path.name: path.read_bytes() for path in sorted(Path(directory).iterdir()) if path.is_file()}
 
 
 @dataclass(frozen=True)
@@ -332,6 +354,7 @@ def truncate_checkpoint(
     num_layers: int,
     *,
     max_concurrent_shards: int,
+    tokenizer: TokenizerSource | None = None,
 ) -> TruncationProvenance:
     """Write the first ``num_layers`` layers of a Grug HF checkpoint to ``output_path``.
 
@@ -341,6 +364,7 @@ def truncate_checkpoint(
         output_path: Local directory or object-store prefix. It must not already hold files.
         num_layers: Number of leading decoder layers to keep; a multiple of ``global_every``.
         max_concurrent_shards: Shards streamed at once.
+        tokenizer: Tokenizer to save into the output, for a source without tokenizer files.
 
     Returns:
         The provenance record also written to ``truncation_provenance.json``.
@@ -365,6 +389,16 @@ def truncate_checkpoint(
         source_manifest_identity=source_manifest.identity if source_manifest else None,
         source_num_layers=source_num_layers,
         num_layers=num_layers,
+        tokenizer=None if tokenizer is None else f"{tokenizer.model_id}@{tokenizer.revision}",
+    )
+    copied_names = _copied_file_names(source)
+    tokenizer_files = {} if tokenizer is None else tokenizer.files()
+    overlap = sorted(set(copied_names) & set(tokenizer_files))
+    if overlap:
+        raise ValueError(f"source already holds tokenizer files {overlap}; do not pass a tokenizer")
+    # Check the export contract before streaming shards so a missing tokenizer fails fast.
+    validate_portable_hf_model_files(
+        {CONFIG_FILENAME, *copied_names, *tokenizer_files, *(plan.output_shard for plan in plans)}, output_path
     )
     logger.info(
         f"Truncating {source_path} from {source_num_layers} to {num_layers} layers: {len(plans)} shards "
@@ -376,8 +410,10 @@ def truncate_checkpoint(
     _verify_against_manifest(source_manifest, plans, shard_files)
 
     entries = [entry for entry, _keys in shard_files]
-    for name in _copied_file_names(source):
+    for name in copied_names:
         entries.append(output.write_bytes(name, source.read_bytes(name)))
+    for name, payload in tokenizer_files.items():
+        entries.append(output.write_bytes(name, payload))
     entries.append(
         output.write_bytes(CONFIG_FILENAME, (json.dumps(new_config, indent=2, sort_keys=True) + "\n").encode())
     )
@@ -410,9 +446,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output", required=True, help="empty output directory or object-store prefix")
     parser.add_argument("--num-layers", type=int, required=True)
     parser.add_argument("--max-concurrent-shards", type=int, required=True)
+    parser.add_argument("--tokenizer", help="HF tokenizer id to save into the output when the source has none")
+    parser.add_argument("--tokenizer-revision", help="required with --tokenizer")
     args = parser.parse_args(argv)
+    if (args.tokenizer is None) != (args.tokenizer_revision is None):
+        parser.error("--tokenizer and --tokenizer-revision go together")
     provenance = truncate_checkpoint(
-        args.source, args.output, args.num_layers, max_concurrent_shards=args.max_concurrent_shards
+        args.source,
+        args.output,
+        args.num_layers,
+        max_concurrent_shards=args.max_concurrent_shards,
+        tokenizer=None if args.tokenizer is None else TokenizerSource(args.tokenizer, args.tokenizer_revision),
     )
     print(json.dumps(asdict(provenance), indent=2, sort_keys=True), flush=True)
 

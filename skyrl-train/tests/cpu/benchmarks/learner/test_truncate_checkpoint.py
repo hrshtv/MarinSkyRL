@@ -18,6 +18,7 @@ from marinskyrl.model_manifest import (
     write_local_model_manifest,
 )
 from skyrl_train.benchmarks.learner.truncate_checkpoint import (
+    TokenizerSource,
     read_truncation_provenance,
     slice_routes,
     truncate_checkpoint,
@@ -253,6 +254,47 @@ def test_truncated_model_reproduces_full_model_hidden_states(tmp_path):
     assert len(shallow_hidden) == KEPT_LAYERS + 2
     for layer in range(KEPT_LAYERS + 1):
         torch.testing.assert_close(shallow_hidden[layer], full_hidden[layer], rtol=0, atol=0)
+
+
+def _remove_tokenizer(path: Path) -> None:
+    for file in path.iterdir():
+        if file.name.startswith("tokenizer") or file.name == "special_tokens_map.json":
+            file.unlink()
+    (path / MODEL_MANIFEST_FILENAME).unlink()
+
+
+def test_source_without_tokenizer_fails_before_copying_any_shard(tmp_path):
+    source = tmp_path / "hero"
+    _write_hero_checkpoint(source)
+    _remove_tokenizer(source)
+
+    with pytest.raises(ValueError, match="no tokenizer files"):
+        truncate_checkpoint(str(source), str(tmp_path / "shallow"), KEPT_LAYERS, max_concurrent_shards=1)
+    assert not (tmp_path / "shallow").exists()
+
+
+def test_tokenizer_source_completes_a_tokenizerless_checkpoint(tmp_path):
+    source = tmp_path / "hero"
+    _write_hero_checkpoint(source)
+    _remove_tokenizer(source)
+    tokenizer_dir = tmp_path / "tokenizer"
+    _save_tokenizer(tokenizer_dir)
+    output = tmp_path / "shallow"
+
+    truncate_checkpoint(
+        str(source),
+        str(output),
+        KEPT_LAYERS,
+        max_concurrent_shards=1,
+        tokenizer=TokenizerSource(str(tokenizer_dir), "main"),
+    )
+
+    assert len(AutoTokenizer.from_pretrained(output)) == VOCAB
+    assert read_truncation_provenance(str(output)).tokenizer == f"{tokenizer_dir}@main"
+    manifest = ModelManifest.from_mapping(
+        json.loads((output / MODEL_MANIFEST_FILENAME).read_text()), str(output / MODEL_MANIFEST_FILENAME)
+    )
+    assert any(entry.path.startswith("tokenizer") for entry in manifest.files)
 
 
 def test_rejects_prefix_ending_on_sliding_window_layer(tmp_path):
