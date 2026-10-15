@@ -47,6 +47,7 @@ TYPES = {
     "generator.weight_sync_pause.mode": 'Literal["abort", "wait", "keep"]',
     "generator.r3_transport": 'Literal["by_value", "resident", "decentral"]',
     "generator.gdn_backend": 'Literal["torch", "flashqla"]',
+    "generator.chat_template": "ChatTemplate | None",
     "generator.chat_template.source": 'Literal["name", "file"]',
     "generator.error_handling.default_error_treatment": 'Literal["mask", "zero", "passthrough"]',
     "generator.trajectory_retention.phases": 'tuple[Literal["train", "eval"], ...]',

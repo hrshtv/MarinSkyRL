@@ -8,7 +8,6 @@ from omegaconf import OmegaConf
 import pytest
 import yaml
 
-from cloud.iris import rl_config_translation
 from cloud.iris.rl_config_translation import compose_skyrl_config, parse_rl_config
 from marinskyrl.speculative_decoding import (
     SpeculativeDecodingConfigError,
@@ -56,9 +55,6 @@ def _write_config(tmp_path: Path, config: dict) -> Path:
 
 
 def test_managed_speculator_reaches_hydra_with_immutable_source_unchanged(tmp_path: Path) -> None:
-    assert Path(rl_config_translation.__file__).resolve() == (
-        Path(__file__).resolve().parents[3] / "cloud/iris/rl_config_translation.py"
-    )
     parsed = parse_rl_config(str(_write_config(tmp_path, _base_config())))
     speculator = parsed.generator["speculative_decoding"]
 

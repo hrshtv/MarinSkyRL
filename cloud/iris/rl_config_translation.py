@@ -9,9 +9,10 @@ from importlib.resources import files
 import json
 import os
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Protocol, get_args, get_origin
+from typing import Any, Dict, Optional, Protocol, get_args, get_origin
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
@@ -39,21 +40,6 @@ TRAINER_NON_PATH_KEYS = frozenset({"policy.model.path", "callbacks.metric_groups
 
 
 CHECKPOINT_EXPORT_ENTRYPOINT = CHECKPOINT_EXPORT_MODULE
-
-
-def resolve_rl_entrypoint(value: str | None, *, config_path: Path) -> str:
-    """Resolve one supported RL execution mode to its packaged module."""
-    name = RLEntrypoint.STANDARD if value is None else value
-    try:
-        entrypoint = RLEntrypoint(name)
-    except ValueError as error:
-        choices = ", ".join(item.value for item in RLEntrypoint)
-        raise ValueError(
-            f"{config_path}: entrypoint must be a registered name ({choices}); got {name!r}. "
-            "Python module paths are not accepted in RL configs."
-        ) from error
-
-    return RL_ENTRYPOINTS[entrypoint]
 
 
 _RL_ENTRYPOINTS_BY_MODULE = MappingProxyType({module: name for name, module in RL_ENTRYPOINTS.items()})

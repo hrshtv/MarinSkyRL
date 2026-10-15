@@ -800,7 +800,7 @@ class Generator(Section):
     "Deadline for every engine to acknowledge a weight-sync pause or resume."
     error_handling: ErrorHandling = Field(default_factory=ErrorHandling)
     "Shared Harbor/Gym terminal-error taxonomy. Unknown Gym failures retain the\nprevious masking behavior; context overflow and timeouts are agent errors."
-    chat_template: ChatTemplate = Field(default_factory=ChatTemplate)
+    chat_template: ChatTemplate | None = Field(default_factory=ChatTemplate)
     chat_template_kwargs: OpenMap = field({})
     engine_init_kwargs: OpenMap = field({})
     speculative_decoding: SpeculativeDecoding | None = field(None)

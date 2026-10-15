@@ -68,8 +68,9 @@ uv run python scripts/generate_recipe_schema.py --check
 
 Commit the generated sections and public exports with the source edit. Put finite choices, null-default
 structures and other constraints that YAML cannot express in `scripts/recipe_schema_sidecar.py`.
-`TYPES`, `OPEN` and `NAMES` paths must exist in YAML. `UNDECLARED` entries represent code-default fields
-and cannot shadow YAML keys. Ellipsis keeps those fields unset in an authored document.
+`TYPES` and `OPEN` paths must exist in YAML. `NAMES` paths may also name `UNDECLARED` fields or their
+parent mappings. `UNDECLARED` entries represent code-default fields and cannot shadow YAML keys.
+Ellipsis keeps those fields unset in an authored document.
 
 Add a migration row to `REMOVED` in `ownership.py` when an authored key changes. Document validation
 reports that row before an unknown-key error. `terminal_bench.harbor.max_episodes` reports
