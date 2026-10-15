@@ -267,11 +267,14 @@ class RouteEngineConfig:
         model: Local model directory or HF id; with ``model_source_uri`` only its config is read.
         model_source_uri: Object-store copy of the weights to stream with the RunAI loader, or ``None`` to load
             ``model`` directly.
+        distributed_streaming: Whether RunAI ranks split the read and share chunks over NCCL (as the trainer's
+            rollout engines do) or each stream their own copy.
     """
 
     model: str
     revision: str | None
     model_source_uri: str | None
+    distributed_streaming: bool
     tokenizer: str
     tokenizer_revision: str | None
     num_engines: int
@@ -304,7 +307,7 @@ def create_route_engines(config: RouteEngineConfig) -> list[InferenceEngineInter
     if config.model_source_uri is not None:
         pretrain = runai_model_uri(config.model_source_uri)
         engine_init_kwargs["load_format"] = "runai_streamer"
-        engine_init_kwargs["model_loader_extra_config"] = {"distributed": True}
+        engine_init_kwargs["model_loader_extra_config"] = {"distributed": config.distributed_streaming}
         engine_init_kwargs[MODEL_METADATA_PATH_KEY] = config.model
     return create_ray_wrapped_inference_engines(
         num_inference_engines=config.num_engines,
@@ -370,6 +373,12 @@ def main() -> None:
     )
     parser.add_argument("--revision", default=None)
     parser.add_argument("--model-source-uri", default=None, help="s3:// or gs:// weights streamed with RunAI")
+    parser.add_argument(
+        "--distributed-streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="share RunAI reads across ranks over NCCL; --no-distributed-streaming streams per rank",
+    )
     parser.add_argument("--tokenizer", required=True, help="HF tokenizer id or path")
     parser.add_argument("--tokenizer-revision", default=None)
     parser.add_argument("--checkpoint-id", required=True, help="name of the routes file written per batch")
@@ -394,6 +403,7 @@ def main() -> None:
         model=args.model,
         revision=args.revision,
         model_source_uri=args.model_source_uri,
+        distributed_streaming=args.distributed_streaming,
         tokenizer=args.tokenizer,
         tokenizer_revision=args.tokenizer_revision,
         num_engines=args.num_engines,
