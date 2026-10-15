@@ -131,7 +131,7 @@ SAFETENSORS_LENGTH_PREFIX_BYTES = 8
 
 
 class _HeaderReader(Protocol):
-    def read(self, size: int) -> bytes: ...
+    def read(self, size: int, /) -> bytes: ...
 
 
 def read_safetensors_header(source: _HeaderReader, source_name: str) -> tuple[bytes, tuple[str, ...]]:
