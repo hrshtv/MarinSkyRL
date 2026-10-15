@@ -23,7 +23,6 @@ import requests
 from jinja2 import TemplateError
 from omegaconf import OmegaConf
 from skyrl_train.config.utils import get_default_config
-from skyrl_train.entrypoints import main_base
 from skyrl_train.inference_engines.base import InferenceEngineInput, InferenceEngineOutput
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.inference_engine_client_http_endpoint import (
@@ -40,7 +39,6 @@ from skyrl_train.inference_engines.utils import (
     route_prompts_to_engines,
 )
 from skyrl_train.trajectory_runners.routed_experts import normalize_routed_experts
-from skyrl_train.utils.utils import validate_generator_cfg
 from transformers import AutoTokenizer
 
 # (num_engines, num_prompts, with_session_ids): a single engine, an uneven even-split, session-id
@@ -1489,10 +1487,7 @@ class _MockGenerateEngine:
         self.scheduler_paused = False
 
 
-@pytest.mark.parametrize("load_format", ["dummy", "Dummy"])
-def test_dummy_training_factory_serves_http_only_after_engines_acknowledge_pause(
-    monkeypatch, unused_tcp_port, load_format
-):
+def test_client_serves_http_only_after_engines_acknowledge_startup_pause(unused_tcp_port):
     entered = threading.Event()
     release = threading.Event()
 
@@ -1503,7 +1498,6 @@ def test_dummy_training_factory_serves_http_only_after_engines_acknowledge_pause
             await super().pause_generation()
 
     engine = DelayedPauseEngine()
-    monkeypatch.setattr(main_base, "create_ray_wrapped_inference_engines_from_config", lambda *args, **kwargs: [engine])
     cfg = get_default_config()
     cfg.trainer.logger = "console"
     cfg.trainer.placement.colocate_all = False
@@ -1511,16 +1505,12 @@ def test_dummy_training_factory_serves_http_only_after_engines_acknowledge_pause
     cfg.generator.http_endpoint_port = unused_tcp_port
     cfg.generator.fuse_weights = False
     cfg.generator.weight_sync_transport = "broadcast"
-    OmegaConf.update(cfg, "generator.engine_init_kwargs.load_format", load_format, force_add=True)
-    validate_generator_cfg(cfg)
-    experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
-    experiment.cfg, experiment.colocate_pg, experiment.tokenizer = cfg, None, object()
     url = f"http://127.0.0.1:{unused_tcp_port}/v1/models"
     client = None
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(experiment.create_inference_engine_client)
+        future = executor.submit(InferenceEngineClient, [engine], object(), cfg, pause_before_serving=True)
         try:
-            assert entered.wait(10), "The factory did not request an engine pause"
+            assert entered.wait(10), "The client did not request an engine pause"
             with pytest.raises(requests.ConnectionError):
                 requests.get(url, timeout=1)
             release.set()

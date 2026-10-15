@@ -124,6 +124,7 @@ from skyrl_train.utils.utils import (
     policy_force_cvd_mask_enabled,
 )
 
+from skyrl_train.config.dummy_engine_weights import dummy_engine_weights_requested
 from skyrl_train.config.objective_spec import rollout_logprobs_required
 from skyrl_train.utils.algorithm_registry import PolicyLossRegistry
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
@@ -1415,7 +1416,7 @@ class RayPPOTrainer:
             else:
                 # Expert-block sync writes into live engine parameters, so the initial sync pauses generation too.
                 pause = reason != "initial" or self._expert_block_sync is not None
-                if pause:
+                if pause and not self.inference_engine_client.generation_paused_event.is_set():
                     await self.inference_engine_client.pause_generation()
                 # Training backloads the optimizer before every step. Offload it after every update, including
                 # the initial sync, so Megatron gradient buffers are not resized while still on the GPU.
@@ -1423,9 +1424,7 @@ class RayPPOTrainer:
                     self._offload_policy_optimizer, timings, timer_label="offload_policy_optimizer_to_cpu"
                 )
                 await self.sync_policy_weights_to_inference_engines()
-                if pause or (
-                    reason == "initial" and self.cfg.generator.engine_init_kwargs.get("load_format") == "dummy"
-                ):
+                if self.inference_engine_client.generation_paused_event.is_set():
                     await self.inference_engine_client.resume_generation()
         self._log_weight_update_completed(reason=reason, duration_seconds=update_timer.duration)
         self._inference_policy_step = self.policy_version_step
@@ -1452,7 +1451,10 @@ class RayPPOTrainer:
                 timings.expert_seconds,
                 timings.dense_seconds,
             )
-            if self.cfg.generator.expert_block_sync.verify:
+            verify_initial_dummy = self._inference_policy_step is None and dummy_engine_weights_requested(
+                self.cfg.generator.engine_init_kwargs.get("load_format")
+            )
+            if self.cfg.generator.expert_block_sync.verify or verify_initial_dummy:
                 self.all_timings.update(await self._expert_block_sync.verify(self.policy_version_step))
         else:
             await self.policy_model.async_run_method(

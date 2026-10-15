@@ -81,7 +81,12 @@ class InferenceEngineClient(InferenceEngineInterface):
     """
 
     def __init__(
-        self, engines: List[InferenceEngineInterface], tokenizer: PreTrainedTokenizerBase, full_config: DictConfig
+        self,
+        engines: List[InferenceEngineInterface],
+        tokenizer: PreTrainedTokenizerBase,
+        full_config: DictConfig,
+        *,
+        pause_before_serving: bool = False,
     ):
         """
         Args:
@@ -130,12 +135,14 @@ class InferenceEngineClient(InferenceEngineInterface):
         self._routing_lock = threading.Lock()
         self._http_bridge_stats = HTTPBridgeStatsAccumulator()
 
-        if self.enable_http_endpoint:
-            try:
+        try:
+            if pause_before_serving:
+                asyncio.run(self.pause_generation())
+            if self.enable_http_endpoint:
                 self._spin_up_http_endpoint()
-            except BaseException:
-                self.discard_engines()
-                raise
+        except BaseException:
+            self.discard_engines()
+            raise
 
         logger.info(f"InferenceEngineClient initialized with {len(engines)} engines.")
 

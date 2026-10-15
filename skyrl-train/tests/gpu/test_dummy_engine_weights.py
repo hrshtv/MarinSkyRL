@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,16 +14,11 @@ from skyrl_train.config.utils import get_default_config
 from skyrl_train.entrypoints import main_base
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.vllm import vllm_engine
-from skyrl_train.io import io
-from skyrl_train.trainer import kill_inference_engines
+from huggingface_hub import snapshot_download
 from tests.gpu.grug_gpu_gates import require_hoppers
 from tests.gpu.utils import ray_init_for_tests
 
 
-SNAPSHOT = (
-    "s3://marin-us-east-02a/marin/rl-canaries/cat-count/gpu/upstream/hf/"
-    "Qwen/Qwen2.5-0.5B-Instruct/7ae557604adf67be50417f59c2c2f167def9a775/"
-)
 PROMPTS = [
     [{"role": "user", "content": f"How many cats are in this list? {'cat ' * count}Answer with a number."}]
     for count in range(1, 9)
@@ -68,6 +64,45 @@ class InspectableWorker(vllm_engine.WorkerWrap):
     def available_kv_cache_memory(self):
         return int(self.available_kv_cache_memory_bytes)
 
+    def read_named_weights(self, hf_names, dump_inventory=False):
+        result = super().read_named_weights(hf_names, dump_inventory=dump_inventory)
+        model = self.model_runner.model
+        all_params = dict(model.named_parameters())
+        tp_size = result["__ranks__"]["tp_size"]
+        for name in hf_names:
+            if result.get(name, {}).get("found"):
+                continue
+            packed = re.match(
+                r"^(model\.layers\.\d+)\.(self_attn\.(q|k|v)_proj|mlp\.(gate|up)_proj)\.(weight|bias)$",
+                name,
+            )
+            if packed is not None:
+                prefix, _projection, qkv, mlp, kind = packed.groups()
+                if qkv is not None:
+                    module_name = f"{prefix}.self_attn.qkv_proj"
+                    module = model.get_submodule(module_name)
+                    sizes = (
+                        module.num_heads * module.head_size,
+                        module.num_kv_heads * module.head_size,
+                        module.num_kv_heads * module.v_head_size,
+                    )
+                    index = ("q", "k", "v").index(qkv)
+                else:
+                    module_name = f"{prefix}.mlp.gate_up_proj"
+                    module = model.get_submodule(module_name)
+                    sizes = tuple(size // tp_size for size in module.output_sizes)
+                    index = ("gate", "up").index(mlp)
+                tensor = all_params[f"{module_name}.{kind}"].narrow(0, sum(sizes[:index]), sizes[index])
+                result[name] = {
+                    "found": True,
+                    "mode": "packed",
+                    "dtype": str(tensor.dtype).removeprefix("torch."),
+                    "tensor": tensor.detach().to("cpu", dtype=torch.float32).contiguous(),
+                }
+                continue
+
+        return result
+
     def read_snapshot_weights(self, names):
         result = self.read_named_weights(names)
         for entry in result.values():
@@ -80,13 +115,13 @@ class InspectableWorker(vllm_engine.WorkerWrap):
 @pytest.mark.vllm
 def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sync(tmp_path, monkeypatch):
     require_hoppers(1)
-    root = Path(__file__).resolve().parents[2] / "skyrl_train"
-    for module in (main_base, vllm_engine):
-        assert Path(module.__file__).resolve().is_relative_to(root), module.__file__
-        print("SOURCE_ASSERT", module.__file__, flush=True)
     monkeypatch.setattr(vllm_engine, "AsyncVLLMRayActor", ray.remote(InspectableEngine))
     model_path = tmp_path / "model"
-    io.download_directory(SNAPSHOT, str(model_path))
+    snapshot_download(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        revision="7ae557604adf67be50417f59c2c2f167def9a775",
+        local_dir=model_path,
+    )
     shards = sorted(model_path.glob("*.safetensors"))
     assert shards
     names = []
@@ -123,7 +158,7 @@ def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sy
             client = experiment.create_inference_engine_client()
             actor = client.engines[0].inference_engine_actor
             budget = ray.get(actor.worker_rpc.remote("available_kv_cache_memory"))[0]
-            print(f"X4a {load_format} Available KV cache memory: {budget} bytes", flush=True)
+            print(f"{load_format} available KV cache memory: {budget} bytes", flush=True)
             if load_format == "auto":
                 real_budget = budget
                 real_weights = ray.get(actor.worker_rpc.remote("read_snapshot_weights", names))[0]
@@ -179,7 +214,7 @@ def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sy
             for name in names:
                 assert dummy_weights[name]["found"], (name, dummy_weights[name])
                 torch.testing.assert_close(dummy_weights[name]["tensor"], real_weights[name]["tensor"], rtol=0, atol=0)
-            print(f"X4a verified {len(names)} HF tensors", flush=True)
+            print(f"Verified {len(names)} HF tensors", flush=True)
             dummy_serial = [
                 asyncio.run(client.generate({"prompts": [prompt], "sampling_params": SAMPLING})) for prompt in PROMPTS
             ]
@@ -195,5 +230,81 @@ def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sy
                 try:
                     client.shutdown_http_endpoint()
                 finally:
-                    kill_inference_engines(client)
+                    client.discard_engines()
             ray.shutdown()
+
+
+@pytest.fixture(scope="module")
+def tiny_hero_checkpoint(tmp_path_factory):
+    from tests.gpu.test_hero_megatron import write_tiny_hero_checkpoint
+
+    path = tmp_path_factory.mktemp("hero-checkpoint")
+    write_tiny_hero_checkpoint(path)
+    return path
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "model.layers.0.sconv_mlp.weight",
+        "model.layers.0.mlp.router.bias",
+        "model.layers.0.shared_experts.1.up_proj.weight",
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+    ],
+)
+def test_hero_dummy_broadcast_requires_each_parameter_family(tmp_path, monkeypatch, tiny_hero_checkpoint, missing):
+    require_hoppers(1)
+    monkeypatch.setattr(vllm_engine, "AsyncVLLMRayActor", ray.remote(InspectableEngine))
+    model_path = tiny_hero_checkpoint
+    names = []
+    for shard in model_path.glob("*.safetensors"):
+        with safe_open(shard, framework="pt", device="cpu") as weights:
+            names.extend(weights.keys())
+    assert missing in names
+    cfg = get_default_config()
+    cfg.trainer.policy.model.path = str(model_path)
+    cfg.trainer.policy.model.tokenizer_path = str(model_path)
+    cfg.trainer.placement.colocate_all = False
+    cfg.generator.num_inference_engines = 1
+    cfg.generator.inference_engine_tensor_parallel_size = 1
+    cfg.generator.inference_engine_pipeline_parallel_size = 1
+    cfg.generator.inference_engine_data_parallel_size = 1
+    cfg.generator.inference_engine_expert_parallel_size = 1
+    cfg.generator.gpu_memory_utilization = 0.6
+    cfg.generator.fuse_weights = False
+    cfg.generator.weight_sync_transport = "broadcast"
+    OmegaConf.update(
+        cfg, "generator.engine_init_kwargs", {"load_format": "dummy", "max_model_len": 256}, force_add=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
+    experiment.cfg, experiment.colocate_pg, experiment.tokenizer = cfg, None, tokenizer
+    ray_init_for_tests()
+    client = None
+    try:
+        client = experiment.create_inference_engine_client()
+        actor = client.engines[0].inference_engine_actor
+
+        async def install():
+            await client.begin_weight_reload()
+            await actor.worker_rpc.remote(
+                "receive_snapshot_weights", str(model_path), [name for name in names if name != missing]
+            )
+            with pytest.raises(ray.exceptions.RayTaskError, match="Incomplete dummy engine weights"):
+                await client.finish_weight_reload()
+            assert client.generation_paused_event.is_set()
+            await actor.worker_rpc.remote("receive_snapshot_weights", str(model_path), [missing])
+            await client.finish_weight_reload()
+            await client.resume_generation()
+
+        asyncio.run(install())
+        installed = ray.get(actor.worker_rpc.remote("read_snapshot_weights", [missing]))[0][missing]
+        assert installed["found"], installed
+        with safe_open(model_path / "model.safetensors", framework="pt", device="cpu") as weights:
+            expected = weights.get_tensor(missing).to(getattr(torch, installed["dtype"])).float()
+        torch.testing.assert_close(installed["tensor"], expected, rtol=0, atol=0)
+    finally:
+        if client is not None:
+            client.discard_engines()
+        ray.shutdown()

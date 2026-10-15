@@ -29,6 +29,7 @@ from vllm.model_executor.model_loader.reload.meta import SKIP_LOAD_TENSORS
 from vllm.model_executor.model_loader.reload.utils import get_layer_params_buffers, get_layer_tensors
 
 from marinskyrl.resource_locator import is_cloud_uri, join_resource_path
+from skyrl_train.config.dummy_engine_weights import dummy_engine_weights_requested
 from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 from skyrl_train.config.behavior_logprobs import (
     ROLLOUT_LOGPROB_VALIDATION_KEY,
@@ -596,7 +597,7 @@ class WorkerWrap:
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
         model = self.model_runner.model
-        dummy_pending = self.vllm_config.load_config.load_format == "dummy" and not getattr(
+        dummy_pending = dummy_engine_weights_requested(self.vllm_config.load_config.load_format) and not getattr(
             self, "_skyrl_dummy_weights_verified", False
         )
         if dummy_pending:
@@ -886,7 +887,7 @@ class WorkerWrap:
         """
         active = getattr(self, "_skyrl_weight_update_active", False)
         if (
-            self.vllm_config.load_config.load_format == "dummy"
+            dummy_engine_weights_requested(self.vllm_config.load_config.load_format)
             and not active
             and not getattr(self, "_skyrl_dummy_weights_verified", False)
         ):
@@ -920,7 +921,31 @@ class WorkerWrap:
         destroy_process_group(self._model_update_group)
 
     def read_named_weights(self, hf_names, dump_inventory: bool = False):
-        """Return HF-named CPU float32 weights, engine dtypes and shard coordinates, with an optional parameter inventory."""
+        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+        from the live vLLM model, reconstructed under the HF parameter names the
+        trainer broadcasts.
+
+        This is the symmetric inverse of ``load_weights`` (vLLM consumes HF-named
+        tensors in ``model.load_weights`` and maps them into its internal
+        fused/sharded params; here we read those internal params back and rebuild
+        the HF view so the trainer's post-step HF tensors can be compared
+        tensor-by-tensor). Returns, per requested HF name, this worker's
+        contribution as a CPU fp32 tensor plus the live engine dtype and rank
+        coordinates so the caller can assemble across TP/EP shards.
+
+        Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
+          * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
+          * ``model.layers.{i}.mlp.gate.weight`` (router)       -> ReplicatedLinear (full copy every rank)
+          * ``model.layers.{i}.self_attn.o_proj.weight``        -> RowParallelLinear (TP input-sharded)
+          * ``model.layers.{i}.mlp.experts.{j}.gate_proj.weight`` -> RoutedExperts w13_weight[local_e, :I]
+          * ``...experts.{j}.up_proj.weight``                   -> RoutedExperts w13_weight[local_e, I:]
+          * ``...experts.{j}.down_proj.weight``                 -> RoutedExperts w2_weight[local_e]
+
+        Args:
+            hf_names: list of HF parameter names to read back.
+            dump_inventory: if True, also returns the full ``named_parameters()``
+                name->shape inventory under key ``__inventory__`` (first run aid).
+        """
         import re
         import torch as _torch
 
@@ -976,35 +1001,6 @@ class WorkerWrap:
                         "tensor": _cpu(tensor),
                     }
                     out[name] = entry
-                    continue
-
-                packed = re.match(
-                    r"^(model\.layers\.\d+)\.(self_attn\.(q|k|v)_proj|mlp\.(gate|up)_proj)\.(weight|bias)$",
-                    name,
-                )
-                if packed is not None:
-                    prefix, _projection, qkv, mlp, kind = packed.groups()
-                    if qkv is not None:
-                        module_name = f"{prefix}.self_attn.qkv_proj"
-                        module = model.get_submodule(module_name)
-                        sizes = (
-                            module.num_heads * module.head_size,
-                            module.num_kv_heads * module.head_size,
-                            module.num_kv_heads * module.v_head_size,
-                        )
-                        index = ("q", "k", "v").index(qkv)
-                    else:
-                        module_name = f"{prefix}.mlp.gate_up_proj"
-                        module = model.get_submodule(module_name)
-                        sizes = tuple(size // tp_size for size in module.output_sizes)
-                        index = ("gate", "up").index(mlp)
-                    tensor = all_params[f"{module_name}.{kind}"].narrow(0, sum(sizes[:index]), sizes[index])
-                    out[name] = {
-                        "found": True,
-                        "mode": "packed",
-                        "dtype": torch_dtype_to_str(tensor.dtype),
-                        "tensor": _cpu(tensor),
-                    }
                     continue
 
                 # 2. Routed expert -> FusedMoE fused weights.
