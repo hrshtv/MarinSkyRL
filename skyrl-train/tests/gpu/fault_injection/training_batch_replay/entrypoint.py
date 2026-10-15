@@ -103,6 +103,7 @@ def _capture_experiment_class():
             inference_engine_client,
             trajectory_runner,
             colocate_pg,
+            models=None,
         ):
             return CapturingRayPPOTrainer(
                 context=TrainingContext.from_config(cfg, train_dataset, trajectory_runner),
@@ -114,6 +115,7 @@ def _capture_experiment_class():
                 inference_engine_client=inference_engine_client,
                 trajectory_runner=trajectory_runner,
                 colocate_pg=colocate_pg,
+                models=models,
                 capture_artifact_path=_artifact_path(cfg),
                 capture_provenance=_provenance(cfg),
             )

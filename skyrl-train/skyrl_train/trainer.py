@@ -288,7 +288,7 @@ def _training_schedule(cfg, dataset_size: int) -> tuple[int, int]:
     return steps_per_epoch, total_steps
 
 
-def _kill_model_actors(models) -> None:
+def discard_model_actors(models) -> None:
     for model in models:
         if model is not None:
             try:
@@ -462,7 +462,7 @@ def build_models(
         logger.info("init policy/ref/critic models done")
         return policy_model, critic_model, ref_model
     except BaseException:
-        _kill_model_actors((policy_model, critic_model, ref_model))
+        discard_model_actors((policy_model, critic_model, ref_model))
         raise
 
 
@@ -807,7 +807,7 @@ class RayPPOTrainer:
         inference engine actors (vLLM / SGLang workers) that would otherwise
         keep running until the node dies.
         """
-        _kill_model_actors((self.policy_model, self.critic_model, self.ref_model))
+        discard_model_actors((self.policy_model, self.critic_model, self.ref_model))
 
         if getattr(self, "_draft_trainer", None) is not None:
             try:

@@ -646,7 +646,7 @@ class BasePPOExp:
 
     def _setup_trainer(self, tracker):
         """Build models and engines, then construct one trainer with complete workers."""
-        from skyrl_train.trainer import build_models  # noqa: PLC0415
+        from skyrl_train.trainer import build_models, discard_model_actors  # noqa: PLC0415
         from skyrl_train.utils.utils import Timer, configure_ray_worker_logging  # noqa: PLC0415
         from skyrl_train.teacher_runtime import prepare_distillation_runtime, start_distillation_runtime  # noqa: PLC0415
 
@@ -714,12 +714,7 @@ class BasePPOExp:
                 # A failed policy build can finish before the daemon creates its client.
                 future.add_done_callback(_discard_started_engines)
                 if models is not None:
-                    for model in models:
-                        if model is not None:
-                            try:
-                                model.kill_actors()
-                            except Exception as error:
-                                logger.warning("Error killing model actors: {}", error)
+                    discard_model_actors(models)
             if self.policy_pg is not None:
                 ray.util.remove_placement_group(self.policy_pg)
             raise
