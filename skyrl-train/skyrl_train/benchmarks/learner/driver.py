@@ -33,6 +33,7 @@ from ray.util.placement_group import placement_group
 from transformers import AutoConfig
 
 from skyrl_train.benchmarks.learner.batch_artifact import (
+    EnsembleBatchManifest,
     LengthProfile,
     list_ensemble,
     read_ensemble_batch,
@@ -157,6 +158,8 @@ class BenchmarkSpec:
             it separately, as the production trainer does.
         routes_checkpoint: Checkpoint id whose stored routes the learner replays, or ``None`` to route natively
             with router replay off.
+        memory_breakdown: After the last update, record each rank's parameter, gradient, FP32 master and
+            optimizer-state bytes by optimizer route (MuonH only).
     """
 
     run_name: str
@@ -180,6 +183,7 @@ class BenchmarkSpec:
     output_path: str
     wandb_project: str | None
     megatron_overrides: tuple[str, ...] = ()
+    memory_breakdown: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,6 +510,8 @@ class BenchmarkResult:
     rows_per_update: int
     updates: tuple[UpdateRecord, ...]
     summaries: tuple[ProfileSummary, ...]
+    # Per-rank ``learner_memory_breakdown`` replies, when the spec asks for them.
+    memory_breakdown: tuple[dict[str, Any], ...] = ()
 
 
 REFERENCE_SEQUENCE_TOKENS = 2048
@@ -637,6 +643,16 @@ def replay_routes(routes: RoutedExpertRows, model_num_layers: int, full_num_laye
     )
 
 
+def load_replay_batch(
+    path: str, routes_checkpoint: str | None, model_num_layers: int, full_num_layers: int
+) -> tuple[TrainingInputBatch, EnsembleBatchManifest]:
+    """Read a stored batch with its routes (if ``routes_checkpoint``) fitted to the benchmarked model's layers."""
+    batch, manifest = read_ensemble_batch(path, routes_checkpoint=routes_checkpoint)
+    if batch.routed_expert_rows is not None:
+        batch.routed_expert_rows = replay_routes(batch.routed_expert_rows, model_num_layers, full_num_layers)
+    return batch, manifest
+
+
 def _init_policy_group(cfg: DictConfig, layout: ParallelLayout) -> PPORayActorGroup:
     from skyrl_train.workers.megatron.megatron_worker import PolicyWorker  # optional megatron extra
 
@@ -693,11 +709,9 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
         records: list[UpdateRecord] = []
         hardware: Hardware | None = None
         for update in schedule:
-            batch, _ = read_ensemble_batch(update.entry.path, routes_checkpoint=spec.routes_checkpoint)
-            if batch.routed_expert_rows is not None:
-                batch.routed_expert_rows = replay_routes(
-                    batch.routed_expert_rows, model_config.num_hidden_layers, full_num_layers
-                )
+            batch, _ = load_replay_batch(
+                update.entry.path, spec.routes_checkpoint, model_config.num_hidden_layers, full_num_layers
+            )
             batch.metadata["global_step"] = update.index
             padded = pad_training_input(batch, multiple)
             scoring_seconds = _score_old_logprobs(policy, padded) if spec.score_old_logprobs else None
@@ -731,6 +745,11 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
                 f"{record.wall_seconds:.2f}s {record.tokens_per_second_per_gpu:.0f} tok/s/GPU MFU {record.mfu:.3f}"
             )
             records.append(record)
+        memory_breakdown = (
+            tuple(ray.get(policy.async_run_ray_method("pass_through", "learner_memory_breakdown")))
+            if spec.memory_breakdown
+            else ()
+        )
     finally:
         ray.shutdown()
     assert hardware is not None
@@ -744,6 +763,7 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
         rows_per_update=rows,
         updates=tuple(records),
         summaries=summarize(records),
+        memory_breakdown=memory_breakdown,
     )
 
 
@@ -784,6 +804,9 @@ def parse_spec(argv: Sequence[str] | None = None) -> BenchmarkSpec:
     parser.add_argument("--output", required=True, help="local or s3:// path of the JSON result")
     parser.add_argument("--wandb-project")
     parser.add_argument("--override", action="append", default=[], help="extra Hydra dotlist override")
+    parser.add_argument(
+        "--memory-breakdown", action="store_true", help="record per-rank memory by optimizer route (MuonH)"
+    )
     args = parser.parse_args(argv)
 
     optimizer: MuonHSettings | AdamWSettings
@@ -825,6 +848,7 @@ def parse_spec(argv: Sequence[str] | None = None) -> BenchmarkSpec:
         output_path=args.output,
         wandb_project=args.wandb_project,
         megatron_overrides=tuple(args.override),
+        memory_breakdown=args.memory_breakdown,
     )
 
 

@@ -25,4 +25,4 @@ fi
 
 exec "$py" cloud/iris/learner_bench/ray_gang.py --rendezvous-dir "$LB_OUTPUT/rendezvous" \
   --ray-log-dir "$LB_OUTPUT/ray-logs" --rendezvous-timeout 3600 --cluster-join-timeout 3600 \
-  --driver-liveness-timeout 3600 -- bash cloud/iris/learner_bench/smoke_driver.sh
+  --driver-liveness-timeout 3600 -- bash "cloud/iris/learner_bench/${LB_DRIVER_SCRIPT:-smoke_driver.sh}"

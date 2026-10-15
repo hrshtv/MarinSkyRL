@@ -864,6 +864,74 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     routes[names[id(parameter)]] = route
         return {"rank": torch.distributed.get_rank(), "routes": routes}
 
+    def learner_memory_breakdown(self):
+        """Return this rank's parallel coordinates and bytes held per Hero MuonH optimizer route.
+
+        For each route, counts the model parameters, their DDP gradient buffers (``main_grad``), the optimizer's
+        FP32 masters, and the optimizer state tensors split by device. Output-layer and embedding parameters are
+        also listed individually with the numel the optimizer holds for them, so whether their state is sharded
+        across data-parallel ranks can be read off directly. Call after at least one update: state is lazy.
+        """
+        if str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() != "muonh":
+            raise ValueError("Memory breakdown by optimizer route requires Hero MuonH")
+        names = {id(parameter): name for chunk in self.actor_module for name, parameter in chunk.named_parameters()}
+        optimizers = (
+            self.optimizer.chained_optimizers if isinstance(self.optimizer, ChainedOptimizer) else [self.optimizer]
+        )
+        routes = defaultdict(lambda: defaultdict(int))
+        listed = {}
+        for wrapped in optimizers:
+            default_route = "grug_muonh" if isinstance(wrapped.optimizer, MegatronGrugMuonH) else "adam"
+            for index, group in enumerate(wrapped.optimizer.param_groups):
+                route = group.get("optimizer", default_route)
+                pairs = [
+                    *zip(wrapped.float16_groups[index], wrapped.fp32_from_float16_groups[index], strict=True),
+                    *((parameter, parameter) for parameter in wrapped.fp32_from_fp32_groups[index]),
+                ]
+                for parameter, master in pairs:
+                    totals = routes[route]
+                    totals["tensors"] += 1
+                    totals["numel"] += parameter.numel()
+                    totals["param_bytes"] += parameter.numel() * parameter.element_size()
+                    main_grad = getattr(parameter, "main_grad", None)
+                    if main_grad is not None:
+                        totals["grad_bytes"] += main_grad.numel() * main_grad.element_size()
+                    if master is not parameter:
+                        totals["master_bytes"] += master.numel() * master.element_size()
+                    state = {
+                        key: value
+                        for key, value in wrapped.optimizer.state.get(master, {}).items()
+                        if torch.is_tensor(value)
+                    }
+                    for value in state.values():
+                        totals[f"state_{value.device.type}_bytes"] += value.numel() * value.element_size()
+                    name = names[id(parameter)]
+                    if "output_layer" in name or "embedding" in name:
+                        listed[name] = {
+                            "route": route,
+                            "param_numel": parameter.numel(),
+                            "master_numel": master.numel(),
+                            "state": {key: [value.numel(), value.device.type] for key, value in state.items()},
+                        }
+        device = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(device)
+        return {
+            "rank": torch.distributed.get_rank(),
+            "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
+            "dp_rank": mpu.get_data_parallel_rank(),
+            "dp_size": mpu.get_data_parallel_world_size(),
+            "ep_rank": mpu.get_expert_model_parallel_rank(),
+            "ep_size": mpu.get_expert_model_parallel_world_size(),
+            "expert_dp_size": mpu.get_expert_data_parallel_world_size(),
+            "routes": {route: dict(totals) for route, totals in routes.items()},
+            "listed_parameters": listed,
+            "cuda_allocated_bytes": torch.cuda.memory_allocated(device),
+            "cuda_reserved_bytes": torch.cuda.memory_reserved(device),
+            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "device_used_bytes": total - free,
+        }
+
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights in HF layout, gathered on rank 0.
 

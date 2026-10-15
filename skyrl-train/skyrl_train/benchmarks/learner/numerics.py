@@ -33,6 +33,7 @@ Calibration procedure:
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -40,10 +41,15 @@ import hashlib
 import itertools
 import json
 import math
+import sys
 
+from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 import ray
 import torch
+from transformers import AutoConfig
+
+from marinskyrl.model_manifest import MODEL_MANIFEST_FILENAME, ModelManifest
 
 from skyrl_train.distributed.dispatch import concatenate_outputs_after_mesh_dispatch
 from skyrl_train.distributed.megatron.parameter_fingerprint import (
@@ -51,8 +57,10 @@ from skyrl_train.distributed.megatron.parameter_fingerprint import (
     merge_parameter_statistics,
     mix32,
 )
+from skyrl_train.benchmarks.learner import driver
 from skyrl_train.io import io
-from skyrl_train.training_batch import TrainingInputBatch
+from skyrl_train.training_batch import TrainingInputBatch, pad_training_input
+from skyrl_train.utils.utils import initialize_ray
 
 SCHEMA_VERSION = 1
 
@@ -493,3 +501,137 @@ def record_numerics(policy, batch: TrainingInputBatch, provenance: NumericsProve
         batch["loss_mask"],
         merge_parameter_statistics(per_rank),
     )
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Command line: record a run with the learner driver's policy settings, calibrate, compare
+
+
+def batch_identity(manifest_sha256: str, batch: TrainingInputBatch) -> str:
+    """Hash a stored batch's tensor digest together with the replay routes it carries, if any."""
+    digest = hashlib.sha256(manifest_sha256.encode())
+    routes = batch.routed_expert_rows
+    if routes is not None:
+        digest.update(f"{routes.num_experts}:{routes.response_len}".encode())
+        for rows in routes.rows:
+            digest.update(str(rows.shape).encode())
+            digest.update(rows.tobytes())
+    return digest.hexdigest()
+
+
+def checkpoint_identity(model_path: str, num_layers: int) -> str:
+    manifest_path = f"{model_path.rstrip('/')}/{MODEL_MANIFEST_FILENAME}"
+    manifest = ModelManifest.from_mapping(json.loads(io.read_bytes(manifest_path)), manifest_path)
+    return f"{manifest.identity}/layers{num_layers}"
+
+
+def layout_name(spec: driver.BenchmarkSpec) -> str:
+    layout = spec.layout
+    return (
+        f"tp{layout.tensor_parallel}-pp{layout.pipeline_parallel}-ep{layout.expert_parallel}"
+        f"-cp{layout.context_parallel}-etp{layout.expert_tensor_parallel}-mbs{spec.micro_batch_size_per_gpu}"
+    )
+
+
+def _record_command(args: argparse.Namespace, driver_argv: Sequence[str]) -> None:
+    spec = driver.parse_spec(driver_argv)
+    entries = driver.ensemble_entries(spec)
+    entry = min(entries, key=lambda e: (e.profile, e.batch_index))
+    rows = driver.rows_per_update([entry], spec.layout, spec.micro_batch_size_per_gpu)
+    cfg = driver.build_policy_cfg(spec, rows, driver.compose_base_config())
+    model_config = AutoConfig.from_pretrained(spec.model_path)
+    full_layers = driver.source_num_layers(spec.model_path, model_config.num_hidden_layers)
+    batch, manifest = driver.load_replay_batch(
+        entry.path, spec.routes_checkpoint, model_config.num_hidden_layers, full_layers
+    )
+    provenance = NumericsProvenance(
+        checkpoint=checkpoint_identity(spec.model_path, model_config.num_hidden_layers),
+        batch_sha256=batch_identity(manifest.tensors_sha256, batch),
+        config_fingerprint=numerics_config_fingerprint(cfg),
+        num_updates=args.num_updates,
+        layout=layout_name(spec),
+        source_revision=spec.harness_revision,
+    )
+    if args.control is not None:
+        batch = perturbed_batch(batch, ControlPerturbation(args.control))
+    batch.metadata["global_step"] = 0
+    padded = pad_training_input(batch, spec.layout.data_parallel * spec.micro_batch_size_per_gpu)
+    initialize_ray(cfg)
+    try:
+        policy = driver._init_policy_group(cfg, spec.layout)
+        record = record_numerics(policy, padded, provenance)
+    finally:
+        ray.shutdown()
+    io.write_bytes_atomic(args.record_output, record_json(record).encode())
+    logger.info(f"numerics record ({provenance.layout}, control={args.control}) written to {args.record_output}")
+
+
+def _calibrate_command(args: argparse.Namespace) -> None:
+    runs = [parse_record(io.read_bytes(path).decode()) for path in args.records]
+    policy = CalibrationPolicy(multiplier=args.multiplier, floors=RECOMMENDED_CALIBRATION.floors)
+    write_reference(args.reference, calibrate_reference(runs, policy))
+    logger.info(f"numerics reference from {len(runs)} runs written to {args.reference}")
+
+
+def comparison_json(comparison: NumericsComparison) -> str:
+    """Every check with its deviation, tolerance and margin (tolerance / deviation), failures first."""
+    checks = sorted(comparison.checks, key=lambda check: (check.passed, check.name))
+    payload = {
+        "passed": comparison.passed,
+        "failures": [check.name for check in comparison.failures],
+        "checks": [
+            {
+                "name": check.name,
+                "deviation": check.deviation if math.isfinite(check.deviation) else None,
+                "tolerance": check.tolerance,
+                "margin": check.tolerance / check.deviation if 0 < check.deviation < math.inf else None,
+                "passed": check.passed,
+            }
+            for check in checks
+        ],
+    }
+    return json.dumps(payload, indent=1, allow_nan=False) + "\n"
+
+
+def _compare_command(args: argparse.Namespace) -> None:
+    reference = read_reference(args.reference)
+    comparison = compare_to_reference(reference, parse_record(io.read_bytes(args.record).decode()))
+    text = comparison_json(comparison)
+    if args.output is not None:
+        io.write_bytes_atomic(args.output, text.encode())
+    logger.info(f"numerics {'PASSED' if comparison.passed else 'FAILED'}: {len(comparison.failures)} failing signals")
+    if not comparison.passed:
+        sys.exit(1)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Record, calibrate and compare learner post-update numerics.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    record = commands.add_parser(
+        "record", help="record one run; arguments not listed here are the learner driver's (its first batch is used)"
+    )
+    record.add_argument("--record-output", required=True)
+    record.add_argument("--num-updates", type=int, required=True)
+    record.add_argument("--control", choices=[control.value for control in ControlPerturbation])
+    calibrate = commands.add_parser("calibrate", help="build a reference from two or more records")
+    calibrate.add_argument("--records", nargs="+", required=True)
+    calibrate.add_argument("--reference", required=True)
+    calibrate.add_argument("--multiplier", type=float, default=RECOMMENDED_CALIBRATION.multiplier)
+    compare = commands.add_parser("compare", help="compare a record with a reference; exits 1 on failure")
+    compare.add_argument("--reference", required=True)
+    compare.add_argument("--record", required=True)
+    compare.add_argument("--output", help="write every check as JSON")
+    args, rest = parser.parse_known_args(argv)
+    if args.command == "record":
+        _record_command(args, rest)
+        return
+    if rest:
+        parser.error(f"unrecognized arguments: {rest}")
+    if args.command == "calibrate":
+        _calibrate_command(args)
+    else:
+        _compare_command(args)
+
+
+if __name__ == "__main__":
+    main()

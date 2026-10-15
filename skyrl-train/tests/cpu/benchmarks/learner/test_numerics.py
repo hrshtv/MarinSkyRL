@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 from omegaconf import OmegaConf
 import pytest
 import torch
@@ -19,7 +20,9 @@ from skyrl_train.benchmarks.learner.numerics import (
     read_reference,
     write_reference,
 )
+from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.distributed.megatron.parameter_fingerprint import parameter_delta_statistics
+from skyrl_train.training_batch import TrainingInputBatch
 
 POLICY = CalibrationPolicy(
     multiplier=4.0,
@@ -180,3 +183,16 @@ def test_config_fingerprint_ignores_layout_but_not_optimizer():
     retuned = cfg.copy()
     retuned.trainer.policy.optimizer_config.lr = 2e-6
     assert numerics_config_fingerprint(retuned) != fingerprint
+
+
+def test_batch_identity_distinguishes_replay_routes_from_native_routing():
+    batch = TrainingInputBatch({"sequences": torch.zeros(1, 4, dtype=torch.long)})
+    native = numerics.batch_identity("digest", batch)
+    rows = np.zeros((3, 2, 8), dtype=np.int16)
+    batch.routed_expert_rows = RoutedExpertRows((rows,), 3, 384)
+    replay = numerics.batch_identity("digest", batch)
+    rows[0, 1, 0] = 5
+    rerouted = numerics.batch_identity("digest", batch)
+
+    assert len({native, replay, rerouted}) == 3
+    assert numerics.batch_identity("digest", batch) == rerouted
