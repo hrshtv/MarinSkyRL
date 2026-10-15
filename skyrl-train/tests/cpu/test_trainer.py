@@ -136,6 +136,7 @@ class _VersionedSync:
         self.sender = ExpertBlockSender(SimpleNamespace(_model_version_step=completed_step), None)
         self.sender.stream = self
         self.installed_versions = []
+        self.verification_error = None
 
     def run(self, version):
         self.installed_versions.append(version)
@@ -145,14 +146,21 @@ class _VersionedSync:
         self.sender.send_weights({"version": version})
         return SyncTimings(0.0, 0.0, 0.0, 0.0, 0.0)
 
+    async def verify(self, version):
+        if self.verification_error is not None:
+            raise self.verification_error
+        return {}
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completed_step", [0, 1, 7])
-@pytest.mark.parametrize("colocated", [False, True])
-async def test_empty_ftpo_batch_sync_keeps_last_completed_model_version(completed_step, colocated):
+@pytest.mark.parametrize("colocated, dummy", [(False, False), (True, False), (False, True)])
+async def test_empty_ftpo_batch_sync_keeps_last_completed_model_version(completed_step, colocated, dummy):
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.cfg = get_default_config()
     trainer.cfg.generator.expert_block_sync.verify = False
+    if dummy:
+        OmegaConf.update(trainer.cfg, "generator.engine_init_kwargs.load_format", "dummy", force_add=True)
     trainer.colocate_all = colocated
     trainer.policy_model = _EmptyBatchPolicyGroup()
     trainer.inference_engine_client = _ResidencyInferenceClient()
@@ -163,7 +171,16 @@ async def test_empty_ftpo_batch_sync_keeps_last_completed_model_version(complete
     trainer.all_timings = {}
     trainer.all_startup_timings = {}
     trainer.all_metrics = {}
+    if dummy:
+        transport.verification_error = RuntimeError("Incomplete dummy engine weight coverage")
+        with pytest.raises(RuntimeError, match="Incomplete dummy engine weight coverage"):
+            await trainer._sync_policy_for_rollouts(reason="initial")
+        assert trainer.inference_engine_client.generation_paused_event.is_set()
+        transport.verification_error = None
     await trainer._sync_policy_for_rollouts(reason="initial")
+    if dummy:
+        # Later syncs use the transport's normal verification setting.
+        transport.verification_error = RuntimeError("initial verification repeated")
     for step in (completed_step + 1, completed_step + 2):
         trainer.global_step = step
         status = await trainer._run_training(
@@ -172,7 +189,7 @@ async def test_empty_ftpo_batch_sync_keeps_last_completed_model_version(complete
         assert status["policy_update_steps"] == 0
         await trainer._sync_policy_for_rollouts(reason="training_step")
         await trainer._sync_policy_for_rollouts(reason="evaluation")
-    assert transport.installed_versions == [completed_step] * 5
+    assert transport.installed_versions == [completed_step] * (6 if dummy else 5)
     assert trainer.inference_engine_client.awake
 
 
