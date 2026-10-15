@@ -4,6 +4,8 @@ uv run --isolated --group dev --extra cpu pytest tests/cpu/test_eval.py
 
 from unittest.mock import MagicMock
 
+from torchdata.stateful_dataloader import StatefulDataLoader
+
 import pytest
 from omegaconf import OmegaConf
 
@@ -36,6 +38,7 @@ def configure_eval(cfg, tmp_path):
     )
     cfg.generator.eval_n_samples_per_prompt = 1
     cfg.environment = OmegaConf.create({"env_class": "gsm8k"})
+    cfg.trainer.pivot_pilot = None
     cfg.trainer.dump_eval_results = False
     cfg.trainer.export_path = str(tmp_path)
     return cfg
@@ -147,3 +150,45 @@ async def test_evaluate_closes_progress_reporter_when_rollout_fails(dummy_config
         )
 
     progress.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validation_rows", [256, 508])
+async def test_pivot_evaluation_covers_the_configured_holdout(dummy_config, tmp_path, validation_rows):
+    cfg = configure_eval(dummy_config, tmp_path)
+    cfg.trainer.pivot_pilot = OmegaConf.create(
+        {
+            "arm": "rl_nemo",
+            "baseline_cache": None,
+            "split_hash": "validation",
+            "quick_hash": "quick",
+            "quick_source_ids": [str(i) for i in range(64)],
+        }
+    )
+    cfg.trainer.policy.model.path = "test-model"
+    cfg.generator.trajectory_retention.model_source_identity = "test-revision"
+    prompts = [
+        {
+            "prompt": [{"role": "user", "content": "question"}],
+            "env_class": None,
+            "env_extras": {"data_source": "swe", "extra_info": {"source_id": str(i)}},
+            "uid": str(i),
+        }
+        for i in range(validation_rows)
+    ]
+    loader = StatefulDataLoader(prompts, batch_size=validation_rows, collate_fn=list)
+    runner = DummyRunner(
+        {
+            "prompt_token_ids": [[101]] * validation_rows,
+            "response_ids": [[201]] * validation_rows,
+            "rewards": [float(i % 2) for i in range(validation_rows)],
+            "loss_masks": [[1]] * validation_rows,
+            "stop_reasons": ["stop"] * validation_rows,
+            "rollout_logprobs": None,
+        }
+    )
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "decoded"
+    metrics = await evaluate(loader, runner, cfg, 0, tokenizer)
+    assert metrics["eval/all/avg_score"] == 0.5
+    assert sum(len(batch["prompts"]) for batch in runner.seen_inputs) == validation_rows

@@ -287,13 +287,13 @@ async def evaluate(
         )
         if pilot is not None:
             kind = "quick" if evaluation_kind(pilot.arm, global_step or 0) == "quick" else "full"
-            expected_count = 64 if kind == "quick" else 256
+            expected_count = len(pilot.quick_source_ids) if kind == "quick" else len(eval_dataloader.dataset)
             source_ids = [extra["extra_info"]["source_id"] for extra in rollouts.env_extras]
             if len(source_ids) != expected_count or len(set(source_ids)) != expected_count:
                 raise ValueError("Pilot evaluation has missing or duplicate source rows")
             eval_metrics.update(diagnostic_metrics(concatenated_batch, prefix=f"eval/{kind}"))
             quick = [index for index, sid in enumerate(source_ids) if sid in set(pilot.quick_source_ids)]
-            if len(quick) != 64:
+            if len(quick) != len(pilot.quick_source_ids):
                 raise ValueError("Pilot evaluation is missing quick-subset rows")
             eval_metrics.update(diagnostic_metrics(concatenated_batch, prefix="eval/quick", indices=quick))
         _dump_eval_results(cfg, global_step, tokenizer, rollouts, concat_data_sources, eval_metrics)
