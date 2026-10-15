@@ -25,7 +25,7 @@ from collections import defaultdict, deque
 import numpy as np
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
-from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
+from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch, pad_training_input
 from skyrl_train.rollouts.buffer import RolloutGroup
 from skyrl_train.rollouts.context import TrainingContext, TrainingContextState
 from skyrl_train.trajectory_selection import trajectory_selector_from_config
@@ -33,7 +33,6 @@ from skyrl_train.trajectory_runners.base import (
     TrajectoryBatch,
     TrajectoryRunner,
 )
-import copy
 from skyrl_train.batch_sampling import RowOwnership, filter_trajectory_batch
 from skyrl_train.trajectory_runners.trajectory_processing import (
     concatenate_trajectory_batches,
@@ -2654,44 +2653,7 @@ class RayPPOTrainer:
             dp_size = math.lcm(dp_size, self.critic_model.actor_infos[0].rank.dp_size)
         if self.ref_model is not None:
             dp_size = math.lcm(dp_size, self.ref_model.actor_infos[0].rank.dp_size)
-
-        pad_size = math.ceil(training_input.batch_size / dp_size) * dp_size - training_input.batch_size
-        new_tensors = {}
-        training_input.metadata["pad_size"] = pad_size
-        if pad_size == 0:
-            return training_input
-        for key, tensor in training_input.items():
-            if tensor is not None:
-                additional_dims = tuple(tensor.shape[1:]) if len(tensor.shape) > 1 else ()
-
-                if key == "is_last_step":
-                    padding_tensor = torch.ones(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
-                elif key == "loss_mask":
-                    # ensures that padding tensors don't count towards the loss
-                    padding_tensor = torch.zeros(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
-                else:
-                    # ensures all padding tensors are in a valid format by cloning `pad_size` from the original input
-                    # `pad_size` is guaranteed to be smaller than batch_size
-                    padding_tensor = tensor[:pad_size].clone()
-                new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
-
-        routes = training_input.routed_expert_rows
-        padded_routes = RoutedExpertRows.cat([routes, routes[:pad_size]]) if routes is not None else None
-        new_training_input = TrainingInputBatch(new_tensors, routed_expert_rows=padded_routes)
-        new_training_input.metadata = {}
-        new_training_input.metadata["uids"] = training_input.metadata["uids"] + [f"pad{i}" for i in range(pad_size)]
-        if "trajectory_ids" in training_input.metadata:
-            new_training_input.metadata["trajectory_ids"] = training_input.metadata["trajectory_ids"] + [
-                f"pad{i}" for i in range(pad_size)
-            ]
-        for key, value in training_input.metadata.items():
-            if key not in ["uids", "trajectory_ids"]:
-                # Extend numpy bool arrays so they stay aligned with the padded batch
-                if key == "exclude_from_baseline" and isinstance(value, np.ndarray):
-                    new_training_input.metadata[key] = np.concatenate([value, np.ones(pad_size, dtype=value.dtype)])
-                else:
-                    new_training_input.metadata[key] = copy.deepcopy(value)
-        return new_training_input
+        return pad_training_input(training_input, dp_size)
 
     @torch.no_grad()
     def fwd_logprobs_values_reward(

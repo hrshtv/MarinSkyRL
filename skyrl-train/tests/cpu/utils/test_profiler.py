@@ -1,16 +1,18 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from skyrl_train.utils.profiler import Profiler
 
 
-def test_profiler_saves_only_first_forward_after_one_warm_update(tmp_path, monkeypatch):
+@pytest.mark.parametrize("captured_update", [1, 2])
+def test_profiler_saves_only_first_forward_of_the_configured_update(tmp_path, monkeypatch, captured_update):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    profiler = Profiler(SimpleNamespace(ranks=[0], save_path=str(tmp_path)))
+    profiler = Profiler(SimpleNamespace(ranks=[0], save_path=str(tmp_path), update_index=captured_update))
 
-    for update_index in range(2):
+    for update_index in range(captured_update + 1):
         profiler.begin_update()
         for mini_batch_index in range(2):
             selected = profiler.for_mini_batch(mini_batch_index)
@@ -23,8 +25,8 @@ def test_profiler_saves_only_first_forward_after_one_warm_update(tmp_path, monke
         profiler.save()
 
     table = (tmp_path / "prof_rank_0.txt").read_text()
-    assert "update_1_mini_0_micro_0" in table
-    assert "update_0_mini_0_micro_0" not in table
-    assert "update_1_mini_0_micro_1" not in table
-    assert "update_1_mini_1_micro_0" not in table
+    assert f"update_{captured_update}_mini_0_micro_0" in table
+    assert f"update_{captured_update - 1}_mini_0_micro_0" not in table
+    assert f"update_{captured_update}_mini_0_micro_1" not in table
+    assert f"update_{captured_update}_mini_1_micro_0" not in table
     assert list(tmp_path.iterdir()) == [tmp_path / "prof_rank_0.txt"]

@@ -5,7 +5,7 @@ import torch
 from omegaconf import OmegaConf
 
 from skyrl_train.learner_memory import LearnerCudaMetrics
-from skyrl_train.timing_observability import PhaseBreakdown
+from skyrl_train.timing_observability import PPO_TRAIN_PHASE_SECONDS_KEY, PhaseBreakdown
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.workers.worker import PolicyWorkerBase
 
@@ -297,7 +297,9 @@ def test_a_policy_update_publishes_its_megatron_phases_and_memory(
             fake_cuda.use_memory(600, 700)
             _megatron_mini_batch_metrics(rollout_lp=None, monkeypatch=monkeypatch, timings=timing)
             fake_cuda.use_memory(150, 200)
-            return TrainingOutputBatch()
+            output = TrainingOutputBatch()
+            output.metadata = {"train_status": {}}
+            return output
 
         async def _broadcast_to_inference_engines(self, inference_engine_client):
             fake_cuda.use_memory(400, 500)
@@ -308,7 +310,7 @@ def test_a_policy_update_publishes_its_megatron_phases_and_memory(
     batch = TrainingInputBatch({"sequences": torch.zeros(1, 1)})
     batch.metadata = {"global_step": 7}
 
-    worker.ppo_train(batch)
+    output = worker.ppo_train(batch)
     asyncio.run(worker.broadcast_to_inference_engines(None))
 
     phases = {
@@ -321,6 +323,9 @@ def test_a_policy_update_publishes_its_megatron_phases_and_memory(
         "megatron_pipeline_metric_broadcast": "ppo_train",
         "ppo_train_residual": "ppo_train",
     }
+    returned = output.metadata[PPO_TRAIN_PHASE_SECONDS_KEY]
+    assert set(returned) == {"ppo_train", "megatron_forward_backward_scheduler", "megatron_pipeline_metric_broadcast"}
+    assert returned["ppo_train"] >= returned["megatron_forward_backward_scheduler"]
     exits = delivered_telemetry.select("cuda_memory_observation", boundary="exit", step="7")
     assert {row["attributes"]["phase"]: row["body"]["peak_allocated_bytes"] for row in exits} == {
         "ppo_train": 600,

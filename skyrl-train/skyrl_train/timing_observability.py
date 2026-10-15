@@ -44,6 +44,10 @@ TIMING_PARENTS: dict[str, str | None] = {
 }
 
 
+# Policy-worker ``ppo_train`` output metadata key: this rank's PhaseBreakdown durations plus the root wall.
+PPO_TRAIN_PHASE_SECONDS_KEY = "ppo_train_phase_seconds"
+
+
 @dataclass(frozen=True)
 class PhaseTiming:
     name: str

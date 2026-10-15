@@ -44,7 +44,7 @@ from skyrl_train.utils.importance_ratio_diagnostics import (
     LogRatioMonitor,
 )
 from skyrl_train.learner_memory import LearnerCudaMetrics
-from skyrl_train.timing_observability import PhaseBreakdown
+from skyrl_train.timing_observability import PPO_TRAIN_PHASE_SECONDS_KEY, PhaseBreakdown
 from skyrl_train.telemetry import WORKER_ROLE, ProcessTelemetry, TelemetryConfig
 from skyrl_train.config.objective_spec import topk_loss_params
 from skyrl_train.objective.objective import TopKTeacherBatch, build_objective_micro_batch, compute_policy_objective
@@ -367,6 +367,19 @@ class Worker(DistributedTorchRayActor):
             "reserved": torch.cuda.memory_reserved(),
             "free": free,
             "total": total,
+        }
+
+    def get_cuda_memory_peaks(self) -> Dict[str, Any]:
+        """Return the device name and allocator peaks since the last peak reset.
+
+        With ``trainer.policy_train_spans`` the policy worker resets the peaks when ``ppo_train`` starts.
+        """
+        device = torch.cuda.current_device()
+        return {
+            "device_name": torch.cuda.get_device_name(device),
+            "peak_allocated": torch.cuda.max_memory_allocated(device),
+            "peak_reserved": torch.cuda.max_memory_reserved(device),
+            "total": torch.cuda.mem_get_info(device)[1],
         }
 
     def save_memory_snapshot(self, global_step=None, local_step=None):
@@ -935,7 +948,7 @@ class PolicyWorkerBase(Worker):
                 output = self._ppo_train_impl(train_data, timing)
                 outcome = "success"
             finally:
-                timing.publish(
+                total_seconds = timing.publish(
                     clock_domain="cpu_dispatch_wall",
                     attributes={
                         "backend": "megatron",
@@ -945,6 +958,8 @@ class PolicyWorkerBase(Worker):
                         "step": str(step),
                     },
                 )
+        if self._policy_train_spans:
+            output.metadata[PPO_TRAIN_PHASE_SECONDS_KEY] = {**timing.durations(), "ppo_train": total_seconds}
         self._model_version_step = step
         return output
 

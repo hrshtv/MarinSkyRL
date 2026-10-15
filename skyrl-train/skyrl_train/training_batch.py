@@ -1,5 +1,6 @@
 """Training batch containers and iteration."""
 
+import copy
 import io
 import math
 import pickle
@@ -481,6 +482,54 @@ class TrainingInputBatch(TensorBatch[TrainingInput]):
             and len(left.rows) == len(right.rows)
             and all(a.dtype == b.dtype and np.array_equal(a, b) for a, b in zip(left.rows, right.rows, strict=True))
         )
+
+
+def pad_training_input(training_input: TrainingInputBatch, multiple: int) -> TrainingInputBatch:
+    """Pad rows by cloning leading rows until the batch size is a multiple of ``multiple``.
+
+    Padded rows carry a zero ``loss_mask`` and ``pad{i}`` uids, so they cost compute but no loss. Fields whose
+    value is ``None`` stay present as ``None``. Sets ``metadata["pad_size"]`` on the input and the result.
+    """
+    if multiple < 1:
+        raise ValueError(f"padding multiple must be positive, got {multiple}")
+    pad_size = math.ceil(training_input.batch_size / multiple) * multiple - training_input.batch_size
+    training_input.metadata["pad_size"] = pad_size
+    if pad_size == 0:
+        return training_input
+    if pad_size > training_input.batch_size:
+        raise ValueError(f"cannot pad {training_input.batch_size} rows by {pad_size} cloned rows")
+    new_tensors: dict[str, torch.Tensor | None] = {}
+    for key, tensor in training_input.items():
+        if tensor is None:
+            new_tensors[key] = None
+            continue
+        additional_dims = tuple(tensor.shape[1:]) if len(tensor.shape) > 1 else ()
+        if key == "is_last_step":
+            padding_tensor = torch.ones(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
+        elif key == "loss_mask":
+            # ensures that padding tensors don't count towards the loss
+            padding_tensor = torch.zeros(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
+        else:
+            # ensures all padding tensors are in a valid format by cloning `pad_size` rows from the original input
+            padding_tensor = tensor[:pad_size].clone()
+        new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
+
+    routes = training_input.routed_expert_rows
+    padded_routes = RoutedExpertRows.cat([routes, routes[:pad_size]]) if routes is not None else None
+    padded = TrainingInputBatch(new_tensors, routed_expert_rows=padded_routes)
+    padded.metadata = {}
+    for key in ("uids", "trajectory_ids"):
+        if key in training_input.metadata:
+            padded.metadata[key] = training_input.metadata[key] + [f"pad{i}" for i in range(pad_size)]
+    for key, value in training_input.metadata.items():
+        if key in ("uids", "trajectory_ids"):
+            continue
+        # Extend numpy bool arrays so they stay aligned with the padded batch
+        if key == "exclude_from_baseline" and isinstance(value, np.ndarray):
+            padded.metadata[key] = np.concatenate([value, np.ones(pad_size, dtype=value.dtype)])
+        else:
+            padded.metadata[key] = copy.deepcopy(value)
+    return padded
 
 
 class TrainingBatchIterator(Iterator[Experience]):
