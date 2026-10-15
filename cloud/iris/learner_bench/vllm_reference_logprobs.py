@@ -69,7 +69,9 @@ async def run(args: argparse.Namespace) -> None:
         enable_prefix_caching=False,
         enforce_eager=True,
         engine_init_timeout_seconds=1800,
-        engine_init_kwargs={},
+        # Hero serving settings from the Hero RL launcher: FlashInfer autotune's dummy runs fail on Grug short
+        # convolutions, and the Triton MoE backend is the qualified one.
+        engine_init_kwargs={"enable_flashinfer_autotune": False, "kernel_config": {"moe_backend": "triton"}},
     )
     engines = create_route_engines(config)
     try:
