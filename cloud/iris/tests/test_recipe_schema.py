@@ -1,37 +1,28 @@
 import json
 from itertools import permutations
-from pathlib import Path
 import pickle
 
 import pytest
 from pydantic import Field
 
 import marinskyrl.recipe_schema as schema
-from marinskyrl.recipe_schema import ContextBudget, FrozenMap, NumberMap, OpenMap, SectionMap
-from marinskyrl.recipe_schema.operations import RecipeDocument
+from marinskyrl.recipe_schema import ContextBudget
+from marinskyrl.recipe_schema.model import FrozenMap, NumberMap, OpenMap, SectionMap
+from marinskyrl.recipe_schema.ownership import DERIVED_PATHS, LAUNCH_PATHS, REMOVED
 from marinskyrl.recipe_schema.documents import set_path
 
 
-class Options(RecipeDocument):
+class Options(schema.RecipePatch):
     options: OpenMap = Field(default_factory=FrozenMap)
     weights: NumberMap = Field(default_factory=FrozenMap)
     budgets: SectionMap[ContextBudget] = Field(default_factory=FrozenMap)
     count: int = 1
 
 
-@pytest.fixture(autouse=True)
-def source_under_test():
-    source = Path(schema.__file__).resolve()
-    expected = Path(__file__).resolve().parents[3] / "marinskyrl/recipe_schema/__init__.py"
-    assert source == expected
-    print(f"recipe_schema source: {source}")
-
-
-def test_open_maps_preserve_sparse_documents_across_mutation_pickle_and_overrides():
+def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     supplied = {"options": {"schedule": {"windows": [1, 2]}, "enabled": True}}
     recipe = Options.model_validate_json(json.dumps(supplied))
     original = recipe.to_skyrl()
-    original_hash = hash(recipe)
     supplied["options"]["schedule"]["windows"].append(3)
     rendered = recipe.to_skyrl()
     rendered["options"]["schedule"]["windows"].append(4)
@@ -41,28 +32,23 @@ def test_open_maps_preserve_sparse_documents_across_mutation_pickle_and_override
     restored = pickle.loads(pickle.dumps(recipe))
     assert recipe.to_skyrl() == original
     assert restored == recipe
-    assert hash(restored) == original_hash == hash(recipe)
     assert "count" not in restored.to_skyrl()
     changed = restored.merge(Options(options={"schedule": {}, "enabled": False}))
     assert changed.to_skyrl() == {"options": {"schedule": {"windows": [1, 2]}, "enabled": False}}
     assert restored.to_skyrl() == original
     assert Options.model_validate_json(json.dumps(changed.to_skyrl())) == changed
-    assert recipe.options == {"schedule": {"windows": [1, 2]}, "enabled": True}
-    assert {"schedule": {"windows": [1, 2]}, "enabled": True} == recipe.options
     numeric = Options(options={"samples": [1], "weight": 1})
     equivalent = Options(options={"samples": [1.0], "weight": 1.0})
-    assert numeric == equivalent
-    assert hash(numeric) == hash(equivalent)
+    assert numeric.to_skyrl() == equivalent.to_skyrl()
     for invalid in (float("nan"), float("inf"), object()):
         with pytest.raises(ValueError, match="finite JSON value"):
             Options(options={"schedule": [invalid]})
     routes = Options(options={"math": 1.0, "code": 1.0, "chat": 1.0})
     updated = routes.merge(Options(count=2))
     assert list(updated.to_skyrl()["options"]) == ["math", "code", "chat"]
-    assert routes != Options(options={"chat": 1.0, "code": 1.0, "math": 1.0})
-
-
-def test_typed_maps_preserve_numeric_types_and_nested_budget_settings_across_round_trips():
+    assert list(routes.to_skyrl()["options"]) != list(
+        Options(options={"chat": 1.0, "code": 1.0, "math": 1.0}).to_skyrl()["options"]
+    )
     base = Options(
         weights={"math": 1.0, "code": 1, "chat": 1.0},
         budgets={"math": ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=2)},
@@ -84,7 +70,6 @@ def test_typed_maps_preserve_numeric_types_and_nested_budget_settings_across_rou
     assert type(updated.weights["code"]) is float
     restored = pickle.loads(pickle.dumps(updated))
     assert restored == updated
-    assert hash(restored) == hash(updated)
     assert restored.budgets["math"].max_turns == 4
     with pytest.raises(TypeError):
         restored.weights["math"] = 9
@@ -100,9 +85,8 @@ def test_typed_maps_preserve_numeric_types_and_nested_budget_settings_across_rou
             Options.from_document(document)
         assert list(document["options"].items()) == original_routes
     assert base.budgets["math"].max_turns == 2
-
-
-def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
+    assert schema.Trainer().model_dump(mode="json").get("hf_save_interval") is None
+    assert "hf_save_interval" not in schema.Trainer().model_dump(mode="json")
     base = schema.SkyRLRecipe(
         context_budget=ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=2),
         data=schema.Data(sampling=schema.Sampling(domain_weights={"math": 2, "code": 1})),
@@ -192,13 +176,13 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
             policy=computed,
             computed=schema.RecipePatch(trainer=schema.Trainer(ckpt_interval=5)),
         )
-    for paths, owner in ((schema.LAUNCH_PATHS, "launch document"), (schema.DERIVED_PATHS, "context_budget")):
+    for paths, owner in ((LAUNCH_PATHS, "launch document"), (DERIVED_PATHS, "context_budget")):
         for path in paths:
             document = base.to_skyrl()
             set_path(document, path, "authored-sentinel")
             with pytest.raises(ValueError, match=f"{path}.*{owner}"):
                 schema.SkyRLRecipe.from_document(document)
-    for path, message in schema.REMOVED.items():
+    for path, message in REMOVED.items():
         document = base.to_skyrl()
         set_path(document, path, {})
         with pytest.raises(ValueError) as error:

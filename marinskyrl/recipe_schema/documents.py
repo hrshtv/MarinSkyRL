@@ -3,7 +3,7 @@
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from .model import document_key, merge_mappings
+from .model import Section, thaw
 
 MISSING = object()
 
@@ -69,3 +69,32 @@ def _without_empty_mappings(document: Mapping[str, Any]) -> dict[str, Any]:
         else:
             contribution[key] = value
     return contribution
+
+
+def merge_mappings(base: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge mappings recursively; lists replace and an empty mapping changes nothing."""
+    merged = thaw(base)
+    for key, value in patch.items():
+        if isinstance(value, Mapping):
+            if not value:
+                continue
+            current = merged.get(key)
+            merged[key] = merge_mappings(current if isinstance(current, Mapping) else {}, value)
+        else:
+            merged[key] = thaw(value)
+    return merged
+
+
+def document_key(value: Any) -> tuple:
+    """Compare JSON values with numeric equality and ordered mapping keys."""
+    if isinstance(value, Mapping):
+        return "mapping", tuple((key, document_key(item)) for key, item in value.items())
+    if isinstance(value, tuple | list):
+        return "list", tuple(document_key(item) for item in value)
+    if isinstance(value, Section):
+        return document_key(value.to_skyrl())
+    if isinstance(value, bool):
+        return "bool", value
+    if isinstance(value, int | float):
+        return "number", value
+    return type(value).__name__, value

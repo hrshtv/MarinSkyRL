@@ -61,10 +61,15 @@ uv run python scripts/generate_recipe_schema.py --check
 ```
 
 Commit the generated sections and public exports with the source edit. Put finite choices, null-default
-structures and other constraints that YAML cannot express in `marinskyrl/recipe_schema/sidecar.py`.
+structures and other constraints that YAML cannot express in `scripts/recipe_schema_sidecar.py`.
 `TYPES`, `OPEN` and `NAMES` paths must exist in YAML. `UNDECLARED` entries represent code-default fields
 and cannot shadow YAML keys. Ellipsis keeps those fields unset in an authored document.
 
 Add a migration row to `REMOVED` in `ownership.py` when an authored key changes. Document validation
 reports that row before an unknown-key error. `terminal_bench.harbor.max_episodes` reports
 "use context_budget.max_turns; Harbor reads max_turns".
+
+Marin imports `marinskyrl.recipe_schema` from the standalone `packages/marinskyrl-recipe` wheel.
+Its only runtime dependency is `pydantic>=2.12.2,<3`. The Marin workspace uses a Git subdirectory
+requirement at the same commit as its isolated launcher environment. Build this project with
+`uv build --wheel packages/marinskyrl-recipe`; the wheel uses the shared schema source directly.

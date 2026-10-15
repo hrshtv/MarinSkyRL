@@ -1,22 +1,17 @@
-import json
 import copy
+import json
 from pathlib import Path
-import subprocess
-import sys
-import tomllib
-from typing import Any, Literal, get_args, get_origin
 
-from pydantic import ValidationError
 import pytest
+from pydantic import ValidationError
 
 import marinskyrl.recipe_schema as schema
-from marinskyrl.recipe_schema.model import thaw
-from marinskyrl.recipe_schema.sidecar import ANY_ALLOWED
+from marinskyrl.recipe_schema.model import Section, thaw
+from marinskyrl.recipe_schema.ownership import DERIVED_PATHS, LAUNCH_PATHS
 from scripts import generate_recipe_schema as generator
 
-
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = ROOT / "scripts/generate_recipe_schema.py"
+
 OUTPUT_PATH_RECIPES = frozenset(
     {
         "128GPU_80B_A3B_next_cp1",
@@ -98,7 +93,7 @@ generator:
     temperature: 1
 """
 SIDECAR = """TYPES = {
-    'trainer.callbacks': 'tuple[CounterCallback, ...] | None',
+    'trainer.callbacks': 'tuple[CheckpointCallback, ...] | None',
     'data.sampling.domain_weights': 'NumberMap',
     'trainer.strategy': 'Literal["megatron"]',
     'trainer.max_steps': 'NonNegativeInt',
@@ -113,9 +108,9 @@ UNDECLARED = {
     'generator.adapter.parameters': ('Parameters | None', None),
     'generator.adapter.parameters.count': ('int', ...),
 }
-NAMES = {}
+NAMES = {"trainer.policy.model": "PolicyModel", "trainer.critic.model": "CriticModel", "trainer.policy.model.lora": "PolicyLora", "trainer.critic.model.lora": "CriticLora"}
 CLASSES = {
-    'CounterCallback': {
+    'CheckpointCallback': {
         'type': ('Literal["counter"]', True),
         'count': ('int', False),
     },
@@ -124,10 +119,26 @@ ALIASES = {}
 """
 
 
+def _author_document(document):
+    authored = {}
+
+    def visit(mapping, target, prefix=""):
+        for key, value in mapping.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if path in DERIVED_PATHS | LAUNCH_PATHS or generator.following_source(value):
+                continue
+            if isinstance(value, dict):
+                target[key] = {}
+                visit(value, target[key], path)
+            else:
+                target[key] = value
+
+    visit(document, authored)
+    return authored
+
+
 def test_repository_generation_matches_hydra_author_defaults_and_all_group_options():
     assert Path(schema.__file__).resolve() == ROOT / "marinskyrl/recipe_schema/__init__.py"
-    assert Path(generator.__file__).resolve() == SCRIPT
-    print(f"generation sources: {schema.__file__}; {generator.__file__}")
     for name, generated in generator.generate().items():
         assert (ROOT / "marinskyrl/recipe_schema" / name).read_text() == generated, f"regenerate {name}"
     sources = generator.source_documents(generator.CONFIG_DIR)
@@ -136,166 +147,66 @@ def test_repository_generation_matches_hydra_author_defaults_and_all_group_optio
     def compare(mapping, actual, prefix=""):
         for key, expected in mapping.items():
             path = f"{prefix}.{key}" if prefix else key
-            if path in schema.DERIVED_PATHS | schema.LAUNCH_PATHS or generator.following_source(expected):
+            if path in DERIVED_PATHS | LAUNCH_PATHS or generator.following_source(expected):
                 continue
             value = getattr(actual, key)
-            if isinstance(expected, dict) and isinstance(value, schema.Section):
+            if isinstance(expected, dict) and isinstance(value, Section):
                 compare(expected, value, path)
             else:
                 assert thaw(value) == expected, path
 
     compare(sources.base, defaults)
-    observed_files = set()
+    observed = set()
     for group, options in sources.groups.items():
         for name, option in options.items():
-            observed_files.add((group.partition("@")[0], name))
-            document = copy.deepcopy(option)
-            for path in schema.DERIVED_PATHS | schema.LAUNCH_PATHS:
-                parent = document
-                for key in path.split(".")[:-1]:
-                    parent = parent.get(key, {})
-                parent.pop(path.rsplit(".", 1)[-1], None)
+            observed.add((group.partition("@")[0], name))
+            document = _author_document(option)
             assert schema.RecipePatch.from_document(document).to_skyrl() == document, (group, name)
-    assert observed_files == {(path.parent.name, path.stem) for path in generator.CONFIG_DIR.glob("*/*.yaml")}
-    recipe_paths = sorted((ROOT / "cloud/iris/configs").glob("*.yaml"))
+    assert observed == {(path.parent.name, path.stem) for path in generator.CONFIG_DIR.glob("*/*.yaml")}
+    paths = sorted((ROOT / "cloud/iris/configs").glob("*.yaml"))
     recipes = generator.recipe_documents(ROOT / "cloud/iris/configs", generator.CONFIG_DIR, sources.groups)
-    normalized = set()
-    for source, document in zip(recipe_paths, recipes, strict=True):
-        for path, names in BUNDLED_NORMALIZATION.items():
-            if source.stem not in names:
-                continue
-            parent = document
-            for key in path.split(".")[:-1]:
-                parent = parent[key]
-            del parent[path.rsplit(".", 1)[-1]]
-            normalized.add((source.stem, path))
-        assert schema.SkyRLRecipe.from_document(document).to_skyrl() == document, source.name
-    assert normalized == {(name, path) for path, names in BUNDLED_NORMALIZATION.items() for name in names}
-    any_paths = set()
-
-    def inspect(annotation, path):
-        if annotation is Any:
-            any_paths.add(path)
-        elif isinstance(annotation, type) and issubclass(annotation, schema.Section):
-            for name, field in annotation.model_fields.items():
-                inspect(field.annotation, f"{path}.{name}" if path else name)
-        elif get_origin(annotation) is not Literal:
-            for child in get_args(annotation):
-                inspect(child, path)
-
-    inspect(schema.SkyRLRecipe, "")
-    assert any_paths == ANY_ALLOWED == frozenset()
+    for path, document in zip(paths, recipes, strict=True):
+        for key, names in BUNDLED_NORMALIZATION.items():
+            if path.stem in names:
+                parent = document
+                for part in key.split(".")[:-1]:
+                    parent = parent.get(part, {})
+                parent.pop(key.rsplit(".", 1)[-1], None)
+        assert schema.SkyRLRecipe.from_document(document).to_skyrl() == document, path.name
 
 
-def test_generator_cli_preserves_group_types_and_adjacent_comments_and_detects_drift(tmp_path: Path):
-    source = Path(schema.__file__).resolve()
-    assert source == ROOT / "marinskyrl/recipe_schema/__init__.py"
-    print(f"recipe_schema source: {source}")
+def test_generator_preserves_observed_types_comments_following_nulls_and_sidecar_drift(tmp_path):
     configs = tmp_path / "config"
-    output = tmp_path / "generated"
-    recipes = tmp_path / "recipes"
     configs.mkdir()
-    output.mkdir()
-    recipes.mkdir()
-    (recipes / "fractional_temperature.yaml").write_text("generator:\n  sampling_params:\n    temperature: 0.9\n")
-    (recipes / "unset_temperature.yaml").write_text("generator:\n  sampling_params:\n    temperature: null\n")
-    base = configs / "ppo_base_config.yaml"
-    base.write_text(BASE)
+    (configs / "ppo_base_config.yaml").write_text(BASE)
     group = configs / "algorithm_recipe"
     group.mkdir()
-    (group / "cispo.yaml").write_text("# @package trainer.algorithm\ncispo:\n  cispo_eps_clip_high: 5.0\n")
-    sidecar = output / "sidecar.py"
-    sidecar.write_text(SIDECAR)
-    (output / "ownership.py").write_text("DERIVED_PATHS = frozenset()\nLAUNCH_PATHS = frozenset()\n")
-    command = [
-        sys.executable,
-        str(SCRIPT),
-        "--config-dir",
-        str(configs),
-        "--output-dir",
-        str(output),
-        "--recipe-dir",
-        str(recipes),
-    ]
-    subprocess.run(command, check=True, capture_output=True, text=True)
-    generated = output / "sections.py"
-    namespace = {"__name__": "marinskyrl.recipe_schema._fixture", "__package__": "marinskyrl.recipe_schema"}
-    exec(compile(generated.read_text(), str(generated), "exec"), namespace)
-    recipe_type = namespace["RecipeSections"]
-    recipe = recipe_type.model_validate_json(
-        json.dumps(
-            {
-                "trainer": {
-                    "algorithm": {"cispo": {"cispo_eps_clip_high": 5.0}},
-                    "policy": {"model": {"lora": {"dropout": 0.05}}},
-                    "critic": {"model": {"lora": {"dropout": 0.1}}},
-                },
-                "generator": {"sampling_params": {"temperature": 0.9}},
-            }
-        )
+    (group / "cispo.yaml").write_text(
+        "# @package trainer.algorithm\n# A file header, not a field.\ncispo:\n  cispo_eps_clip_high: 5.0\n"
     )
-    assert type(recipe.trainer.algorithm.cispo.cispo_eps_clip_high) is float
-    assert recipe.trainer.policy.model.lora.dropout == 0.05
-    assert recipe.trainer.critic.model.lora.dropout == 0.1
-    assert recipe.to_skyrl()["generator"]["sampling_params"]["temperature"] == 0.9
-    for raw, expected_type in (("1", int), ("1.0", float)):
-        changed = recipe.with_settings([f"generator.sampling_params.temperature={raw}"])
-        assert type(changed.to_skyrl()["generator"]["sampling_params"]["temperature"]) is expected_type
-    for invalid in ("invalid-numeric-value", {"temperature": 1}):
-        with pytest.raises(ValidationError):
-            recipe_type.model_validate_json(json.dumps({"generator": {"sampling_params": {"temperature": invalid}}}))
-    integer = recipe_type.model_validate_json('{"trainer":{"algorithm":{"cispo":{"cispo_eps_clip_high":5}}}}')
-    assert type(integer.to_skyrl()["trainer"]["algorithm"]["cispo"]["cispo_eps_clip_high"]) is int
-    description = type(recipe.trainer.placement).model_fields["policy_num_nodes"].description
-    assert "physical footprint" in description
-    assert "Filled from allocation" in description
-    assert "colocation" not in description
-    assert recipe_type().to_skyrl() == {}
-    assert list(recipe.data.sampling.domain_weights.items()) == [("math-reasoning", 1), ("code", 2.0)]
-    sparse = recipe_type.from_document({"trainer": {"algorithm": {"ftpo": {"lambda_mse": 0.25}}}})
-    assert sparse.to_skyrl() == {"trainer": {"algorithm": {"ftpo": {"lambda_mse": 0.25}}}}
-    adapter = recipe_type.from_document({"generator": {"adapter": {"name": "custom", "parameters": {"count": 2}}}})
-    assert adapter.to_skyrl() == {"generator": {"adapter": {"name": "custom", "parameters": {"count": 2}}}}
-    declared = recipe_type.from_document({"trainer": {"callbacks": [{"type": "counter"}]}})
-    assert declared.to_skyrl() == {"trainer": {"callbacks": [{"type": "counter"}]}}
+    sidecar = {}
+    exec(SIDECAR, sidecar)
+    sources = generator.source_documents(configs)
+    owners = {"DERIVED_PATHS": frozenset(), "LAUNCH_PATHS": frozenset()}
+    code = generator.render_sections(sources.base, sidecar, owners, sources.comments, sources.groups)
+    namespace = {"__name__": "marinskyrl.recipe_schema._fixture", "__package__": "marinskyrl.recipe_schema"}
+    exec(compile(code, "generated_fixture.py", "exec"), namespace)
+    model = namespace["RecipeSections"]
+    for value in (5, 5.0):
+        document = {"trainer": {"algorithm": {"cispo": {"cispo_eps_clip_high": value}}}}
+        recipe = model.model_validate_json(json.dumps(document))
+        assert type(recipe.to_skyrl()["trainer"]["algorithm"]["cispo"]["cispo_eps_clip_high"]) is type(value)
     for following in ("hf_save_interval", "micro_forward_batch_size_per_gpu"):
         with pytest.raises(ValidationError):
-            recipe_type.model_validate_json(json.dumps({"trainer": {following: None}}))
-    integer.merge(recipe_type(generator={"engine_init_kwargs": {"custom": [1, 2]}}))
-
-    formatted = generated.read_text()
-    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["marin-style"]["ruff_version"]
-    subprocess.run(
-        [
-            "uv",
-            "tool",
-            "run",
-            "--from",
-            f"ruff=={version}",
-            "ruff",
-            "format",
-            "--config",
-            str(ROOT / "pyproject.toml"),
-            str(generated),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert generated.read_text() == formatted
-    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
-    subprocess.run(command, check=True, capture_output=True, text=True)
-    assert generated.read_text() == formatted
-    base.write_text(BASE.replace("ckpt_interval: 2", "ckpt_interval: 3"))
-    stale = subprocess.run(command + ["--check"], capture_output=True, text=True)
-    assert stale.returncode != 0
-    base.write_text(BASE)
-    for patch in (
-        "TYPES['trainer.misspelled'] = 'int'\n",
-        "UNDECLARED['trainer.ckpt_interval'] = ('int', 99)\n",
+            model.model_validate_json(json.dumps({"trainer": {following: None}}))
+    assert "unset" not in model().model_dump_json()
+    assert '"The policy\'s physical footprint.\\nFilled from allocation when unset."' in code
+    assert "A file header, not a field." not in code
+    for name, key, value in (
+        ("TYPES", "trainer.misspelled", "int"),
+        ("UNDECLARED", "trainer.ckpt_interval", ("int", 99)),
     ):
-        sidecar.write_text(SIDECAR + patch)
-        drift = subprocess.run(command + ["--check"], capture_output=True, text=True)
-        assert drift.returncode != 0
-    sidecar.write_text(SIDECAR)
-    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
+        changed = copy.deepcopy(sidecar)
+        changed[name][key] = value
+        with pytest.raises(ValueError):
+            generator.render_sections(sources.base, changed, owners, sources.comments, sources.groups)

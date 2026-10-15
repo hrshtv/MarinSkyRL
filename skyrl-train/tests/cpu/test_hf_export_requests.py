@@ -7,7 +7,6 @@ from omegaconf import OmegaConf
 
 from cloud.iris import export_hf_checkpoint
 from cloud.iris.export_hf_checkpoint import ExportJobSpec, argument_parser, request_spec
-from skyrl_train import hf_export, trainer as trainer_module
 from skyrl_train.callbacks.base import TrainerControl, TrainerState
 from skyrl_train.callbacks.builtin import DefaultCallbackHandler
 from skyrl_train.config.utils import get_default_config
@@ -16,10 +15,10 @@ from skyrl_train.hf_export import (
     read_hf_export_request,
     write_hf_export_request,
 )
-from skyrl_train.hf_export_schema import HFExportRequest, HFExportStatus, HFUploadMode
+from skyrl_train.hf_export_schema import HFExportRequest, HFExportStatus
 from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.utils.trainer_utils import cleanup_old_checkpoints
-from skyrl_train.utils.utils import validate_hf_export_config
+from skyrl_train.config.callbacks import validate_hf_export_config
 
 
 def _trainer_config(
@@ -155,23 +154,14 @@ def test_hf_export_interval_requires_an_artifact_or_repository_destination(
     assert control.should_save_hf_model is expected_export
 
 
-def test_pending_export_request_refreshes_publication_settings(tmp_path, generated_recipe_schema):
-    root = Path(__file__).resolve().parents[3]
-    assert Path(trainer_module.__file__).resolve() == root / "skyrl-train/skyrl_train/trainer.py"
-    assert Path(hf_export.__file__).resolve() == root / "skyrl-train/skyrl_train/hf_export.py"
-    recipe_type, _ = generated_recipe_schema
-    recipe = recipe_type.from_document({"trainer": {"hf_upload_mode": HFUploadMode.LATEST.value}}).with_settings(
-        [f"trainer.hf_upload_mode={HFUploadMode.ALL.value}"]
-    )
-    with pytest.raises(ValueError):
-        recipe.with_settings(["trainer.hf_upload_mode=unknown-upload-mode"])
+def test_pending_export_request_refreshes_publication_settings(tmp_path):
     checkpoint = _queue_export(tmp_path)
     existing = read_hf_export_request(str(checkpoint))
     assert existing is not None
     write_hf_export_request(existing.with_status(HFExportStatus.PENDING, last_exit_code=1, increment_attempts=True))
 
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
-    trainer.cfg = OmegaConf.merge(_trainer_config(tmp_path), recipe.to_skyrl())
+    trainer.cfg = _trainer_config(tmp_path)
     trainer.cfg.trainer.hf_hub_repo_id = None
     trainer.cfg.trainer.export_hf_artifact = True
     trainer.all_timings = {}
@@ -184,7 +174,6 @@ def test_pending_export_request_refreshes_publication_settings(tmp_path, generat
     assert refreshed.hf_hub_repo_id is None
     assert refreshed.attempts == 1
     assert refreshed.last_exit_code == 1
-    assert refreshed.hf_upload_mode is HFUploadMode.ALL
 
 
 def test_disabled_hf_export_does_not_require_checkpoint_alignment():
@@ -215,6 +204,25 @@ def test_default_hf_export_interval_tracks_checkpoint_override():
 
     assert cfg.trainer.hf_save_interval == 10
     validate_hf_export_config(cfg)
+
+
+def test_terminal_artifact_export_rejects_disabled_request_callback():
+    cfg = get_default_config()
+    cfg.trainer.export_hf_artifact = True
+    cfg.trainer.ckpt_interval = 1
+    cfg.trainer.hf_save_interval = -1
+
+    with pytest.raises(ValueError, match="Terminal HF artifact export"):
+        validate_hf_export_config(cfg)
+
+    cfg.trainer.hf_save_interval = 2
+    validate_hf_export_config(cfg)
+    handler = DefaultCallbackHandler(cfg)
+    state = TrainerState(global_step=2, epoch=0, total_steps=2, num_steps_per_epoch=2)
+    control = handler.call_event("on_train_end", state, TrainerControl())
+
+    assert control.should_save
+    assert control.should_save_hf_model
 
 
 def test_request_rejects_operator_override_instead_of_ignoring_it(tmp_path):

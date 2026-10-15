@@ -7,8 +7,8 @@ from email.parser import Parser
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
+import sys
 import tomllib
 import zipfile
 
@@ -52,52 +52,6 @@ def test_root_wheel_owns_launcher_and_training_packages(built_wheel: BuiltWheel,
     assert "skyrl_gym/__init__.py" in built_wheel.names
     assert "skyrl_train/__init__.py" in built_wheel.names
     assert "skyrl_train/config/ppo_base_config.yaml" in built_wheel.names
-    environment = tmp_path / "schema-environment"
-    subprocess.run(["uv", "venv", "--python", "3.12", str(environment)], check=True)
-    interpreter = environment / "bin/python"
-    requirements = (Requirement(raw) for raw in metadata.get_all("Requires-Dist", []))
-    pydantic = next(requirement for requirement in requirements if requirement.name == "pydantic")
-    minimum = next(bound.version for bound in pydantic.specifier if bound.operator == ">=")
-    subprocess.run(["uv", "pip", "install", "--python", str(interpreter), f"pydantic=={minimum}"], check=True)
-    subprocess.run(
-        ["uv", "pip", "install", "--python", str(interpreter), "--no-deps", str(built_wheel.path)], check=True
-    )
-    program = """
-import importlib.util
-import json
-from pathlib import Path
-import pickle
-import sys
-import sysconfig
-
-import pydantic
-import marinskyrl.recipe_schema as schema
-
-assert Path(schema.__file__).resolve() == Path(sysconfig.get_path("purelib")) / "marinskyrl/recipe_schema/__init__.py"
-blocked = {"hydra", "omegaconf", "ray", "torch", "yaml"}
-assert all(importlib.util.find_spec(name) is None for name in blocked)
-assert not blocked.intersection(name.split(".")[0] for name in sys.modules)
-budget = schema.ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=4)
-recipe = schema.SkyRLRecipe.combine(
-    base=schema.SkyRLRecipe(context_budget=budget),
-    arm=schema.RecipePatch(data=schema.Data(sampling=schema.Sampling(domain_weights={"math": 1, "code": 2}))),
-).with_settings(["data.sampling.domain_weights.math=3"])
-restored = schema.SkyRLRecipe.from_document(recipe.to_skyrl())
-assert restored == recipe and hash(restored) == hash(recipe)
-assert pickle.loads(pickle.dumps(restored)) == recipe
-print(json.dumps({"source": schema.__file__, "pydantic": pydantic.__version__, "document": restored.to_skyrl()}))
-"""
-    result = subprocess.run(
-        [str(interpreter), "-c", program],
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": ""},
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    output = json.loads(result.stdout)
-    print(f"built-wheel schema source: {output['source']}; pydantic {output['pydantic']}")
 
 
 def test_base_dependencies_are_cpu_only(built_wheel: BuiltWheel) -> None:
@@ -108,7 +62,7 @@ def test_base_dependencies_are_cpu_only(built_wheel: BuiltWheel) -> None:
         if "extra ==" not in requirement
     }
 
-    assert base_requirements.isdisjoint({"flash-attn", "torch", "transformer-engine", "vllm"})
+    assert base_requirements.isdisjoint({"flash-attn", "torch", "transformer-engine", "vllm", "harbor", "harbor-config"})
 
 
 def test_training_extras_publish_hardware_policy_and_rollout_requirements(built_wheel: BuiltWheel) -> None:
@@ -121,10 +75,11 @@ def test_training_extras_publish_hardware_policy_and_rollout_requirements(built_
     assert any(requirement.startswith("torch==") and "extra == 'cpu'" in requirement for requirement in requirements)
     assert any(requirement.startswith("torch==") and "extra == 'cuda'" in requirement for requirement in requirements)
     assert any(requirement.startswith("vllm==") and "extra == 'vllm'" in requirement for requirement in requirements)
-    assert any(
-        requirement.startswith("harbor[analysis,datasets,daytona]") and "extra == 'vllm'" in requirement
-        for requirement in requirements
-    )
+    base_requirements = [Requirement(value) for value in requirements if "extra ==" not in value]
+    assert {"marin-rolloutengine", "marin-shellbox", "marin-taskcompendium", "marin-verifyit"} <= {
+        requirement.name for requirement in base_requirements
+    }
+    assert all(requirement.url is None for requirement in base_requirements if requirement.name.startswith("marin-"))
     assert any(requirement.startswith("torch==") and "extra == 'vllm'" in requirement for requirement in requirements)
     assert any(
         requirement.startswith("memray") and "extra == 'telemetry'" in requirement for requirement in requirements
@@ -147,25 +102,17 @@ def test_training_extras_publish_hardware_policy_and_rollout_requirements(built_
     assert "Extras `cpu` and `cuda` are incompatible" in conflict.stderr
 
 
-def test_rollout_runtime_resolves_harbor_main_into_the_frozen_lock() -> None:
-    sources = PYPROJECT["tool"]["uv"]["sources"]
-    lock = tomllib.loads((REPOSITORY_ROOT / "uv.lock").read_text())
-
-    assert sources["harbor"] == {"git": "https://github.com/marin-community/harbor.git"}
-    harbor = next(package for package in lock["package"] if package["name"] == "harbor")
-    assert harbor["source"]["git"].startswith("https://github.com/marin-community/harbor.git#")
-    assert len(harbor["source"]["git"].rsplit("#", 1)[-1]) == 40
-
-
-def test_harbor_config_release_matches_the_locked_harbor_commit() -> None:
-    lock = tomllib.loads((REPOSITORY_ROOT / "uv.lock").read_text())
-    packages = {package["name"]: package for package in lock["package"]}
-    harbor_commit = packages["harbor"]["source"]["git"].rsplit("#", 1)[-1]
-    config_url = packages["harbor-config"]["source"]["url"]
-    config_release = re.search(r"/harbor-config-([0-9a-f]{40})/", config_url)
-
-    assert config_release is not None
-    assert config_release.group(1) == harbor_commit
+def test_rollout_runtime_exports_pinned_harbor_for_linux_training() -> None:
+    platform = {"sys_platform": "linux", "platform_machine": "x86_64"}
+    requirements = _exported_requirements(("megatron", "vllm"))
+    harbor = next(
+        requirement for requirement in requirements
+        if requirement.name == "harbor"
+        and (requirement.marker is None or requirement.marker.evaluate(platform))
+    )
+    assert harbor.url is not None
+    assert harbor.url.startswith("git+https://github.com/marin-community/harbor.git@")
+    assert harbor.url.rsplit("@", 1)[-1] == PYPROJECT["tool"]["uv"]["sources"]["harbor"]["rev"]
 
 
 def _exported_requirements(extras: tuple[str, ...]) -> list[Requirement]:
@@ -222,3 +169,61 @@ def test_policy_closures_match_supported_architectures(
     assert names.isdisjoint(forbidden)
     vllm = next(requirement for requirement in exported if requirement.name == "vllm")
     assert vllm.url is not None and vllm.url.endswith(f"manylinux_2_28_{architecture}.whl")
+
+
+def test_standalone_recipe_wheel_authors_without_launcher_dependencies(tmp_path: Path) -> None:
+    output = tmp_path / "wheel"
+    subprocess.run(["uv", "build", "--wheel", "packages/marinskyrl-recipe", "--out-dir", str(output)], cwd=REPOSITORY_ROOT, check=True)
+    wheel = next(output.glob("*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        metadata = Parser().parsestr(archive.read(next(name for name in names if name.endswith(".dist-info/METADATA"))).decode())
+    assert metadata.get_all("Requires-Dist") == ["pydantic<3,>=2.12.2"]
+    assert "marinskyrl/__init__.py" not in names
+    assert all(name.startswith("marinskyrl/recipe_schema/") or ".dist-info/" in name for name in names)
+    environment = tmp_path / "schema-environment"
+    subprocess.run(["uv", "venv", "--python", f"{sys.version_info.major}.{sys.version_info.minor}", str(environment)], check=True)
+    interpreter = environment / "bin/python"
+    requirements = (Requirement(raw) for raw in metadata.get_all("Requires-Dist", []))
+    pydantic = next(requirement for requirement in requirements if requirement.name == "pydantic")
+    minimum = next(bound.version for bound in pydantic.specifier if bound.operator == ">=")
+    subprocess.run(["uv", "pip", "install", "--python", str(interpreter), f"pydantic=={minimum}"], check=True)
+    subprocess.run(
+        ["uv", "pip", "install", "--python", str(interpreter), "--no-deps", str(wheel)], check=True
+    )
+    program = """
+import importlib.util
+import json
+from pathlib import Path
+import pickle
+import sys
+import sysconfig
+
+import pydantic
+import marinskyrl.recipe_schema as schema
+
+assert Path(schema.__file__).resolve() == Path(sysconfig.get_path("purelib")) / "marinskyrl/recipe_schema/__init__.py"
+blocked = {"hydra", "omegaconf", "ray", "torch", "yaml"}
+assert all(importlib.util.find_spec(name) is None for name in blocked)
+assert not blocked.intersection(name.split(".")[0] for name in sys.modules)
+budget = schema.ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=4)
+recipe = schema.SkyRLRecipe.combine(
+    base=schema.SkyRLRecipe(context_budget=budget),
+    arm=schema.RecipePatch(data=schema.Data(sampling=schema.Sampling(domain_weights={"math": 1, "code": 2}))),
+).with_settings(["data.sampling.domain_weights.math=3"])
+restored = schema.SkyRLRecipe.from_document(recipe.to_skyrl())
+assert json.dumps(restored.to_skyrl()) == json.dumps(recipe.to_skyrl())
+assert pickle.loads(pickle.dumps(restored)).to_skyrl() == recipe.to_skyrl()
+print(json.dumps({"source": schema.__file__, "pydantic": pydantic.__version__, "document": restored.to_skyrl()}))
+"""
+    result = subprocess.run(
+        [str(interpreter), "-c", program],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["document"]["data"]["sampling"]["domain_weights"] == {"math": 3, "code": 2}
