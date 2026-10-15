@@ -11,6 +11,7 @@ from transformers import PreTrainedTokenizerBase
 from skyrl_train.config.weight_sync_pause import resolve_weight_sync_pause_policy
 from skyrl_train.inference_engines.vllm.decode_invariant.engine import (
     DECODE_INVARIANT_ATTENTION_BACKEND,
+    decode_invariant_engine_environment,
     decode_invariant_engine_init_kwargs,
     verify_decode_invariant_config,
 )
@@ -43,8 +44,10 @@ def inference_engine_kwargs_from_config(
     engine_init_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     """Combine shared generator settings with explicit role geometry and ownership; a decode-invariant role gets
-    the CUSTOM attention backend and the decode-invariant engine kwargs after its settings are verified."""
+    the CUSTOM attention backend, the decode-invariant engine kwargs and its engine environment after its settings
+    are verified."""
     attention_backend = cfg.generator.get("vllm_attention_backend", None)
+    engine_environment = {}
     if role.decode_invariant:
         verify_decode_invariant_config(
             backend=role.backend,
@@ -56,6 +59,7 @@ def inference_engine_kwargs_from_config(
         )
         attention_backend = DECODE_INVARIANT_ATTENTION_BACKEND
         engine_init_kwargs = {**engine_init_kwargs, **decode_invariant_engine_init_kwargs()}
+        engine_environment = decode_invariant_engine_environment()
     kwargs = {
         "num_inference_engines": role.num_inference_engines,
         "tensor_parallel_size": role.tensor_parallel_size,
@@ -79,6 +83,7 @@ def inference_engine_kwargs_from_config(
         "backend": role.backend,
         "vllm_attention_backend": attention_backend,
         "engine_init_kwargs": engine_init_kwargs,
+        "engine_environment": engine_environment,
         "max_logprobs": role.max_logprobs,
         "mp_backend": cfg.generator.get("inference_engine_mp_backend", False),
         "placement_group_timeout_seconds": int(cfg.trainer.distributed.placement_group_timeout_seconds),

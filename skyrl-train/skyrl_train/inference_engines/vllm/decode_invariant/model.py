@@ -64,6 +64,11 @@ def check_router_weights(model: torch.nn.Module, loaded: set[str]) -> None:
 
 class DecodeInvariantGrugMoeForCausalLM(GrugMoeForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(
+                "a decode-invariant engine runs vLLM's model runner V2, whose log-probability kernel the exact "
+                "trainer runs; vLLM chose the V1 runner"
+            )
         compilation = vllm_config.compilation_config
         if compilation.cudagraph_mode == CUDAGraphMode.NONE or 1 in compilation.cudagraph_capture_sizes:
             # vLLM sets cudagraph_mode NONE for a Grug model with short convolutions.

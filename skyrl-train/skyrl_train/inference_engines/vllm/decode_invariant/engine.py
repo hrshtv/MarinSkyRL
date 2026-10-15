@@ -78,6 +78,18 @@ def verify_decode_invariant_config(
         )
     if engine_init_kwargs.get("speculative_config") is not None:
         raise ValueError("a decode-invariant engine runs without speculative decoding")
+    if engine_init_kwargs.get("logits_processors"):
+        raise ValueError(
+            "a decode-invariant engine runs vLLM's model runner V2, which engine_init_kwargs.logits_processors "
+            "turns off"
+        )
+
+
+def decode_invariant_engine_environment() -> dict[str, str]:
+    """The environment a decode-invariant engine's processes start with: without NVLink SHARP or vLLM's NCCL symmetric
+    memory, the expert-parallel combine runs NCCL's ring reduce-scatter, in the order ``models/grug_exact``'s
+    ``ep_combine`` reproduces."""
+    return {"NCCL_NVLS_ENABLE": "0", "VLLM_USE_NCCL_SYMM_MEM": "0"}
 
 
 def decode_invariant_engine_init_kwargs() -> dict[str, Any]:
