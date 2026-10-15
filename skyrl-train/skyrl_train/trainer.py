@@ -9,7 +9,7 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from jaxtyping import Float
 import ray
@@ -105,7 +105,7 @@ from marinskyrl.checkpoint_paths import (
 from marinskyrl.process_diagnostics import write_exception_receipt
 from marinskyrl.resource_locator import is_cloud_uri, join_resource_path
 from marinskyrl.speculative_decoding import SpeculativeDecodingConfig, runai_model_uri
-from skyrl_train.checkpoint_listing import extract_step_from_path
+from skyrl_train.checkpoint_listing import extract_step_from_path, list_checkpoint_dirs
 from skyrl_train.utils.trainer_utils import (
     async_step_metrics,
     consumed_stop_metrics,
@@ -127,7 +127,7 @@ from skyrl_train.config.objective_spec import rollout_logprobs_required
 from skyrl_train.utils.algorithm_registry import PolicyLossRegistry
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
 from skyrl_train.callbacks.base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
-from skyrl_train.callbacks.builtin import DefaultCallbackHandler, RefModelUpdateCallback
+from skyrl_train.callbacks.builtin import CheckpointCallback, DefaultCallbackHandler, RefModelUpdateCallback
 from skyrl_train.telemetry import (
     TRAINER_ROLE,
     ConsumedWork,
@@ -161,6 +161,12 @@ from skyrl_train.hf_export_schema import (
 
 
 @dataclass(frozen=True)
+class SamplerCheckpointState:
+    completed_updates: int
+    checkpoint_path: str | None
+
+
+@dataclass(frozen=True)
 class CheckpointSnapshot:
     step: int
     upload_started_at: float
@@ -169,6 +175,7 @@ class CheckpointSnapshot:
     trainer_state_path: str
     trainer_state_payload: bytes
     marker_path: str
+    sampler_state: SamplerCheckpointState | None = None
 
 
 _MODEL_INITIALIZATION_TIMEOUT = 60 * 60
@@ -288,6 +295,9 @@ class RayPPOTrainer:
     _expert_block_sync: ExpertBlockSync | None = None
     _sampler_noise_initialized: bool = False
     _sampler_refresh_step: int = 0
+    _sampler_checkpoint_path: str | None = None
+    _restored_sampler_state: SamplerCheckpointState | None = None
+    _last_saved_sampler_state: SamplerCheckpointState | None = None
 
     _training_metrics_enabled: bool = False
     _rollout_spans_enabled: bool = False
@@ -321,9 +331,8 @@ class RayPPOTrainer:
             self.colocate_all
             or cfg.trainer.rollout_buffer.max_staleness_steps != 0
             or cfg.trainer.rollout_buffer.batch_policy != "full_batch"
-            or cfg.trainer.resume_mode != "none"
         ):
-            raise ValueError("periodic sampler freeze requires a fresh disaggregated synchronous full-batch run")
+            raise ValueError("periodic sampler freeze requires disaggregated synchronous full-batch training")
         self.tracker = tracker
         self.tokenizer = tokenizer
         self.train_dataset = train_dataset
@@ -400,6 +409,15 @@ class RayPPOTrainer:
             self.callback_handler = CallbackHandler(callbacks)
         else:
             self.callback_handler = DefaultCallbackHandler(cfg)
+
+        if refresh_period > 1 and str(cfg.trainer.resume_mode) != "none":
+            if not any(
+                isinstance(callback, CheckpointCallback)
+                and callback.save_steps > 0
+                and refresh_period % callback.save_steps == 0
+                for callback in self.callback_handler.callbacks
+            ):
+                raise ValueError("periodic sampler resume requires checkpoints at every sampler refresh boundary")
 
         # Trainer control object for callback coordination
         self._control = TrainerControl()
@@ -790,6 +808,7 @@ class RayPPOTrainer:
             io.write_bytes_atomic(snapshot.rollout_state_path, snapshot.rollout_state_payload)
             io.write_bytes_atomic(snapshot.marker_path, str(snapshot.step).encode())
             self._last_saved_step = snapshot.step
+            self._last_saved_sampler_state = snapshot.sampler_state
             cleanup_started = time.monotonic()
             self._cleanup_old_checkpoints()
             cleanup_duration = time.monotonic() - cleanup_started
@@ -1172,6 +1191,11 @@ class RayPPOTrainer:
                     await self.inference_engine_client.resume_generation()
         if reason != "evaluation":
             self._sampler_refresh_step = self.global_step
+            self._sampler_checkpoint_path = (
+                os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{self.global_step}", "policy")
+                if period > 1 and self.global_step > 0
+                else None
+            )
             self.all_metrics["sampler/frozen_policy_completed_updates"] = self._sampler_refresh_step
         self._log_weight_update_completed(reason=reason, duration_seconds=update_timer.duration)
 
@@ -1272,21 +1296,67 @@ class RayPPOTrainer:
             duration_seconds,
         )
 
-    async def _restore_training_checkpoint(self) -> bool:
-        """Restore learner and rollout state before starting generation."""
-        if self.resume_mode == ResumeMode.NONE:
-            return False
-        if self.cfg.generator.get("sampler_weight_noise_scale", 0) > 0:
-            # Fix the perturbation against the original model before checkpoint weights replace it.
+    async def _restore_frozen_sampler(self) -> None:
+        learner_checkpoint_path = self.loaded_checkpoint_path
+        assert learner_checkpoint_path is not None
+        state = self._restored_sampler_state
+        period = self.cfg.generator.sampler_refresh_period
+        expected_step = self.global_step // period * period
+        if state is None or state.completed_updates != expected_step:
+            raise ValueError("checkpoint does not identify the required frozen sampler policy")
+        if state.completed_updates == 0:
+            if state.checkpoint_path is not None:
+                raise ValueError("initial sampler policy must use the configured original model")
+            return
+        if state.checkpoint_path is None or not io.exists(
+            os.path.join(os.path.dirname(state.checkpoint_path), TRAINER_STATE_FILENAME)
+        ):
+            raise ValueError("checkpoint is missing its committed frozen sampler policy")
+        if state.completed_updates == self.global_step:
             await self._sync_policy_for_rollouts(reason="initial")
-        with Timer("load_checkpoints", self.all_startup_timings):
-            self.global_step, self.loaded_checkpoint_path = self.load_checkpoints()
-        logger.info(f"Resumed training from global_step {self.global_step}")
-        if self._restored_rollout_state is None:
-            return False
-        await self.context.load_state_dict(self._restored_rollout_state)
-        self._restored_rollout_state = None
-        return True
+        else:
+            learner_step = self.global_step
+            try:
+                self.global_step = state.completed_updates
+                ray.get(
+                    self.policy_model.async_run_ray_method(
+                        "pass_through", "load_checkpoint", ckpt_dir=state.checkpoint_path, load_training_state=False
+                    )
+                )
+                await self._sync_policy_for_rollouts(reason="checkpoint_restore")
+            finally:
+                self.global_step = learner_step
+                ray.get(
+                    self.policy_model.async_run_ray_method(
+                        "pass_through",
+                        "load_checkpoint",
+                        ckpt_dir=os.path.join(learner_checkpoint_path, "policy"),
+                        load_training_state=False,
+                    )
+                )
+        self._sampler_checkpoint_path = state.checkpoint_path
+
+    async def _initialize_training_state(self) -> bool:
+        """Restore checkpoint state and initialize the actual generating policy."""
+        period = self.cfg.generator.get("sampler_refresh_period", 1)
+        restored_data = False
+        if self.resume_mode != ResumeMode.NONE:
+            if self.cfg.generator.get("sampler_weight_noise_scale", 0) > 0 or period > 1:
+                # Preserve the original delta and the first frozen policy before replacing learner weights.
+                await self._sync_policy_for_rollouts(reason="initial")
+            with Timer("load_checkpoints", self.all_startup_timings):
+                self.global_step, self.loaded_checkpoint_path = self.load_checkpoints()
+            logger.info(f"Resumed training from global_step {self.global_step}")
+            if self._restored_rollout_state is not None:
+                await self.context.load_state_dict(self._restored_rollout_state)
+                self._restored_rollout_state = None
+                restored_data = True
+        await self._start_draft_trainer()
+        if self.resume_mode != ResumeMode.NONE and period > 1 and self.loaded_checkpoint_path is not None:
+            await self._restore_frozen_sampler()
+        else:
+            await self._sync_policy_for_rollouts(reason="initial")
+        return restored_data
 
     async def _train_loop(self):
         await self._init_weight_sync()
@@ -1295,10 +1365,7 @@ class RayPPOTrainer:
         if self.colocate_all:
             self.policy_model.backload_to_gpu()
 
-        restored_data = await self._restore_training_checkpoint()
-
-        await self._start_draft_trainer()
-        await self._sync_policy_for_rollouts(reason="initial")
+        restored_data = await self._initialize_training_state()
 
         if self._ftpo_stopped:
             await self._handle_resume_at_max_steps()
@@ -3017,6 +3084,20 @@ class RayPPOTrainer:
         """
         # Create global step folder structure
         step = self.global_step
+        sampler_state = None
+        if self.cfg.generator.get("sampler_refresh_period", 1) > 1:
+            sampler_state = SamplerCheckpointState(self._sampler_refresh_step, self._sampler_checkpoint_path)
+            if (
+                self.resume_mode != ResumeMode.NONE
+                and 0 < sampler_state.completed_updates < step
+                and (
+                    sampler_state.checkpoint_path is None
+                    or not io.exists(
+                        os.path.join(os.path.dirname(sampler_state.checkpoint_path), TRAINER_STATE_FILENAME)
+                    )
+                )
+            ):
+                raise ValueError("cannot checkpoint without the committed frozen sampler policy")
         global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{step}")
         policy_save_dir = os.path.join(global_step_folder, POLICY_CHECKPOINT_SUBDIRECTORY)
         critic_save_dir = os.path.join(global_step_folder, "critic")
@@ -3065,6 +3146,8 @@ class RayPPOTrainer:
             "ftpo_stopped": self._ftpo_stopped,
             "domain_gradient_balance_state": self._domain_balancer.state_dict() if self._domain_balancer else None,
         }
+        if sampler_state is not None:
+            trainer_state["sampler_state"] = asdict(sampler_state)
         trainer_state_path = os.path.join(global_step_folder, TRAINER_STATE_FILENAME)
         trainer_state_buffer = stdlib_io.BytesIO()
         torch.save(trainer_state, trainer_state_buffer)
@@ -3077,6 +3160,7 @@ class RayPPOTrainer:
             trainer_state_path=trainer_state_path,
             trainer_state_payload=trainer_state_buffer.getvalue(),
             marker_path=latest_checkpoint_file,
+            sampler_state=sampler_state,
         )
 
     def _cleanup_old_checkpoints(self):
@@ -3089,6 +3173,27 @@ class RayPPOTrainer:
             return
 
         protected_steps = protected_hf_export_steps(self.cfg.trainer.ckpt_path)
+        if self._last_saved_sampler_state is not None:
+            committed_step = self._last_saved_step
+            assert committed_step is not None
+            protected_steps.add(committed_step)
+            protected_steps.add(self._last_saved_sampler_state.completed_updates)
+            directories = sorted(
+                list_checkpoint_dirs(self.cfg.trainer.ckpt_path), key=extract_step_from_path, reverse=True
+            )
+            committed = [path for path in directories if extract_step_from_path(path) <= committed_step]
+            if not committed or extract_step_from_path(committed[0]) != committed_step:
+                return
+            for directory in committed[:max_ckpts]:
+                metadata_path = os.path.join(self.cfg.trainer.ckpt_path, directory, TRAINER_STATE_FILENAME)
+                if not io.exists(metadata_path):
+                    return
+                with io.open_file(metadata_path, "rb") as source:
+                    state = torch.load(source, map_location="cpu", weights_only=False)
+                protected_steps.add(extract_step_from_path(directory))
+                sampler_state = state.get("sampler_state")
+                if sampler_state is not None:
+                    protected_steps.add(sampler_state["completed_updates"])
 
         if not self._node_ids:
             self._node_ids = get_node_ids(self.policy_model, self.critic_model, self.ref_model)
@@ -3187,6 +3292,8 @@ class RayPPOTrainer:
         with io.open_file(trainer_state_path, "rb") as f:
             trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         saved_global_step = trainer_state.get("global_step", global_step)
+        sampler_state = trainer_state.get("sampler_state")
+        self._restored_sampler_state = SamplerCheckpointState(**sampler_state) if sampler_state is not None else None
         self._ftpo_stopped = bool(trainer_state.get("ftpo_stopped", False))
         if self.cfg.trainer.get("reset_distillation_token_count_on_resume", False):
             self.distillation_scored_tokens_total = 0

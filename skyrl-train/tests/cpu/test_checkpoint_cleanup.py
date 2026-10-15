@@ -13,8 +13,9 @@ Background on the incident that motivated these tests is in
 from unittest.mock import MagicMock, patch
 
 import ray.exceptions
+import torch
 
-from skyrl_train.trainer import RayPPOTrainer
+from skyrl_train.trainer import RayPPOTrainer, SamplerCheckpointState
 
 
 def _make_bare_trainer(max_ckpts_to_keep: int, ckpt_path: str, node_ids) -> RayPPOTrainer:
@@ -61,3 +62,52 @@ def test_cleanup_runs_driver_side_after_fanout_failure(tmp_path):
 
     remaining = sorted(p.name for p in tmp_path.iterdir())
     assert remaining == ["global_step_3"], "driver-side cleanup should keep only the newest checkpoint"
+
+
+def test_cleanup_preserves_the_sampler_referenced_by_the_committed_checkpoint(tmp_path):
+    for step in (2, 3, 4, 5, 6):
+        directory = tmp_path / f"global_step_{step}"
+        directory.mkdir()
+        if step in (4, 5):
+            torch.save({"sampler_state": {"completed_updates": 3}}, directory / "trainer_state.pt")
+    trainer = _make_bare_trainer(max_ckpts_to_keep=2, ckpt_path=str(tmp_path), node_ids=["a"])
+    trainer._last_saved_step = 5
+    trainer._last_saved_sampler_state = SamplerCheckpointState(3, str(tmp_path / "global_step_3/policy"))
+    # The next refresh can finish while the preceding checkpoint's upload is still running.
+    trainer._sampler_refresh_step = 6
+
+    with patch("skyrl_train.trainer.run_on_each_node", side_effect=ray.exceptions.WorkerCrashedError):
+        trainer._cleanup_old_checkpoints()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "global_step_3",
+        "global_step_4",
+        "global_step_5",
+        "global_step_6",
+    ]
+
+
+def test_cleanup_keeps_both_recent_restore_points_and_their_sampler_policies(tmp_path):
+    for step in (3, 4, 5, 6, 7):
+        directory = tmp_path / f"global_step_{step}"
+        directory.mkdir()
+        if step <= 6:
+            sampler_step = 3 if step < 6 else 6
+            torch.save(
+                {"sampler_state": {"completed_updates": sampler_step}},
+                directory / "trainer_state.pt",
+            )
+    trainer = _make_bare_trainer(max_ckpts_to_keep=2, ckpt_path=str(tmp_path), node_ids=["a"])
+    trainer._last_saved_step = 6
+    trainer._last_saved_sampler_state = SamplerCheckpointState(6, str(tmp_path / "global_step_6/policy"))
+    trainer._sampler_refresh_step = 9
+
+    with patch("skyrl_train.trainer.run_on_each_node", side_effect=ray.exceptions.WorkerCrashedError):
+        trainer._cleanup_old_checkpoints()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "global_step_3",
+        "global_step_5",
+        "global_step_6",
+        "global_step_7",
+    ]

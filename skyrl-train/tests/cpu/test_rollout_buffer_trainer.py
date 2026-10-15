@@ -1,4 +1,5 @@
 import asyncio
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,16 +19,36 @@ from skyrl_train.trajectory_selection import BestOfNTrajectorySelector
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("noise_scale", [0.0, 0.05])
-async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(tmp_path, monkeypatch, noise_scale):
+@pytest.mark.parametrize(
+    "noise_scale,refresh_period,saved_step,sampler_step",
+    [(0.0, 1, 5, 5), (0.05, 1, 5, 5), (0.0, 3, 2, 0), (0.0, 3, 5, 3), (0.0, 3, 6, 6), (0.05, 3, 5, 3)],
+)
+async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(
+    tmp_path, monkeypatch, noise_scale, refresh_period, saved_step, sampler_step
+):
     original = torch.arange(1, 4, dtype=torch.float32)
-    restored_weights = original * 7
+    restored_weights = original * (saved_step + 2)
+    sampler_weights = original * (sampler_step + 2) if sampler_step else original
     moments = torch.tensor([0.3, 0.6, 0.9])
-    checkpoint = tmp_path / "global_step_5"
+    checkpoint = tmp_path / "source" / f"global_step_{saved_step}"
     policy_checkpoint = checkpoint / "policy"
     policy_checkpoint.mkdir(parents=True)
     torch.save({"weights": restored_weights, "moments": moments}, policy_checkpoint / "state.pt")
-    torch.save({"global_step": 5}, checkpoint / "trainer_state.pt")
+    sampler_checkpoint = checkpoint.parent / f"global_step_{sampler_step}" / "policy" if sampler_step else None
+    if sampler_checkpoint is not None and sampler_step != saved_step:
+        sampler_checkpoint.mkdir(parents=True)
+        torch.save({"weights": sampler_weights, "moments": moments * 100}, sampler_checkpoint / "state.pt")
+        torch.save({"global_step": sampler_step}, sampler_checkpoint.parent / "trainer_state.pt")
+    torch.save(
+        {
+            "global_step": saved_step,
+            "sampler_state": {
+                "completed_updates": sampler_step,
+                "checkpoint_path": str(sampler_checkpoint) if sampler_checkpoint is not None else None,
+            },
+        },
+        checkpoint / "trainer_state.pt",
+    )
     rollout_state = TrainingContextState(
         loader=PromptLoaderState(order={"epoch": 0, "position": 6}, retries=[]),
         ready=[],
@@ -47,6 +68,11 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(tm
         def async_run_ray_method(self, dispatch, method, **kwargs):
             if method == "barrier_all":
                 return []
+            if method == "save_checkpoint":
+                destination = Path(kwargs["ckpt_dir"])
+                destination.mkdir(parents=True, exist_ok=True)
+                torch.save({"weights": self.weights, "moments": self.moments}, destination / "state.pt")
+                return [None]
             assert method == "load_checkpoint"
             saved = torch.load(Path(kwargs["ckpt_dir"]) / "state.pt", weights_only=True)
             self.weights.copy_(saved["weights"])
@@ -86,8 +112,10 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(tm
     trainer.cfg = get_default_config()
     trainer.cfg.generator.sampler_weight_noise_scale = noise_scale
     trainer.cfg.generator.sampler_weight_noise_seed = 17
+    trainer.cfg.generator.sampler_refresh_period = refresh_period
     trainer.cfg.trainer.resume_mode = "from_path"
     trainer.cfg.trainer.resume_path = str(checkpoint)
+    trainer.cfg.trainer.ckpt_path = str(tmp_path / "resumed")
     trainer.cfg.trainer.restore_dataloader_state = True
     trainer.cfg.trainer.reset_global_step_on_resume = False
     trainer.resume_mode = trainer_module.ResumeMode.FROM_PATH
@@ -102,21 +130,32 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(tm
     trainer.critic_model = None
     trainer.inference_engine_client = Engine()
     trainer.context = Context()
+    trainer.speculative_decoding = None
+    trainer.tokenizer = None
     monkeypatch.setattr(trainer_module.ray, "get", lambda references: references)
 
     # The reference sampler starts at the original model and then receives a later learner snapshot.
     expected = original.clone()
     reference_noise = FixedSamplerNoise([("weight", expected)], noise_scale, 17)
-    expected.copy_(restored_weights)
+    expected.copy_(sampler_weights)
     reference_noise.after_sync()
 
-    assert await trainer._restore_training_checkpoint()
-    await trainer._sync_policy_for_rollouts(reason="initial")
+    assert await trainer._initialize_training_state()
 
     torch.testing.assert_close(serving, expected, rtol=0, atol=0)
+    torch.testing.assert_close(trainer.policy_model.weights, restored_weights, rtol=0, atol=0)
     torch.testing.assert_close(trainer.policy_model.moments, moments, rtol=0, atol=0)
     assert trainer.context.restored == rollout_state
-    assert trainer.global_step == 5
+    assert trainer.global_step == saved_step
+    snapshot = trainer._snapshot_checkpoint(rollout_state)
+    saved = torch.load(io.BytesIO(snapshot.trainer_state_payload), weights_only=False)
+    if refresh_period > 1:
+        assert saved["sampler_state"] == {
+            "completed_updates": sampler_step,
+            "checkpoint_path": str(sampler_checkpoint) if sampler_checkpoint is not None else None,
+        }
+    else:
+        assert saved.get("sampler_state") is None
 
 
 def _group(uid: str, policy_step: int, *, rewards: list[float] | None = None) -> RolloutGroup:
@@ -180,12 +219,16 @@ def test_weight_sync_respects_optimizer_offload_policy(reason, offload_enabled):
 
 
 @pytest.mark.asyncio
-async def test_periodic_refresh_preserves_simulated_sampler_weights_across_evaluation(monkeypatch):
+async def test_periodic_refresh_preserves_simulated_sampler_weights_across_evaluation(monkeypatch, tmp_path):
     trainer = object.__new__(RayPPOTrainer)
     trainer.cfg = OmegaConf.create(
         {
             "generator": {"sampler_refresh_period": 3, "sampler_weight_noise_scale": 0, "sampler_weight_noise_seed": 0},
-            "trainer": {"offload_optimizer_during_rollouts": True, "step_wise_training": False},
+            "trainer": {
+                "offload_optimizer_during_rollouts": True,
+                "step_wise_training": False,
+                "ckpt_path": str(tmp_path),
+            },
         }
     )
     trainer.colocate_all = False

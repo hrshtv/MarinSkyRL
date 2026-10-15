@@ -92,6 +92,37 @@ Checkpointing behavior is controlled by several parameters in the YAML configura
   - **Purpose**: Specific checkpoint directory to resume from (only used when ``resume_mode: "from_path"``)
   - **Format**: Must point to a ``global_step_N`` directory
 
+Fixed Noise and Frozen Sampler Policies
+--------------------------------------
+
+Keep the configured initial model and noise seed unchanged across restarts.
+Fixed sampler noise is initialized from that original model before loading the
+learner checkpoint. The resumed learner weights then receive the same fixed delta.
+
+For a periodically refreshed sampler, checkpoint metadata also records which
+policy generated rollouts and where its weights are stored. A restart restores
+that older serving snapshot while keeping the current learner and optimizer state.
+The initial sampler uses the configured original model. Checkpoints without sampler
+metadata or a required older policy snapshot cannot resume this mode.
+
+Resuming a frozen sampler requires disaggregated synchronous full batches and a
+checkpoint interval that divides the sampler refresh period. This ensures every
+refreshed sampler has a checkpoint. For example:
+
+.. code-block:: yaml
+
+    generator:
+      sampler_refresh_period: 65
+    trainer:
+      resume_mode: latest
+      ckpt_interval: 13
+      max_ckpts_to_keep: 2
+
+When an explicit callback list is configured, set the checkpoint callback's
+``save_steps`` accordingly; it replaces the legacy ``ckpt_interval`` setting.
+Cleanup preserves the recent committed checkpoints and any older sampler policies
+they require. A newer partial upload does not evict those restore dependencies.
+
 HuggingFace Model Export
 ------------------------
 
