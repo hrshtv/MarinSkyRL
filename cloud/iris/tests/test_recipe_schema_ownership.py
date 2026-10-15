@@ -132,6 +132,7 @@ def test_ownership_sentinels_distinguish_launch_writers_context_writers_and_auth
         defaults = launcher._skyrl_config_sections(
             replace(parsed, **absent), authored_parameters, SimpleNamespace(gpus_per_node=8)
         )
+        defaults["terminal_bench"] = defaults.pop("terminal_bench_config")
         for path in FILL_WHEN_UNSET:
             assert get_path(defaults, path) not in (MISSING, None)
     assert outcomes[0]["data"]["terminal_bench_data"] != outcomes[1]["data"]["terminal_bench_data"]
