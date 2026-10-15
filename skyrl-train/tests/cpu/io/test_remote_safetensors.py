@@ -285,7 +285,6 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         expert_keys = [f"model.layers.0.mlp.experts.{expert}.down_proj.weight" for expert in (2, 0, 1)]
         experts = store.load_tensors(expert_keys)
         for key in expert_keys:
-            assert isinstance(experts[key], torch.Tensor)
             torch.testing.assert_close(experts[key], tensors[key], rtol=0, atol=0)
     unrequested = tensors["unrequested.weight"]
     expected_bytes = (
