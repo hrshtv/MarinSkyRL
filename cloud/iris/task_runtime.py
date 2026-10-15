@@ -1872,15 +1872,15 @@ def run_head(
         rewrite_limiter = RateLimiter(RENDEZVOUS_REFRESH_INTERVAL)
         write_rendezvous(args.rendezvous_dir, head_ip, ray_port, gang_epoch)
         rewrite_limiter.mark_run()
+        def refresh_rendezvous():
+            if rewrite_limiter.should_run():
+                write_rendezvous(args.rendezvous_dir, head_ip, ray_port, gang_epoch)
+
         wait_for_nodes(
             ray_address,
             num_tasks,
             args.cluster_join_timeout,
-            rewrite_cb=lambda: (
-                write_rendezvous(args.rendezvous_dir, head_ip, ray_port, gang_epoch)
-                if rewrite_limiter.should_run()
-                else None
-            ),
+            rewrite_cb=refresh_rendezvous,
         )
     else:
         _log("Single-node slice: skipping rendezvous and multi-node wait.")

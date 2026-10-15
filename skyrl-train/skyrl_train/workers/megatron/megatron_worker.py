@@ -120,56 +120,55 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
         """
-        with Timer("megatron/init_configs"):
-            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=model_revision)
-            validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path,
-                trust_remote_code=True,
-                revision=tokenizer_revision,
-            )
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=model_revision)
+        validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            revision=tokenizer_revision,
+        )
 
-            override_config_kwargs = {
-                "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
-                "pad_token_id": tokenizer.pad_token_id,
-            }
-            override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
-            update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
+        override_config_kwargs = {
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
+        update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
 
-            # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
-            transformer_config_kwargs = OmegaConf.to_container(transformer_config_kwargs, resolve=True)
-            transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
+        # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
+        transformer_config_kwargs = OmegaConf.to_container(transformer_config_kwargs, resolve=True)
+        transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
 
-            if not self.cfg.trainer.gradient_checkpointing:
-                for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
-                    transformer_config_kwargs[key] = None
+        if not self.cfg.trainer.gradient_checkpointing:
+            for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
+                transformer_config_kwargs[key] = None
 
-            bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
-            self.remote_hf_state = None
-            if model_source_uri:
-                self.remote_hf_state = install_remote_hf_state(bridge, model_source_uri, model_path)
-            provider = bridge.to_megatron_provider()
-            configure_bridge_provider(
-                provider,
-                tensor_model_parallel_size=megatron_config.tensor_model_parallel_size,
-                pipeline_model_parallel_size=megatron_config.pipeline_model_parallel_size,
-                context_parallel_size=megatron_config.context_parallel_size,
-                expert_model_parallel_size=megatron_config.expert_model_parallel_size,
-                expert_tensor_parallel_size=megatron_config.expert_tensor_parallel_size,
-                bf16=bf16,
-                attention_backend="flash" if flash_attn else "fused",
-            )
+        bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
+        self.remote_hf_state = None
+        if model_source_uri:
+            self.remote_hf_state = install_remote_hf_state(bridge, model_source_uri, model_path)
+        provider = bridge.to_megatron_provider()
+        configure_bridge_provider(
+            provider,
+            tensor_model_parallel_size=megatron_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=megatron_config.pipeline_model_parallel_size,
+            context_parallel_size=megatron_config.context_parallel_size,
+            expert_model_parallel_size=megatron_config.expert_model_parallel_size,
+            expert_tensor_parallel_size=megatron_config.expert_tensor_parallel_size,
+            bf16=bf16,
+            attention_backend="flash" if flash_attn else "fused",
+        )
 
-            for k, v in transformer_config_kwargs.items():
-                setattr(provider, k, v)
-            provider.finalize()
+        for k, v in transformer_config_kwargs.items():
+            setattr(provider, k, v)
+        provider.finalize()
 
-            self.provider = provider
-            self.bridge = bridge
+        self.provider = provider
+        self.bridge = bridge
 
-            self.strategy.hf_config = hf_config
-            self.tokenizer = tokenizer
+        self.strategy.hf_config = hf_config
+        self.tokenizer = tokenizer
 
     def make_megatron_module(
         self,
@@ -182,18 +181,17 @@ class MegatronWorker:
         """
         from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
-        with Timer("megatron/make_megatron_module"):
-            default_ddp_config = DistributedDataParallelConfig()
-            if wrap_with_ddp:
-                default_ddp_config.use_distributed_optimizer = True
-            if ddp_config is not None:
-                for k, v in ddp_config.items():
-                    setattr(default_ddp_config, k, v)
-            model = self.provider.provide_distributed_model(
-                ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
-            )
-            install_dpo_batch_major_output_projection(model, self.provider, self.cfg.trainer.algorithm.policy_loss_type)
-            return model
+        default_ddp_config = DistributedDataParallelConfig()
+        if wrap_with_ddp:
+            default_ddp_config.use_distributed_optimizer = True
+        if ddp_config is not None:
+            for k, v in ddp_config.items():
+                setattr(default_ddp_config, k, v)
+        model = self.provider.provide_distributed_model(
+            ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
+        )
+        install_dpo_batch_major_output_projection(model, self.provider, self.cfg.trainer.algorithm.policy_loss_type)
+        return model
 
     def forward(self, data, *, probe_micro_batch_size: int | None = None):
         """
@@ -466,11 +464,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             ddp_config["use_distributed_optimizer"] = False
             ddp_config["overlap_param_gather"] = False
 
-        self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=for_training,
-            ddp_config=ddp_config,
-            bf16=self.cfg.trainer.bf16,
-        )
+        with Timer("megatron/make_megatron_module"):
+            self.actor_module = self.make_megatron_module(
+                wrap_with_ddp=for_training,
+                ddp_config=ddp_config,
+                bf16=self.cfg.trainer.bf16,
+            )
 
         self._download_hf_snapshot_if_needed(model_path, self.cfg.trainer.policy.model)
         torch.distributed.barrier()
@@ -500,12 +499,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.profiler = Profiler(self.cfg.trainer.policy.megatron_config.torch_profiler_config)
 
         # create optimizer
-        with Timer("megatron/optimizer"):
-            self.optimizer = get_megatron_optimizer(
-                self.actor_module,
-                self.cfg.trainer.policy.optimizer_config,
-                self.cfg.trainer.policy.megatron_config.optimizer_config_kwargs,
-            )
+        self.optimizer = get_megatron_optimizer(
+            self.actor_module,
+            self.cfg.trainer.policy.optimizer_config,
+            self.cfg.trainer.policy.megatron_config.optimizer_config_kwargs,
+        )
 
         self._normalize_mini_batch_size()
 
@@ -971,11 +969,12 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             tokenizer_revision=self.cfg.trainer.ref.model.get("tokenizer_revision"),
         )
 
-        self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=False,
-            ddp_config=None,
-            bf16=self.cfg.trainer.bf16,
-        )
+        with Timer("megatron/make_megatron_module"):
+            self.actor_module = self.make_megatron_module(
+                wrap_with_ddp=False,
+                ddp_config=None,
+                bf16=self.cfg.trainer.bf16,
+            )
 
         self._download_hf_snapshot_if_needed(model_path, self.cfg.trainer.ref.model)
         torch.distributed.barrier()

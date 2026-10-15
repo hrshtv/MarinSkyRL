@@ -657,6 +657,9 @@ class BasePPOExp:
         try:
             with Timer("policy/build_models", self.startup_timings):
                 trainer.build_models(PolicyWorker, CriticWorker, RefWorker, policy_pg=self.policy_pg)
+            self.startup_timings.update(
+                {f"policy/{name}": duration for name, duration in trainer.policy_model.startup_timings.items()}
+            )
             trainer.all_startup_timings.update(self.startup_timings)
             logger.info(
                 "Policy workers ready: strategy={} count={}",
@@ -706,7 +709,11 @@ class BasePPOExp:
         # See agent_logs/2026-05-29_skyrl_uvloop_integration_and_robustness_research.md
         asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
-        with self.get_tracker() as tracker:
+        from skyrl_train.utils.utils import Timer  # noqa: PLC0415
+
+        with Timer("driver/tracker", self.startup_timings):
+            tracker_context = self.get_tracker()
+        with tracker_context as tracker:
             trainer = None
             try:
                 trainer = self._setup_trainer(tracker)
