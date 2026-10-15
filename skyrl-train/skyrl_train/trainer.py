@@ -299,8 +299,8 @@ def discard_model_actors(models) -> None:
 
 def build_models(
     cfg, tokenizer, train_dataset, PolicyWorker, CriticWorker, RefWorker, *, colocate_pg=None, policy_pg=None
-):
-    """Build policy, critic and reference actors before constructing their trainer."""
+) -> tuple[PPORayActorGroup, PPORayActorGroup | None, PPORayActorGroup | None]:
+    """Return policy, critic and reference actors before constructing their trainer."""
     _, total_training_steps = _training_schedule(cfg, len(train_dataset))
     policy_model = critic_model = ref_model = None
     try:
