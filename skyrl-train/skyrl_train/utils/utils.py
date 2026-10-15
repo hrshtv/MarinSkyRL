@@ -23,7 +23,7 @@ from skyrl_train.config.query_bias import resolve_grug_query_bias_update
 from skyrl_train.config.weight_sync_pause import resolve_weight_sync_pause_policy
 from skyrl_train.config.behavior_logprobs import configure_behavior_logprob_sampling
 from skyrl_train.config.mismatch_probe import validate_mismatch_probe_config
-from skyrl_train.config.numerics import validate_numerics_config
+from skyrl_train.config.numerics import exactness_check_config, validate_numerics_config
 from skyrl_train.config.objective_spec import rollout_logprobs_required, validate_objective
 from skyrl_train.debug_mode import apply_debug_mode
 from skyrl_train.trajectory_runners.trajectory_reward_shaping import parse_trajectory_reward_shaping_config
@@ -569,8 +569,12 @@ def validate_cfg(cfg: DictConfig):
 
     cfg.trainer.algorithm = algorithm_config
 
-    behavior_logprobs_required = rollout_logprobs_required(cfg.trainer.algorithm, loss_spec=spec) or bool(
-        cfg.trainer.mismatch_probe.get("enabled", False)
+    # The exactness check compares the engines' log-probabilities with the trainer's, so they must be the processed
+    # ones the trainer computes.
+    behavior_logprobs_required = (
+        rollout_logprobs_required(cfg.trainer.algorithm, loss_spec=spec)
+        or bool(cfg.trainer.mismatch_probe.get("enabled", False))
+        or exactness_check_config(cfg).enabled
     )
     if behavior_logprobs_required:
         if cfg.generator.sampling_params.logprobs is None:
