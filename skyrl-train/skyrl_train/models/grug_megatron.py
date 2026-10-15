@@ -353,7 +353,19 @@ class GrugGPTModel(GPTModel):
         if not apply_embed_norm:
             return outputs
         decoder_input, *rest = outputs
-        return (self.embed_norm(decoder_input), *rest)
+        # Decoder recomputation leaves this first-stage norm outside its boundary.
+        # A grad-bearing input is required by Megatron's reentrant checkpoint;
+        # frozen embeddings must still produce gradients for the norm weights.
+        if (
+            self.config.recompute_granularity == "full"
+            and self.training
+            and torch.is_grad_enabled()
+            and decoder_input.requires_grad
+        ):
+            normalized = tensor_parallel.checkpoint(self.embed_norm, False, decoder_input)
+        else:
+            normalized = self.embed_norm(decoder_input)
+        return (normalized, *rest)
 
 
 class GrugShortConv(nn.Module):
