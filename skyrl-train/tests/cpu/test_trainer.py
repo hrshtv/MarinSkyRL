@@ -14,7 +14,8 @@ import numpy as np
 from omegaconf import OmegaConf
 
 import skyrl_train.trainer as trainer_module
-from skyrl_train.callbacks.base import TrainerControl
+from skyrl_train.callbacks.base import CallbackHandler, TrainerControl
+from skyrl_train.callbacks.builtin import CheckpointCallback
 from skyrl_train.config.utils import get_default_config
 from marinskyrl.distillation import compile_distillation_plan_from_config
 from skyrl_train.distillation import ChosenTokenTeacherInput, TeacherTopKInput, TopKTeacherEvidence
@@ -362,6 +363,36 @@ def test_load_checkpoints_probes_cloud_resume_uri_without_trailing_slash(dummy_c
         trainer.load_checkpoints()
 
     assert probed == ["s3://marin-us-east-02a/iris/test/checkpoints/global_step_12"]
+
+
+@pytest.mark.parametrize("partial_step", [26, 27])
+def test_latest_checkpoint_uses_callback_save_interval(dummy_config, tmp_path, monkeypatch, partial_step):
+    checkpoint_path = tmp_path / "global_step_13"
+    (checkpoint_path / trainer_module.POLICY_CHECKPOINT_SUBDIRECTORY).mkdir(parents=True)
+    torch.save({"global_step": 13}, checkpoint_path / trainer_module.TRAINER_STATE_FILENAME)
+    (tmp_path / f"global_step_{partial_step}").mkdir()
+    (tmp_path / trainer_module.LATEST_CHECKPOINT_FILE).write_text("13")
+    dummy_config.trainer.ckpt_path = str(tmp_path)
+    dummy_config.trainer.ckpt_interval = 5
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.resume_mode = ResumeMode.LATEST
+    trainer.callback_handler = CallbackHandler([CheckpointCallback(save_steps=13)])
+    trainer.colocate_all = False
+    trainer.all_startup_timings = {}
+    trainer.policy_model = _CheckpointResidencyPolicyGroup()
+    trainer.critic_model = None
+    trainer._domain_balancer = None
+    monkeypatch.setattr(trainer_module.ray, "get", lambda refs: refs)
+
+    if partial_step == 27:
+        with pytest.raises(ValueError, match="Inconsistent checkpoint folder"):
+            trainer.load_checkpoints()
+        assert trainer.policy_model.restored_dirs == []
+    else:
+        assert trainer.load_checkpoints() == (13, str(checkpoint_path))
+        assert trainer.policy_model.restored_dirs == [str(checkpoint_path / "policy")]
 
 
 def test_load_checkpoints_offloads_disaggregated_optimizer_before_policy_restore(dummy_config, tmp_path, monkeypatch):

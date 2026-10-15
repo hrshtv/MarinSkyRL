@@ -1192,7 +1192,11 @@ class RayPPOTrainer:
         if reason != "evaluation":
             self._sampler_refresh_step = self.global_step
             self._sampler_checkpoint_path = (
-                os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{self.global_step}", "policy")
+                join_resource_path(
+                    self.cfg.trainer.ckpt_path,
+                    f"{GLOBAL_STEP_PREFIX}{self.global_step}",
+                    POLICY_CHECKPOINT_SUBDIRECTORY,
+                )
                 if period > 1 and self.global_step > 0
                 else None
             )
@@ -1309,7 +1313,7 @@ class RayPPOTrainer:
                 raise ValueError("initial sampler policy must use the configured original model")
             return
         if state.checkpoint_path is None or not io.exists(
-            os.path.join(os.path.dirname(state.checkpoint_path), TRAINER_STATE_FILENAME)
+            join_resource_path(os.path.dirname(state.checkpoint_path), TRAINER_STATE_FILENAME)
         ):
             raise ValueError("checkpoint is missing its committed frozen sampler policy")
         if state.completed_updates == self.global_step:
@@ -1330,7 +1334,7 @@ class RayPPOTrainer:
                     self.policy_model.async_run_ray_method(
                         "pass_through",
                         "load_checkpoint",
-                        ckpt_dir=os.path.join(learner_checkpoint_path, "policy"),
+                        ckpt_dir=join_resource_path(learner_checkpoint_path, POLICY_CHECKPOINT_SUBDIRECTORY),
                         load_training_state=False,
                     )
                 )
@@ -3251,7 +3255,14 @@ class RayPPOTrainer:
                 ckpt_iteration,
                 checkpoint_path,
                 latest_checkpoint_file,
-                self.cfg.trainer.ckpt_interval,
+                max(
+                    (
+                        callback.save_steps
+                        for callback in self.callback_handler.callbacks
+                        if isinstance(callback, CheckpointCallback) and callback.save_steps > 0
+                    ),
+                    default=0,
+                ),
             )
         else:
             # Get and validate resume path
