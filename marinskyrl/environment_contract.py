@@ -117,21 +117,21 @@ ENV_VAR_SPECS = (
     # isolated grading child, using the benchmark's existing provider settings.
     EnvVarSpec(
         "VERIFYIT_JUDGE_BASE_URL",
-        "environment.skyrl_gym.nemotron_ultra.judges",
+        "environment.task_sessions.nemotron_ultra.judges",
         EnvVarSource.EXTERNAL,
         frozenset({EnvVarScope.TASK_RUNTIME}),
         frozenset({EnvVarWriter.PYTHON_ASSIGNMENT}),
     ),
     EnvVarSpec(
         "VERIFYIT_JUDGE_MODEL",
-        "environment.skyrl_gym.nemotron_ultra.judges",
+        "environment.task_sessions.nemotron_ultra.judges",
         EnvVarSource.EXTERNAL,
         frozenset({EnvVarScope.TASK_RUNTIME}),
         frozenset({EnvVarWriter.PYTHON_ASSIGNMENT}),
     ),
     EnvVarSpec(
         "VERIFYIT_JUDGE_API_KEY",
-        "environment.skyrl_gym.nemotron_ultra.judges",
+        "environment.task_sessions.nemotron_ultra.judges",
         EnvVarSource.SECRET,
         frozenset({EnvVarScope.TASK_RUNTIME}),
         frozenset({EnvVarWriter.PYTHON_ASSIGNMENT}),
@@ -313,6 +313,8 @@ _BUILD_BOUNDARY_WRITERS = frozenset({EnvVarWriter.SHELL_EXPORT, EnvVarWriter.DOC
 # process, task, container, or build boundaries, but they are not training controls.
 _SECRET_BOUNDARIES = {
     "DAYTONA_API_KEY",
+    "DAYTONA_RL_API_KEY",
+    "DAYTONA_EVAL_API_KEY",
     "KUBECONFIG",
     "MLFLOW_TRACKING_TOKEN",
     "WANDB_API_KEY",
@@ -357,8 +359,6 @@ _RUNTIME_BOUNDARIES = {
     "DATA_DIR",
     "FSSPEC_S3",
     "GLOO_SOCKET_IFNAME",
-    "HARBOR_DISTRIBUTED_CONTAINERS",
-    "HARBOR_MODEL_ENDPOINT",
     "HF_HUB_DOWNLOAD_TIMEOUT",
     "HF_HUB_OFFLINE",
     "LD_LIBRARY_PATH",
@@ -378,7 +378,7 @@ _RUNTIME_BOUNDARIES = {
     "NUM_INFERENCE_ENGINES",
     "NVTE_FUSED_ATTN",
     "OMP_NUM_THREADS",
-    "OTAGENT_LITERAL_LOG_PATH",
+    "OPENBLAS_NUM_THREADS",
     "OT_AGENT_IRIS_RAY_PORT",
     "OT_AGENT_IRIS_RENDEZVOUS_DIR",
     "POLICY_NUM_NODES",

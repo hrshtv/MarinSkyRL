@@ -1,6 +1,5 @@
 import asyncio
 import copy
-import importlib.util
 import os
 from collections import defaultdict
 from datetime import timedelta
@@ -15,11 +14,12 @@ import torch.distributed
 from huggingface_hub import snapshot_download
 from loguru import logger
 from megatron.bridge import AutoBridge
-from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from omegaconf import OmegaConf
 from skyrl_train.distributed.dispatch import MeshRank
+from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
 from skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
@@ -30,7 +30,6 @@ from skyrl_train.distributed.megatron.megatron_utils import (
 from skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
-    init_megatron_optim_config,
 )
 from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state, make_prefetch_hook
 from skyrl_train.distributed.utils import init_worker_process_group_with_device
@@ -61,7 +60,9 @@ from skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronModelWrapper,
     MegatronPolicyMicroBatch,
 )
+from skyrl_train.workers.megatron.bridge_provider_config import configure_bridge_provider
 from skyrl_train.workers.megatron.router_replay_install import install_megatron_router_replay
+from skyrl_train.workers.megatron.output_projection_layout import install_dpo_batch_major_output_projection
 from skyrl_train.workers.megatron.weight_extractor import BucketedMegatronWeightExtractor, mapping_hf_names
 from skyrl_train.workers.worker import (
     CriticWorkerBase,
@@ -120,6 +121,7 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
         """
+<<<<<<< HEAD
         if remote_read_mode not in ("per_key", "prefetch"):
             raise ValueError(f"remote_read_mode must be per_key or prefetch; got {remote_read_mode!r}")
         with Timer("megatron/init_configs"):
@@ -130,23 +132,33 @@ class MegatronWorker:
                 trust_remote_code=True,
                 revision=tokenizer_revision,
             )
+=======
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=model_revision)
+        validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            revision=tokenizer_revision,
+        )
+>>>>>>> atqamar/startup-quick-fixes
 
-            override_config_kwargs = {
-                "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
-                "pad_token_id": tokenizer.pad_token_id,
-            }
-            override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
-            update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
+        override_config_kwargs = {
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
+        update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
 
-            # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
-            transformer_config_kwargs = OmegaConf.to_container(transformer_config_kwargs, resolve=True)
-            transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
+        # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
+        transformer_config_kwargs = OmegaConf.to_container(transformer_config_kwargs, resolve=True)
+        transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
 
-            if not self.cfg.trainer.gradient_checkpointing:
-                for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
-                    transformer_config_kwargs[key] = None
+        if not self.cfg.trainer.gradient_checkpointing:
+            for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
+                transformer_config_kwargs[key] = None
 
+<<<<<<< HEAD
             bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
             self.remote_hf_state = None
             if model_source_uri:
@@ -170,16 +182,33 @@ class MegatronWorker:
             provider.gradient_accumulation_fusion = (
                 importlib.util.find_spec("fused_weight_gradient_mlp_cuda") is not None
             )
+=======
+        bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
+        self.remote_hf_state = None
+        if model_source_uri:
+            self.remote_hf_state = install_remote_hf_state(bridge, model_source_uri, model_path)
+        provider = bridge.to_megatron_provider()
+        configure_bridge_provider(
+            provider,
+            tensor_model_parallel_size=megatron_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=megatron_config.pipeline_model_parallel_size,
+            context_parallel_size=megatron_config.context_parallel_size,
+            expert_model_parallel_size=megatron_config.expert_model_parallel_size,
+            expert_tensor_parallel_size=megatron_config.expert_tensor_parallel_size,
+            bf16=bf16,
+            attention_backend="flash" if flash_attn else "fused",
+        )
+>>>>>>> atqamar/startup-quick-fixes
 
-            for k, v in transformer_config_kwargs.items():
-                setattr(provider, k, v)
-            provider.finalize()
+        for k, v in transformer_config_kwargs.items():
+            setattr(provider, k, v)
+        provider.finalize()
 
-            self.provider = provider
-            self.bridge = bridge
+        self.provider = provider
+        self.bridge = bridge
 
-            self.strategy.hf_config = hf_config
-            self.tokenizer = tokenizer
+        self.strategy.hf_config = hf_config
+        self.tokenizer = tokenizer
 
     def make_megatron_module(
         self,
@@ -192,17 +221,17 @@ class MegatronWorker:
         """
         from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
-        with Timer("megatron/make_megatron_module"):
-            default_ddp_config = DistributedDataParallelConfig()
-            if wrap_with_ddp:
-                default_ddp_config.use_distributed_optimizer = True
-            if ddp_config is not None:
-                for k, v in ddp_config.items():
-                    setattr(default_ddp_config, k, v)
-            model = self.provider.provide_distributed_model(
-                ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
-            )
-            return model
+        default_ddp_config = DistributedDataParallelConfig()
+        if wrap_with_ddp:
+            default_ddp_config.use_distributed_optimizer = True
+        if ddp_config is not None:
+            for k, v in ddp_config.items():
+                setattr(default_ddp_config, k, v)
+        model = self.provider.provide_distributed_model(
+            ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
+        )
+        install_dpo_batch_major_output_projection(model, self.provider, self.cfg.trainer.algorithm.policy_loss_type)
+        return model
 
     def forward(self, data, *, probe_micro_batch_size: int | None = None):
         """
@@ -468,11 +497,20 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             tokenizer_revision=self.cfg.trainer.policy.model.get("tokenizer_revision"),
         )
 
-        self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=for_training,
-            ddp_config=self.cfg.trainer.policy.megatron_config.ddp_config if for_training else None,
-            bf16=self.cfg.trainer.bf16,
-        )
+        ddp_config = self.cfg.trainer.policy.megatron_config.ddp_config if for_training else None
+        if for_training and str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() == "muonh":
+            ddp_config = dict(ddp_config)
+            if ddp_config.get("use_distributed_optimizer", False):
+                raise ValueError("Hero MuonH needs unsharded Megatron DDP gradient buffers")
+            ddp_config["use_distributed_optimizer"] = False
+            ddp_config["overlap_param_gather"] = False
+
+        with Timer("megatron/make_megatron_module"):
+            self.actor_module = self.make_megatron_module(
+                wrap_with_ddp=for_training,
+                ddp_config=ddp_config,
+                bf16=self.cfg.trainer.bf16,
+            )
 
         self._download_hf_snapshot_if_needed(model_path, self.cfg.trainer.policy.model)
         torch.distributed.barrier()
@@ -507,12 +545,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.profiler = Profiler(self.cfg.trainer.policy.megatron_config.torch_profiler_config)
 
         # create optimizer
-        with Timer("megatron/optimizer"):
-            optim_config = init_megatron_optim_config(
-                self.cfg.trainer.policy.optimizer_config,
-                self.cfg.trainer.policy.megatron_config.optimizer_config_kwargs,
-            )
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+        self.optimizer = get_megatron_optimizer(
+            self.actor_module,
+            self.cfg.trainer.policy.optimizer_config,
+            self.cfg.trainer.policy.megatron_config.optimizer_config_kwargs,
+        )
 
         self._normalize_mini_batch_size()
 
@@ -618,6 +655,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         distillation=experience.distillation,
                         ftpo=experience.ftpo,
                         rollout_routed_experts=experience.rollout_routed_experts,
+                        pair_roles=experience.pair_roles,
                     )
                 )
 
@@ -842,6 +880,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         torch.cuda.empty_cache()
         torch.distributed.barrier()
 
+    def grug_optimizer_route_snapshot(self):
+        """Return this rank and the optimizer route for each named parameter."""
+        if str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() != "muonh":
+            raise ValueError("Optimizer route snapshot requires Hero MuonH")
+        names = {id(parameter): name for chunk in self.actor_module for name, parameter in chunk.named_parameters()}
+        optimizers = (
+            self.optimizer.chained_optimizers if isinstance(self.optimizer, ChainedOptimizer) else [self.optimizer]
+        )
+        routes = {}
+        for wrapped in optimizers:
+            default_route = "grug_muonh" if isinstance(wrapped.optimizer, MegatronGrugMuonH) else "adam"
+            for index, group in enumerate(wrapped.optimizer.param_groups):
+                route = group.get("optimizer", default_route)
+                for parameter in (*wrapped.float16_groups[index], *wrapped.fp32_from_fp32_groups[index]):
+                    routes[names[id(parameter)]] = route
+        return {"rank": torch.distributed.get_rank(), "routes": routes}
+
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights in HF layout, gathered on rank 0.
 
@@ -961,6 +1016,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             tokenizer_revision=self.cfg.trainer.ref.model.get("tokenizer_revision"),
         )
 
+<<<<<<< HEAD
         self.actor_module = self.make_megatron_module(
             wrap_with_ddp=False,
             ddp_config=None,
@@ -968,6 +1024,14 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         )
         if self.remote_hf_state is not None:
             self.remote_hf_state.store.close()
+=======
+        with Timer("megatron/make_megatron_module"):
+            self.actor_module = self.make_megatron_module(
+                wrap_with_ddp=False,
+                ddp_config=None,
+                bf16=self.cfg.trainer.bf16,
+            )
+>>>>>>> atqamar/startup-quick-fixes
 
         self._download_hf_snapshot_if_needed(model_path, self.cfg.trainer.ref.model)
         torch.distributed.barrier()

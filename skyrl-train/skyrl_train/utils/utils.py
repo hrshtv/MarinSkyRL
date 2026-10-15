@@ -19,16 +19,13 @@ from ray.util.placement_group import (
 )
 
 from skyrl_train.batch_invariant import BATCH_INVARIANT_NCCL_ENV
-from skyrl_train.config.callbacks import has_explicit_callbacks, interval_hf_export_enabled
+from skyrl_train.config.callbacks import validate_hf_export_config
+from skyrl_train.config.utils import generation_context_limit
 from skyrl_train.config.query_bias import resolve_grug_query_bias_update
 from skyrl_train.config.weight_sync_pause import resolve_weight_sync_pause_policy
 from skyrl_train.config.behavior_logprobs import configure_behavior_logprob_sampling
 from skyrl_train.config.mismatch_probe import validate_mismatch_probe_config
 from skyrl_train.config.objective_spec import rollout_logprobs_required, validate_objective
-from skyrl_train.callbacks.types import (
-    CHECKPOINT_CALLBACK_TYPE,
-    HF_MODEL_SAVE_CALLBACK_TYPE,
-)
 from skyrl_train.debug_mode import apply_debug_mode
 from skyrl_train.trajectory_runners.trajectory_reward_shaping import parse_trajectory_reward_shaping_config
 from skyrl_train.trajectory_runners.trajectory_retention_config import parse_trajectory_retention_config
@@ -449,35 +446,6 @@ def _iter_config_kwargs(node):
             yield (key,), value
 
 
-def validate_hf_export_config(cfg: DictConfig) -> None:
-    """Validate checkpoint and model-save callback interval alignment."""
-    callbacks = cfg.trainer.get("callbacks")
-    if has_explicit_callbacks(cfg):
-
-        def callback_intervals(callback_type: str) -> list[int]:
-            return [
-                int(callback.get("save_steps", -1))
-                for callback in callbacks
-                if callback.get("type") == callback_type and int(callback.get("save_steps", -1)) > 0
-            ]
-
-        checkpoint_intervals = callback_intervals(CHECKPOINT_CALLBACK_TYPE)
-        export_intervals = callback_intervals(HF_MODEL_SAVE_CALLBACK_TYPE)
-    else:
-        checkpoint_interval = int(cfg.trainer.get("ckpt_interval", -1))
-        checkpoint_intervals = [checkpoint_interval] if checkpoint_interval > 0 else []
-        export_intervals = [int(cfg.trainer.hf_save_interval)] if interval_hf_export_enabled(cfg) else []
-
-    for export_interval in export_intervals:
-        if not checkpoint_intervals or not any(
-            export_interval % checkpoint_interval == 0 for checkpoint_interval in checkpoint_intervals
-        ):
-            raise ValueError(
-                f"HF export interval {export_interval} must be a multiple of trainer.ckpt_interval "
-                f"or an explicit checkpoint callback interval; found {checkpoint_intervals or 'none'}"
-            )
-
-
 def validate_cfg(cfg: DictConfig):
     validate_mismatch_probe_config(cfg)
     if cfg.trainer.strategy != "megatron":
@@ -603,11 +571,8 @@ def validate_cfg(cfg: DictConfig):
         minimum_group_size=algorithm_config.group_advantage_min_size,
     )
     algorithm_config.resolved_group_advantage = group_advantage.to_config()
-    # NOTE (erictang000): this is the max sequence length including the prompt, since max response length
-    # per batch can be variable based on the prompt length. This is used to normalize the loss for
-    # seq_mean_token_sum_norm loss reduction. Potentially revisit this if we update to use a
-    # fixed max response budget.
-    algorithm_config.max_seq_len = cfg.generator.max_input_length + cfg.generator.sampling_params.max_generate_length
+    # Sequence-normalized losses use the same bound as model generation.
+    algorithm_config.max_seq_len = generation_context_limit(cfg.generator)
 
     cfg.trainer.algorithm = algorithm_config
 
@@ -737,9 +702,6 @@ def validate_generator_cfg(cfg: DictConfig):
             "Please set `inference_engine_tensor_parallel_size` to 1."
         )
 
-    if cfg.generator.backend == "sglang" and not cfg.generator.use_conversation_multi_turn:
-        raise NotImplementedError("`use_conversation_multi_turn=False` is not supported for SGLang backend")
-
     validate_generation_logprobs(cfg)
 
     validate_megatron_cfg(cfg)
@@ -757,16 +719,6 @@ def validate_generator_cfg(cfg: DictConfig):
                 "supported for SGLang backend since we always set `skip_tokenizer_init` to True. "
                 "If you have to use these parameters, you can switch to vLLM. "
                 "See this issue for more: https://github.com/sgl-project/sglang/issues/9039#issuecomment-3218331087"
-            )
-
-    if cfg.generator.use_conversation_multi_turn:
-        if (
-            cfg.generator.sampling_params.stop is not None or cfg.generator.eval_sampling_params.stop is not None
-        ) and not cfg.generator.append_eos_token_after_stop_str_in_multi_turn:
-            logger.warning(
-                "WARNING: `sampling_params.stop` and `eval_sampling_params.stop` are specified and we "
-                "are using multi-turn generation. You might want to set `append_eos_token_after_stop_str_in_multi_turn` "
-                "to `True` to append tokenizer.eos_token_id to the assistant-generated response to match the chat template."
             )
 
     if cfg.generator.enable_http_endpoint:
@@ -1209,13 +1161,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         logger.info("Exporting mlflow tracking token to ray runtime env")
         env_vars["MLFLOW_TRACKING_TOKEN"] = os.environ["MLFLOW_TRACKING_TOKEN"]
 
-    # Harbor distributed containers mode for HPC multi-node jobs
-    # This enables Harbor to spread container workload across Ray nodes
-    if os.environ.get("HARBOR_DISTRIBUTED_CONTAINERS"):
-        logger.info("Exporting HARBOR_DISTRIBUTED_CONTAINERS to ray runtime env")
-        env_vars["HARBOR_DISTRIBUTED_CONTAINERS"] = os.environ["HARBOR_DISTRIBUTED_CONTAINERS"]
-
-    # RAY_ADDRESS is needed by Harbor's distributed pool to connect to the cluster
     if os.environ.get("RAY_ADDRESS"):
         logger.info("Exporting RAY_ADDRESS to ray runtime env")
         env_vars["RAY_ADDRESS"] = os.environ["RAY_ADDRESS"]
