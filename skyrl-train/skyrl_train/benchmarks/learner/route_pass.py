@@ -13,6 +13,11 @@ per-KV-slot buffer; the single sampled token is never forwarded, so it adds no r
 carries that ``[R + 1, layers, top_k]`` array as a base64 ``.npy`` string, and this module drops its last row
 (the final response token).
 
+Weights: ``--model`` is a local Hugging Face directory holding at least the model config. With
+``--model-source-uri`` the weights are streamed from that object-store copy with vLLM's RunAI loader, as the
+trainer's rollout engines do, and ``--model`` supplies only metadata. The tokenizer is named separately because
+exported checkpoints may not carry one.
+
 GPU layout: the CLI starts one TP=1, EP=DP vLLM engine per ``--data-parallel-size`` GPUs through
 ``create_ray_wrapped_inference_engines`` (the same factory the trainer and local teachers use) and needs a
 running Ray cluster with that many GPUs. Hero BF16 serving needs about 32 H100s or 16 GB200s.
@@ -39,12 +44,16 @@ from skyrl_train.benchmarks.learner.batch_artifact import (
 )
 from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.inference_engines.base import InferenceEngineInterface
-from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
+from skyrl_train.inference_engines.ray_wrapped_inference_engine import (
+    MODEL_METADATA_PATH_KEY,
+    create_ray_wrapped_inference_engines,
+)
 from skyrl_train.inference_engines.vllm_teacher_oracle import close_owned_inference_engine
 from skyrl_train.io import io
 from skyrl_train.tokenizer import create_tokenizer
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.trajectory_runners.routed_experts import decode_routed_experts
+from marinskyrl.speculative_decoding import runai_model_uri
 
 logger = logging.getLogger(__name__)
 
@@ -252,10 +261,19 @@ def num_experts_from_config(model: str, revision: str | None) -> int:
 
 @dataclass(frozen=True)
 class RouteEngineConfig:
-    """vLLM geometry and limits for the routing pass."""
+    """vLLM geometry and limits for the routing pass.
+
+    Attributes:
+        model: Local model directory or HF id; with ``model_source_uri`` only its config is read.
+        model_source_uri: Object-store copy of the weights to stream with the RunAI loader, or ``None`` to load
+            ``model`` directly.
+    """
 
     model: str
     revision: str | None
+    model_source_uri: str | None
+    tokenizer: str
+    tokenizer_revision: str | None
     num_engines: int
     data_parallel_size: int
     max_model_len: int
@@ -270,22 +288,31 @@ class RouteEngineConfig:
 
 def create_route_engines(config: RouteEngineConfig) -> list[InferenceEngineInterface]:
     """Start TP=1, EP=DP vLLM engines with routed-expert capture; returns one handle per DP rank."""
-    tokenizer = create_tokenizer(config.model, disable_fast_tokenizer=False, revision=config.revision)
+    tokenizer = create_tokenizer(config.tokenizer, disable_fast_tokenizer=False, revision=config.tokenizer_revision)
     engine_init_kwargs = {
         **config.engine_init_kwargs,
         "enable_return_routed_experts": True,
         "max_model_len": config.max_model_len,
         "served_model_name": config.model,
+        "tokenizer": config.tokenizer,
     }
+    if config.tokenizer_revision is not None:
+        engine_init_kwargs["tokenizer_revision"] = config.tokenizer_revision
     if config.revision is not None:
         engine_init_kwargs["revision"] = config.revision
+    pretrain = config.model
+    if config.model_source_uri is not None:
+        pretrain = runai_model_uri(config.model_source_uri)
+        engine_init_kwargs["load_format"] = "runai_streamer"
+        engine_init_kwargs["model_loader_extra_config"] = {"distributed": True}
+        engine_init_kwargs[MODEL_METADATA_PATH_KEY] = config.model
     return create_ray_wrapped_inference_engines(
         num_inference_engines=config.num_engines,
         tensor_parallel_size=1,
         data_parallel_size=config.data_parallel_size,
         expert_parallel_size=config.data_parallel_size,
         model_dtype="bfloat16",
-        pretrain=config.model,
+        pretrain=pretrain,
         seed=0,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=config.enable_prefix_caching,
@@ -338,8 +365,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ensemble-root", required=True)
     parser.add_argument("--ensemble-version", required=True)
-    parser.add_argument("--model", required=True, help="HF checkpoint path or id served by vLLM")
+    parser.add_argument(
+        "--model", required=True, help="HF checkpoint path or id; only its config with --model-source-uri"
+    )
     parser.add_argument("--revision", default=None)
+    parser.add_argument("--model-source-uri", default=None, help="s3:// or gs:// weights streamed with RunAI")
+    parser.add_argument("--tokenizer", required=True, help="HF tokenizer id or path")
+    parser.add_argument("--tokenizer-revision", default=None)
     parser.add_argument("--checkpoint-id", required=True, help="name of the routes file written per batch")
     parser.add_argument("--num-engines", type=int, default=1)
     parser.add_argument("--data-parallel-size", type=int, required=True, help="GPUs per engine; EP = DP, TP = 1")
@@ -361,6 +393,9 @@ def main() -> None:
     config = RouteEngineConfig(
         model=args.model,
         revision=args.revision,
+        model_source_uri=args.model_source_uri,
+        tokenizer=args.tokenizer,
+        tokenizer_revision=args.tokenizer_revision,
         num_engines=args.num_engines,
         data_parallel_size=args.data_parallel_size,
         max_model_len=args.max_model_len,
