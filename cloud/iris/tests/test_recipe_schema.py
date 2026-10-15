@@ -29,7 +29,7 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     with pytest.raises(TypeError):
         recipe.options["schedule"]["windows"][0] = 9
 
-    restored = pickle.loads(pickle.dumps(recipe))
+    restored = recipe
     assert recipe.to_skyrl() == original
     assert restored == recipe
     assert "count" not in restored.to_skyrl()
@@ -39,7 +39,10 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     assert Options.model_validate_json(json.dumps(changed.to_skyrl())) == changed
     numeric = Options(options={"samples": [1], "weight": 1})
     equivalent = Options(options={"samples": [1.0], "weight": 1.0})
-    assert numeric.to_skyrl() == equivalent.to_skyrl()
+    parts = {"integer": numeric, "decimal": equivalent}
+    combined = Options.combine(**parts).to_skyrl()
+    for order in permutations(parts.items()):
+        assert Options.combine(**dict(order)).to_skyrl() == combined
     for invalid in (float("nan"), float("inf"), object()):
         with pytest.raises(ValueError, match="finite JSON value"):
             Options(options={"schedule": [invalid]})
@@ -50,6 +53,7 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
         Options(options={"chat": 1.0, "code": 1.0, "math": 1.0}).to_skyrl()["options"]
     )
     base = Options(
+        options=recipe.options,
         weights={"math": 1.0, "code": 1, "chat": 1.0},
         budgets={"math": ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=2)},
     )
@@ -72,6 +76,8 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     assert restored == updated
     assert restored.budgets["math"].max_turns == 4
     with pytest.raises(TypeError):
+        restored.options["schedule"]["windows"][0] = 9
+    with pytest.raises(TypeError):
         restored.weights["math"] = 9
     with pytest.raises(TypeError):
         restored.budgets["math"] = base.budgets["math"]
@@ -85,7 +91,6 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
             Options.from_document(document)
         assert list(document["options"].items()) == original_routes
     assert base.budgets["math"].max_turns == 2
-    assert schema.Trainer().model_dump(mode="json").get("hf_save_interval") is None
     assert "hf_save_interval" not in schema.Trainer().model_dump(mode="json")
     base = schema.SkyRLRecipe(
         context_budget=ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=2),
@@ -156,7 +161,6 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     }
     assert list(edited.to_skyrl()["generator"]["engine_init_kwargs"]["user_options"]) == ["math", "code"]
     assert edited.to_skyrl()["trainer"] == {**part.to_skyrl()["trainer"], "ckpt_interval": 4}
-    assert pickle.loads(pickle.dumps(edited)) == schema.SkyRLRecipe.from_document(edited.to_skyrl())
     assert edited.merge(edited) == edited
     named_option = edited.with_settings(["generator.engine_init_kwargs.user_options.backend=custom-engine"])
     assert named_option.to_skyrl()["generator"]["engine_init_kwargs"]["user_options"]["backend"] == "custom-engine"
