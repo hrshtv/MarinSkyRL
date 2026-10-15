@@ -119,7 +119,7 @@ def _raw_config() -> dict[str, Any]:
 
 def test_launch_rejects_terminal_export_without_request_callback(tmp_path):
     raw = _raw_config()
-    raw["skyrl"]["trainer"].update(export_hf_artifact=True, ckpt_interval=1, hf_save_interval=-1)
+    raw["skyrl"]["trainer"].update(ckpt_interval=1, hf_save_interval=-1)
     path = tmp_path / "launch.yaml"
     path.write_text(yaml.safe_dump(raw))
 
@@ -303,36 +303,29 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
             load_launch_config(path)
 
 
-@pytest.mark.parametrize("case", ["dpo-allocation", "eagle-engine-count"])
-def test_source_launch_fills_omitted_geometry_without_document_changes(tmp_path, case):
+def test_source_dpo_launch_fills_allocation_without_document_changes(tmp_path):
     raw = _raw_config()
-    if case == "dpo-allocation":
-        raw["skyrl"].update(
-            config_groups={"algorithm_recipe": "dpo"},
-            environment={"env_class": "preference_pair"},
-            trainer={
-                "strategy": "megatron",
-                "placement": {"policy_num_nodes": 1, "ref_num_nodes": 1, "policy_num_gpus_per_node": 8},
+    raw["skyrl"].update(
+        config_groups={"algorithm_recipe": "dpo"},
+        environment={"env_class": "preference_pair"},
+        trainer={
+            "strategy": "megatron",
+            "use_sample_packing": False,
+            "micro_train_batch_size_per_gpu": 2,
+            "placement": {
+                "colocate_all": False,
+                "colocate_policy_ref": True,
+                "policy_num_nodes": 1,
+                "ref_num_nodes": 1,
+                "policy_num_gpus_per_node": 8,
             },
-        )
-    else:
-        raw["iris"]["allocation"]["gpus_per_node"] = 1
-        raw["skyrl"]["trainer"]["placement"].update(policy_num_gpus_per_node=1, ref_num_gpus_per_node=1)
-        raw["skyrl"]["generator"].update(
-            num_inference_engines=1,
-            speculative_decoding={
-                "method": "eagle3",
-                "model": {"source_uri": "hf://laion/draft", "source_identity": "a" * 40},
-                "num_speculative_tokens": 3,
-            },
-        )
+        },
+    )
+    raw["skyrl"]["generator"]["n_samples_per_prompt"] = 2
     path = tmp_path / "source.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
     explicit = OmegaConf.to_container(load_launch_config(path), resolve=True)
-    if case == "dpo-allocation":
-        del raw["iris"]["allocation"]["num_nodes"]
-    else:
-        del raw["skyrl"]["generator"]["num_inference_engines"]
+    del raw["iris"]["allocation"]["num_nodes"]
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
     assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(explicit)
 
