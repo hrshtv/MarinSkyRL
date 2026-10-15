@@ -31,7 +31,9 @@ from skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
 )
-from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state, make_prefetch_hook
+from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state
+from skyrl_train.distributed.megatron.remote_prefetch import make_prefetch_hook
+from skyrl_train.config.remote_read import RemoteReadMode
 from skyrl_train.distributed.utils import init_worker_process_group_with_device
 from skyrl_train.mismatch_probe.modes import TRAINER_MODES
 from skyrl_train.models.grug_moe import GRUG_MOE_MODEL_TYPE, validate_grug_training_strategy
@@ -121,18 +123,6 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
         """
-<<<<<<< HEAD
-        if remote_read_mode not in ("per_key", "prefetch"):
-            raise ValueError(f"remote_read_mode must be per_key or prefetch; got {remote_read_mode!r}")
-        with Timer("megatron/init_configs"):
-            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=model_revision)
-            validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path,
-                trust_remote_code=True,
-                revision=tokenizer_revision,
-            )
-=======
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=model_revision)
         validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
         tokenizer = AutoTokenizer.from_pretrained(
@@ -140,7 +130,6 @@ class MegatronWorker:
             trust_remote_code=True,
             revision=tokenizer_revision,
         )
->>>>>>> atqamar/startup-quick-fixes
 
         override_config_kwargs = {
             "bos_token_id": tokenizer.bos_token_id,
@@ -158,31 +147,6 @@ class MegatronWorker:
             for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
                 transformer_config_kwargs[key] = None
 
-<<<<<<< HEAD
-            bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
-            self.remote_hf_state = None
-            if model_source_uri:
-                self.remote_hf_state = install_remote_hf_state(bridge, model_source_uri, model_path)
-            provider = bridge.to_megatron_provider()
-            if self.remote_hf_state is not None and remote_read_mode == "prefetch":
-                provider.register_pre_wrap_hook(make_prefetch_hook(bridge, self.remote_hf_state), prepend=True)
-            provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
-            provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
-            provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
-            provider.context_parallel_size = megatron_config.context_parallel_size
-            provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
-            provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
-            provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
-            provider.attention_backend = "flash" if flash_attn else "fused"
-            provider.variable_seq_lengths = True
-            provider.masked_softmax_fusion = True
-            provider.moe_token_dispatcher_type = "alltoall"
-            # Megatron-Bridge enables wgrad fusion whenever Transformer Engine is present, but the
-            # non-TE output layer still needs APEX's fused_weight_gradient_mlp_cuda extension.
-            provider.gradient_accumulation_fusion = (
-                importlib.util.find_spec("fused_weight_gradient_mlp_cuda") is not None
-            )
-=======
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True, revision=model_revision)
         self.remote_hf_state = None
         if model_source_uri:
@@ -198,7 +162,8 @@ class MegatronWorker:
             bf16=bf16,
             attention_backend="flash" if flash_attn else "fused",
         )
->>>>>>> atqamar/startup-quick-fixes
+        if self.remote_hf_state is not None and remote_read_mode == RemoteReadMode.PREFETCH:
+            provider.register_pre_wrap_hook(make_prefetch_hook(bridge, self.remote_hf_state), prepend=True)
 
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
@@ -1016,22 +981,14 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             tokenizer_revision=self.cfg.trainer.ref.model.get("tokenizer_revision"),
         )
 
-<<<<<<< HEAD
-        self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=False,
-            ddp_config=None,
-            bf16=self.cfg.trainer.bf16,
-        )
-        if self.remote_hf_state is not None:
-            self.remote_hf_state.store.close()
-=======
         with Timer("megatron/make_megatron_module"):
             self.actor_module = self.make_megatron_module(
                 wrap_with_ddp=False,
                 ddp_config=None,
                 bf16=self.cfg.trainer.bf16,
             )
->>>>>>> atqamar/startup-quick-fixes
+        if self.remote_hf_state is not None:
+            self.remote_hf_state.store.close()
 
         self._download_hf_snapshot_if_needed(model_path, self.cfg.trainer.ref.model)
         torch.distributed.barrier()

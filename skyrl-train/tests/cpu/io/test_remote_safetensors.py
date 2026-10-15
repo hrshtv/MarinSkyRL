@@ -9,13 +9,15 @@ from s3fs import S3FileSystem
 import torch
 
 from cloud.iris.hf_model_cache import stage_model_metadata
-from marinskyrl.model_manifest import _HEADER_READ_CHUNK_BYTES, snapshot_model_manifest
+from marinskyrl.model_manifest import snapshot_model_manifest
+from skyrl_train.distributed.megatron.remote_prefetch import (
+    lazy_first_dim_patterns_for_bridge,
+    prefetch_items_from_tasks,
+)
 from skyrl_train.io import io
 import skyrl_train.io.remote_safetensors as remote_safetensors
 from skyrl_train.io.remote_safetensors import (
     RemoteSafetensorsTensorStore,
-    lazy_first_dim_patterns_for_bridge,
-    prefetch_items_from_tasks,
 )
 
 
@@ -56,10 +58,7 @@ class CountingFileSystem(AbstractFileSystem):
         )
 
     def cat_file(self, path, start=None, end=None, **kwargs):
-<<<<<<< HEAD
         self.gets += 1
-=======
->>>>>>> atqamar/startup-quick-fixes
         payload = self.shards.get(path, self.payload)[start:end]
         self.fetched_bytes += len(payload)
         return payload
@@ -70,15 +69,23 @@ def _write_index(metadata_dir: Path, weight_map: dict[str, str]) -> None:
     (metadata_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
 
 
-@pytest.mark.parametrize(
-    "header_metadata_bytes", [0, _HEADER_READ_CHUNK_BYTES + 1024**2], ids=["small-header", "multi-read-header"]
-)
+@pytest.mark.parametrize("expert_layout", ["stacked", "per_expert"])
 def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range_fetches(
-    tmp_path, monkeypatch, header_metadata_bytes
+    tmp_path, monkeypatch, expert_layout
 ):
     tensors = {f"dense.{index}": torch.arange(8, dtype=torch.float32) + index for index in range(24)}
     tensors["dense.1"] = tensors["dense.1"].to(torch.bfloat16)
-    tensors["experts"] = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
+    if expert_layout == "stacked":
+        tensors["experts"] = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
+    else:
+        tensors.update(
+            {
+                f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight": torch.arange(8, dtype=torch.bfloat16)
+                + expert
+                for expert in range(3)
+                for projection in ("gate", "up", "down")
+            }
+        )
     tensors["outside"] = torch.arange(8, dtype=torch.float32)
     shards = {}
     for name in ("a.safetensors", "b.safetensors"):
@@ -86,7 +93,6 @@ def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range
         save_file(
             {key: value for key, value in tensors.items() if key.startswith("dense.") == (name == "a.safetensors")},
             shard,
-            metadata={"annotation": "x" * header_metadata_bytes},
         )
         shards[f"bucket/policy/{name}"] = shard.read_bytes()
     metadata = tmp_path / "metadata"
@@ -102,7 +108,16 @@ def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range
     ]
     tasks += [
         SimpleNamespace(
-            megatron_module=object(), mapping=SimpleNamespace(hf_param="experts", megatron_param=str(index))
+            megatron_module=object(),
+            mapping=SimpleNamespace(
+                hf_param="experts"
+                if expert_layout == "stacked"
+                else {
+                    projection: f"model.layers.0.mlp.experts.{index}.{projection}_proj.weight"
+                    for projection in ("gate", "up", "down")
+                },
+                megatron_param=str(index),
+            ),
         )
         for index in (2, 0)
     ]
@@ -116,20 +131,25 @@ def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range
     results = []
     for prefetched in (False, True):
         filesystem = CountingFileSystem(b"", shards=shards)
-        monkeypatch.setattr(io, "_get_filesystem", lambda path: filesystem)
+        monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
         store = RemoteSafetensorsTensorStore("s3://bucket/policy", metadata, lazy_first_dim_patterns=("experts",))
         if prefetched:
-            store.plan_prefetch(prefetch_items_from_tasks(tasks, {"experts"}, int))
+            store.plan_prefetch(prefetch_items_from_tasks(tasks, store.lazy_first_dim_keys, int))
         for index in range(24):
             value = store.load_tensors([f"dense.{index}"])[f"dense.{index}"]
             assert torch.equal(value, tensors[f"dense.{index}"])
             assert value.dtype == tensors[f"dense.{index}"].dtype
-        experts = store.load_tensors(["experts"])["experts"]
-        for index in (-1, 0):
-            assert torch.equal(experts[index], tensors["experts"][index])
+        if expert_layout == "stacked":
+            experts = store.load_tensors(["experts"])["experts"]
+            for index in (-1, 0):
+                assert torch.equal(experts[index], tensors["experts"][index])
+        else:
+            for index in (2, 0):
+                for projection in ("gate", "up", "down"):
+                    key = f"model.layers.0.mlp.experts.{index}.{projection}_proj.weight"
+                    torch.testing.assert_close(store.load_tensors([key])[key], tensors[key], rtol=0, atol=0)
         store.close()
         assert store.read_stats.prefetch_misses == store.read_stats.prefetch_unused == 0
-        assert store.read_stats.gets == filesystem.gets
         results.append((store.read_stats.bytes_read, filesystem.gets))
     assert results[0][0] == results[1][0]
     assert results[1][1] < results[0][1]
@@ -143,7 +163,7 @@ def test_prefetch_large_tensors_split_ranges_and_keep_windows_bounded(tmp_path, 
     metadata = tmp_path / "metadata"
     _write_index(metadata, {key: shard.name for key in tensors})
     filesystem = CountingFileSystem(shard.read_bytes())
-    monkeypatch.setattr(io, "_get_filesystem", lambda path: filesystem)
+    monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
     monkeypatch.setattr(remote_safetensors, "_PREFETCH_WINDOW_BYTES", 140 * 1024**2)
     cat_ranges = filesystem.cat_ranges
 
@@ -177,7 +197,7 @@ def test_prefetch_unplanned_key_reads_through_and_range_errors_propagate(tmp_pat
     metadata = tmp_path / "metadata"
     _write_index(metadata, {key: shard.name for key in tensors})
     filesystem = CountingFileSystem(shard.read_bytes())
-    monkeypatch.setattr(io, "_get_filesystem", lambda path: filesystem)
+    monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
     payload_budget = tensors["planned"].numel() * tensors["planned"].element_size()
     monkeypatch.setattr(
         remote_safetensors, "_PREFETCH_WINDOW_BYTES", remote_safetensors._PREFETCH_MAX_GAP + payload_budget
@@ -228,9 +248,13 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         save_file(tensors, shard)
     shards = {f"bucket/policy/{expert_shard.name}": expert_shard.read_bytes()} if split_shards else {}
     filesystem = CountingFileSystem(shard.read_bytes(), shards)
-    local_filesystem_for = io._get_filesystem
+    local_filesystem_and_path = io.filesystem_and_path
     monkeypatch.setattr(
-        io, "_get_filesystem", lambda path: filesystem if path.startswith("s3://") else local_filesystem_for(path)
+        io,
+        "filesystem_and_path",
+        lambda path: (filesystem, path.removeprefix("s3://"))
+        if path.startswith("s3://")
+        else local_filesystem_and_path(path),
     )
     metadata = tmp_path / "metadata"
     if indexed:

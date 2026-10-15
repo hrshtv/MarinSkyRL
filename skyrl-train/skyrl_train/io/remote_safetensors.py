@@ -2,27 +2,22 @@
 
 from __future__ import annotations
 
-<<<<<<< HEAD
 from collections import defaultdict, deque
-from collections.abc import Callable
-from dataclasses import dataclass, replace
-=======
-from collections import defaultdict
+from bisect import bisect_right
+from fsspec.spec import AbstractFileSystem
 from dataclasses import dataclass
->>>>>>> atqamar/startup-quick-fixes
 import fnmatch
 import json
 import math
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable
+from typing import BinaryIO, Iterable
 
 import torch
 from fsspec.utils import merge_offset_ranges
 
 from marinskyrl.resource_locator import join_resource_path
 from marinskyrl.model_manifest import (
-    _HEADER_READ_CHUNK_BYTES,
     HF_WEIGHT_INDEX_FILENAME,
     SAFETENSORS_LENGTH_PREFIX_BYTES,
     read_safetensors_header,
@@ -47,27 +42,6 @@ _PREFETCH_WINDOW_BYTES = 1024**3
 _PREFETCH_MAX_BLOCK = 64 * 1024**2
 _PREFETCH_MAX_GAP = 1024**2
 _PREFETCH_BATCH_SIZE = 16
-
-
-def prefetch_items_from_tasks(
-    tasks: Iterable[Any], lazy_keys: set[str], expert_index: Callable[[str], int]
-) -> list[tuple[str, int | None]]:
-    """Return rank-owned HF keys and expert slices in conversion-task order."""
-    items = dict.fromkeys(
-        (key, expert_index(task.mapping.megatron_param) if key in lazy_keys else None)
-        for task in tasks
-        if task.megatron_module is not None
-        for key in (
-            [task.mapping.hf_param] if isinstance(task.mapping.hf_param, str) else task.mapping.hf_param.values()
-        )
-    )
-    return list(items)
-
-
-def lazy_first_dim_patterns_for_bridge(bridge: object) -> tuple[str, ...]:
-    """Return remote slice patterns from an AutoBridge's registered model bridge."""
-    registered_bridge = getattr(bridge, "_model_bridge", bridge)
-    return tuple(getattr(registered_bridge, "REMOTE_FIRST_DIM_SLICE_PATTERNS", ()))
 
 
 def _safe_relative_path(value: str) -> str:
@@ -107,7 +81,11 @@ class RemoteSafetensorsTensorStore:
         self._reads = 0
         self._bytes_read = 0
         self._read_seconds = 0.0
+        self._gets = 0
+        self._prefetch_misses = 0
+        self._prefetch_unused = 0
         self._handles: dict[str, BinaryIO] = {}
+        self._locations: dict[str, tuple[AbstractFileSystem, str]] = {}
         self._prefetch_plan: deque[tuple[str, int | None]] | None = None
         self._prefetched: dict[tuple[str, int | None], bytearray] = {}
         if index_path.exists():
@@ -134,31 +112,41 @@ class RemoteSafetensorsTensorStore:
     def get_all_keys(self) -> list[str]:
         return sorted(self._weight_map)
 
-<<<<<<< HEAD
+    @property
+    def lazy_first_dim_keys(self) -> frozenset[str]:
+        return frozenset(self._lazy_first_dim_keys)
+
     def plan_prefetch(self, items: Iterable[tuple[str, int | None]]) -> None:
         """Fetch requested tensor ranges in bounded windows as the reader consumes them."""
         self._prefetch_plan = deque(dict.fromkeys(item for item in items if item[0] in self._weight_map))
-=======
+
     @property
     def read_stats(self) -> ReadStats:
-        return ReadStats(self._opens, self._reads, self._bytes_read, self._read_seconds)
->>>>>>> atqamar/startup-quick-fixes
+        return ReadStats(
+            self._opens,
+            self._reads,
+            self._bytes_read,
+            self._read_seconds,
+            self._gets,
+            self._prefetch_misses,
+            self._prefetch_unused,
+        )
 
     def _source(self, shard: str) -> BinaryIO:
         source = self._handles.get(shard)
         if source is None:
             started = time.monotonic()
-            source = io.open_file(join_resource_path(self.source_uri, shard), "rb", cache_type="none")
+            uri = join_resource_path(self.source_uri, shard)
+            filesystem, path = io.filesystem_and_path(uri)
+            self._locations[shard] = filesystem, path
+            options = {"cache_type": "none"} if io.is_cloud_path(uri) else {}
+            source = filesystem.open(path, "rb", **options)
             self._handles[shard] = source
-<<<<<<< HEAD
-            self.read_stats = replace(
-                self.read_stats,
-                opens=self.read_stats.opens + 1,
-                read_seconds=self.read_stats.read_seconds + time.monotonic() - started,
-            )
+            self._opens += 1
+            self._read_seconds += time.monotonic() - started
         return source
 
-    def _fill_window(self) -> None:
+    def _take_prefetch_window(self):
         items = []
         budget = 0
         while self._prefetch_plan:
@@ -174,7 +162,6 @@ class RemoteSafetensorsTensorStore:
                 end = start + slice_size
             cost = end - start + _PREFETCH_MAX_GAP
             if cost > _PREFETCH_WINDOW_BYTES:
-                # Oversized items use per-key reads and count as prefetch misses.
                 self._prefetch_plan.popleft()
                 continue
             if budget + cost > _PREFETCH_WINDOW_BYTES:
@@ -182,12 +169,16 @@ class RemoteSafetensorsTensorStore:
             self._prefetch_plan.popleft()
             budget += cost
             items.append((key, index, shard, offset + start, offset + end))
+        return items
+
+    def _fill_window(self) -> None:
+        items = self._take_prefetch_window()
         if not items:
             return
-        filesystem = getattr(self._source(items[0][2]), "fs")
+        filesystem = self._locations[items[0][2]][0]
         paths, starts, ends = [], [], []
         for _key, _index, shard, start, end in items:
-            path = io._normalized_path(filesystem, join_resource_path(self.source_uri, shard))
+            path = self._locations[shard][1]
             for part_start in range(start, end, _PREFETCH_MAX_BLOCK):
                 paths.append(path)
                 starts.append(part_start)
@@ -197,61 +188,55 @@ class RemoteSafetensorsTensorStore:
         )
         started = time.monotonic()
         payloads = filesystem.cat_ranges(paths, starts, ends, batch_size=_PREFETCH_BATCH_SIZE)
-        self.read_stats = replace(
-            self.read_stats,
-            gets=self.read_stats.gets + len(paths),
-            read_seconds=self.read_stats.read_seconds + time.monotonic() - started,
-        )
-        for start, end, payload in zip(starts, ends, payloads, strict=True):
+        self._gets += len(paths)
+        self._read_seconds += time.monotonic() - started
+        ranges = defaultdict(list)
+        for path, start, end, payload in zip(paths, starts, ends, payloads, strict=True):
             if isinstance(payload, Exception):
                 raise payload
             if len(payload) != end - start:
                 raise ValueError("Truncated prefetched safetensors range")
+            ranges[path].append((start, end, payload))
         for key, index, shard, start, end in items:
-            path = io._normalized_path(filesystem, join_resource_path(self.source_uri, shard))
+            fetched = ranges[self._locations[shard][1]]
             value = bytearray()
             for part_start in range(start, end, _PREFETCH_MAX_BLOCK):
                 part_end = min(part_start + _PREFETCH_MAX_BLOCK, end)
-                for fetched_path, low, high, payload in zip(paths, starts, ends, payloads, strict=True):
-                    if fetched_path == path and low <= part_start and part_end <= high:
-                        value.extend(payload[part_start - low : part_end - low])
-                        break
-                else:
+                block = bisect_right(fetched, part_start, key=lambda entry: entry[0]) - 1
+                low, high, payload = fetched[block]
+                if block < 0 or not low <= part_start < part_end <= high:
                     raise ValueError(f"Prefetch did not cover {key!r}")
+                value.extend(payload[part_start - low : part_end - low])
             self._prefetched[key, index] = value
 
-    def _pop_prefetched(self, key: str, index: int | None = None) -> bytearray | None:
-        if self._prefetch_plan is None:
-            return None
-        if not self._prefetched:
-            self._fill_window()
+    def _read(self, key: str, shard: str, start: int, end: int, index: int | None = None) -> bytearray:
+        payload = None
+        if self._prefetch_plan is not None:
+            if not self._prefetched:
+                self._fill_window()
+            payload = self._prefetched.pop((key, index), None)
+            if payload is None:
+                self._prefetch_misses += 1
         started = time.monotonic()
-        payload = self._prefetched.pop((key, index), None)
         if payload is None:
-            self.read_stats = replace(self.read_stats, prefetch_misses=self.read_stats.prefetch_misses + 1)
-        else:
-            self._record_read(len(payload), started)
+            source = self._source(shard)
+            source.seek(start)
+            payload = bytearray(source.read(end - start))
+            self._gets += 1
+        self._record_read(len(payload), started)
         return payload
 
     def close(self) -> None:
         """Release buffered ranges and source handles, recording unconsumed plan items."""
-        self.read_stats = replace(
-            self.read_stats,
-            prefetch_unused=self.read_stats.prefetch_unused + len(self._prefetched) + len(self._prefetch_plan or ()),
-        )
+        self._prefetch_unused += len(self._prefetched) + len(self._prefetch_plan or ())
         self._prefetched.clear()
         self._prefetch_plan = None
         for source in self._handles.values():
             source.close()
         self._handles.clear()
         self._headers.clear()
+        self._locations.clear()
 
-=======
-            self._opens += 1
-            self._read_seconds += time.monotonic() - started
-        return source
-
->>>>>>> atqamar/startup-quick-fixes
     def _header(self, shard: str) -> tuple[int, dict[str, object]]:
         cached = self._headers.get(shard)
         if cached is not None:
@@ -261,8 +246,7 @@ class RemoteSafetensorsTensorStore:
         started = time.monotonic()
         header_bytes, _keys = read_safetensors_header(source, join_resource_path(self.source_uri, shard))
         self._record_read(len(header_bytes), started)
-        header_reads = 1 + math.ceil((len(header_bytes) - SAFETENSORS_LENGTH_PREFIX_BYTES) / _HEADER_READ_CHUNK_BYTES)
-        self.read_stats = replace(self.read_stats, gets=self.read_stats.gets + header_reads)
+        self._gets += 1
         cached = len(header_bytes), json.loads(header_bytes[SAFETENSORS_LENGTH_PREFIX_BYTES:])
         self._headers[shard] = cached
         return cached
@@ -300,7 +284,6 @@ class RemoteSafetensorsTensorStore:
         shard = self._weight_map[key]
         shard_uri = join_resource_path(self.source_uri, shard)
         data_offset, header = self._header(shard)
-        source = self._source(shard)
         dtype, shape, start, _end = self._tensor_descriptor(key, shard, header)
         if not shape:
             raise IndexError(f"Cannot slice scalar safetensors tensor {key!r}")
@@ -309,14 +292,8 @@ class RemoteSafetensorsTensorStore:
             raise IndexError(f"First-dimension index {index} is out of bounds for {key!r} with shape {shape}")
         slice_shape = shape[1:]
         slice_size = math.prod(slice_shape) * torch.empty((), dtype=dtype).element_size()
-        slice_start = start + normalized_index * slice_size
-        payload = self._pop_prefetched(key, normalized_index)
-        if payload is None:
-            source.seek(data_offset + slice_start)
-            started = time.monotonic()
-            payload = bytearray(source.read(slice_size))
-            self._record_read(len(payload), started)
-            self.read_stats = replace(self.read_stats, gets=self.read_stats.gets + 1)
+        slice_start = data_offset + start + normalized_index * slice_size
+        payload = self._read(key, shard, slice_start, slice_start + slice_size, normalized_index)
         if len(payload) != slice_size:
             raise ValueError(f"Truncated tensor slice {key!r}[{index}] in {shard_uri}")
         return torch.frombuffer(payload, dtype=dtype).reshape(slice_shape)
@@ -336,16 +313,9 @@ class RemoteSafetensorsTensorStore:
         for shard, shard_keys in by_shard.items():
             shard_uri = join_resource_path(self.source_uri, shard)
             data_offset, header = self._header(shard)
-            source = self._source(shard)
             for key in shard_keys:
                 dtype, shape, start, end = self._tensor_descriptor(key, shard, header)
-                payload = self._pop_prefetched(key)
-                if payload is None:
-                    source.seek(data_offset + start)
-                    started = time.monotonic()
-                    payload = bytearray(source.read(end - start))
-                    self._record_read(len(payload), started)
-                    self.read_stats = replace(self.read_stats, gets=self.read_stats.gets + 1)
+                payload = self._read(key, shard, data_offset + start, data_offset + end)
                 if len(payload) != end - start:
                     raise ValueError(f"Truncated tensor {key!r} in {shard_uri}")
                 tensors[key] = torch.frombuffer(payload, dtype=dtype).reshape(shape)
