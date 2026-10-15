@@ -113,6 +113,26 @@ class InspectableWorker(vllm_engine.WorkerWrap):
         return result
 
 
+def _single_engine_experiment(model_path, max_model_len):
+    cfg = get_default_config()
+    cfg.trainer.policy.model.path = str(model_path)
+    cfg.trainer.policy.model.tokenizer_path = str(model_path)
+    cfg.trainer.placement.colocate_all = False
+    cfg.generator.num_inference_engines = 1
+    cfg.generator.inference_engine_tensor_parallel_size = 1
+    cfg.generator.inference_engine_pipeline_parallel_size = 1
+    cfg.generator.inference_engine_data_parallel_size = 1
+    cfg.generator.inference_engine_expert_parallel_size = 1
+    cfg.generator.gpu_memory_utilization = 0.6
+    cfg.generator.fuse_weights = False
+    cfg.generator.weight_sync_transport = "broadcast"
+    OmegaConf.update(cfg, "generator.engine_init_kwargs.max_model_len", max_model_len, force_add=True)
+    experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
+    experiment.cfg, experiment.colocate_pg, experiment.tokenizer = cfg, None, AutoTokenizer.from_pretrained(model_path)
+
+    return experiment
+
+
 @pytest.mark.vllm
 def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sync(tmp_path, monkeypatch):
     require_hoppers(1)
@@ -131,23 +151,9 @@ def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sy
             names.extend(weights.keys())
     missing = "model.layers.0.mlp.gate_proj.weight"
     assert missing in names
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    cfg = get_default_config()
-    cfg.trainer.policy.model.path = str(model_path)
-    cfg.trainer.policy.model.tokenizer_path = str(model_path)
-    cfg.trainer.placement.colocate_all = False
-    cfg.generator.num_inference_engines = 1
-    cfg.generator.inference_engine_tensor_parallel_size = 1
-    cfg.generator.inference_engine_pipeline_parallel_size = 1
-    cfg.generator.inference_engine_data_parallel_size = 1
-    cfg.generator.inference_engine_expert_parallel_size = 1
-    cfg.generator.gpu_memory_utilization = 0.6
+    experiment = _single_engine_experiment(model_path, 2048)
+    cfg = experiment.cfg
     cfg.generator.enforce_eager = True
-    cfg.generator.fuse_weights = False
-    cfg.generator.weight_sync_transport = "broadcast"
-    OmegaConf.update(cfg, "generator.engine_init_kwargs.max_model_len", 2048, force_add=True)
-    experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
-    experiment.cfg, experiment.colocate_pg, experiment.tokenizer = cfg, None, tokenizer
 
     # Sequential engines give each load mode the same single GPU and memory budget.
     real_weights = None
@@ -183,7 +189,7 @@ def test_dummy_engine_installs_every_tensor_and_holds_requests_until_verified_sy
 
             async def verify_and_resume():
                 # A distinct client sends to the actual paused engine scheduler.
-                early_client = InferenceEngineClient(client.engines, tokenizer, cfg)
+                early_client = InferenceEngineClient(client.engines, experiment.tokenizer, cfg)
                 early = asyncio.create_task(
                     early_client.generate({"prompts": PROMPTS[:1], "sampling_params": SAMPLING})
                 )
@@ -263,24 +269,10 @@ def test_hero_dummy_broadcast_requires_each_parameter_family(tmp_path, monkeypat
         with safe_open(shard, framework="pt", device="cpu") as weights:
             names.extend(weights.keys())
     assert missing in names
-    cfg = get_default_config()
-    cfg.trainer.policy.model.path = str(model_path)
-    cfg.trainer.policy.model.tokenizer_path = str(model_path)
-    cfg.trainer.placement.colocate_all = False
-    cfg.generator.num_inference_engines = 1
-    cfg.generator.inference_engine_tensor_parallel_size = 1
-    cfg.generator.inference_engine_pipeline_parallel_size = 1
-    cfg.generator.inference_engine_data_parallel_size = 1
-    cfg.generator.inference_engine_expert_parallel_size = 1
-    cfg.generator.gpu_memory_utilization = 0.6
-    cfg.generator.fuse_weights = False
-    cfg.generator.weight_sync_transport = "broadcast"
-    OmegaConf.update(
-        cfg, "generator.engine_init_kwargs", {"load_format": "dummy", "max_model_len": MAX_MODEL_LEN}, force_add=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
-    experiment.cfg, experiment.colocate_pg, experiment.tokenizer = cfg, None, tokenizer
+    experiment = _single_engine_experiment(model_path, MAX_MODEL_LEN)
+    cfg = experiment.cfg
+    OmegaConf.update(cfg, "generator.engine_init_kwargs.load_format", "dummy", force_add=True)
+    OmegaConf.update(cfg, "generator.engine_init_kwargs.enable_flashinfer_autotune", False, force_add=True)
     ray_init_for_tests()
     client = None
     try:
