@@ -67,13 +67,6 @@ UNDECLARED = {
     'generator.adapter.parameters.count': ('int', ...),
 }
 NAMES = {"trainer.policy.model": "PolicyModel", "trainer.critic.model": "CriticModel", "trainer.policy.model.lora": "PolicyLora", "trainer.critic.model.lora": "CriticLora"}
-CLASSES = {
-    'CheckpointCallback': {
-        'type': ('Literal["counter"]', True),
-        'count': ('int', False),
-    },
-}
-ALIASES = {}
 """
 
 
@@ -154,6 +147,10 @@ def test_generator_preserves_observed_types_comments_following_nulls_and_sidecar
     assert "unset" not in model().model_dump_json()
     assert '"The policy\'s physical footprint.\\nFilled from allocation when unset."' in code
     assert "A file header, not a field." not in code
+    unnamed = copy.deepcopy(sidecar)
+    del unnamed["NAMES"]["trainer.critic.model"]
+    with pytest.raises(ValueError, match="trainer.critic.model"):
+        generator.render_sections(sources.base, unnamed, owners, sources.comments, sources.groups)
     for name, key, value in (
         ("TYPES", "trainer.misspelled", "int"),
         ("UNDECLARED", "trainer.ckpt_interval", ("int", 99)),
