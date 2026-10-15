@@ -1,6 +1,7 @@
 import asyncio
 
 import numpy as np
+import pytest
 import torch
 
 from skyrl_train.config.numerics import CheckFailure, ExactnessCheckConfig, NumericsMode
@@ -33,9 +34,9 @@ class _Engines:
         ]
 
 
-def _check():
-    config = ExactnessCheckConfig(every_weight_syncs=1, on_failure=CheckFailure.LOG)
-    return ExactnessCheck(config, NumericsMode.NATIVE, get_default_config().generator, _Tokenizer())
+def _check(on_failure=CheckFailure.LOG, mode=NumericsMode.NATIVE):
+    config = ExactnessCheckConfig(every_weight_syncs=1, on_failure=on_failure)
+    return ExactnessCheck(config, mode, get_default_config().generator, _Tokenizer())
 
 
 async def _sample(check, engines):
@@ -76,3 +77,9 @@ def test_trainer_scores_each_engines_response_at_its_serving_rank_bit_for_bit():
     assert metrics["exactness_check/mismatched_tokens"] == 1
     assert metrics["exactness_check/engine_0/mismatched_tokens"] == 1
     assert metrics["exactness_check/engine_1/mismatched_tokens"] == 0
+
+    # A mode that promises bit-identical log-probabilities stops the run on that one bit.
+    stopping = _check(CheckFailure.STOP, NumericsMode.EXACT)
+    asyncio.run(_sample(stopping, engines))
+    with pytest.raises(RuntimeError):
+        stopping.compare(scores, score_seconds=0.0)

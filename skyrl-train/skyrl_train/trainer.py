@@ -26,7 +26,7 @@ from collections import defaultdict, deque
 import numpy as np
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
-from skyrl_train.config.numerics import NumericsResolution, exactness_check_config, resolve_numerics
+from skyrl_train.config.numerics import NumericsResolution, exactness_check_config, read_numerics
 from skyrl_train.exactness_check import ExactnessCheck
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.rollouts.buffer import RolloutGroup
@@ -372,7 +372,7 @@ class RayPPOTrainer:
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
-        self._numerics = resolve_numerics(cfg)
+        self._numerics = read_numerics(cfg)
         check_config = exactness_check_config(cfg)
         if check_config.enabled:
             self._exactness_check = ExactnessCheck(check_config, self._numerics.mode, cfg.generator, tokenizer)
@@ -1356,6 +1356,12 @@ class RayPPOTrainer:
 
         self._log_startup_timings()
         logger.info("Numerics mode {}", self._numerics.mode)
+        if self._numerics.fallback_reasons:
+            logger.warning(
+                "trainer.numerics.mode=exact resolved to native, so trainer and rollout log-probabilities will "
+                "differ: {}",
+                "; ".join(self._numerics.fallback_reasons),
+            )
         self._record_run_configuration()
 
         if self.cfg.trainer.algorithm.use_kl_in_reward:
