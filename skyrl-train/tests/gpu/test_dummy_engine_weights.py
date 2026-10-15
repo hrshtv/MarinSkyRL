@@ -16,6 +16,7 @@ from skyrl_train.inference_engines.inference_engine_client import InferenceEngin
 from skyrl_train.inference_engines.vllm import vllm_engine
 from huggingface_hub import snapshot_download
 from tests.gpu.grug_gpu_gates import require_hoppers
+from tests.gpu.grug_serving import MAX_MODEL_LEN
 from tests.gpu.utils import ray_init_for_tests
 
 
@@ -275,7 +276,7 @@ def test_hero_dummy_broadcast_requires_each_parameter_family(tmp_path, monkeypat
     cfg.generator.fuse_weights = False
     cfg.generator.weight_sync_transport = "broadcast"
     OmegaConf.update(
-        cfg, "generator.engine_init_kwargs", {"load_format": "dummy", "max_model_len": 256}, force_add=True
+        cfg, "generator.engine_init_kwargs", {"load_format": "dummy", "max_model_len": MAX_MODEL_LEN}, force_add=True
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     experiment = main_base.BasePPOExp.__new__(main_base.BasePPOExp)
