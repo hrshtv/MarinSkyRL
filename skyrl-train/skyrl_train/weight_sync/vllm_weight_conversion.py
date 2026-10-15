@@ -72,7 +72,7 @@ def load_weights_into_vllm(
 
 
 def validate_dummy_weight_coverage(
-    layers: dict[str, dict], loaded_parameters: set[str], skipped_float_parameters: set[str]
+    layers: dict[str, dict], loaded_parameters: set[str], skipped_float_aliases: Iterable[set[str]]
 ) -> None:
     """Reject incomplete initial dummy weights before vLLM finalizes the reload."""
     satisfied_storage = {
@@ -101,8 +101,7 @@ def validate_dummy_weight_coverage(
             break
         for name in satisfied:
             del pending[name]
-    gaps.extend(
-        f"{name}: floating skipped tensor not loaded" for name in sorted(skipped_float_parameters - loaded_parameters)
-    )
+    missing_float_parameters = {min(names) for names in skipped_float_aliases if not names & loaded_parameters}
+    gaps.extend(f"{name}: floating skipped tensor not loaded" for name in sorted(missing_float_parameters))
     if gaps:
         raise RuntimeError("Incomplete dummy engine weights: " + "; ".join(gaps))

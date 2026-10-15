@@ -674,10 +674,7 @@ class WorkerWrap:
                     skipped_float_aliases.setdefault(identity, set()).add(
                         f"{layer_name}.{name}" if layer_name else name
                     )
-            skipped_float_parameters = {
-                min(names) for names in skipped_float_aliases.values() if not names & self._skyrl_loaded_weight_names
-            }
-            validate_dummy_weight_coverage(layers, self._skyrl_loaded_weight_names, skipped_float_parameters)
+            validate_dummy_weight_coverage(layers, self._skyrl_loaded_weight_names, skipped_float_aliases.values())
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         if dummy_pending:

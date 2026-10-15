@@ -231,9 +231,9 @@ def test_dummy_tied_head_requires_its_bias_after_shared_weight_and_padding(
 
 @pytest.mark.parametrize("loaded", [True, False])
 def test_dummy_float_weights_excluded_from_layer_counts_still_require_a_load(loaded):
-    name = "model.layer.e_score_correction_bias"
+    aliases = {"model.layer.e_score_correction_bias", "model.layer.router.e_score_correction_bias"}
     if loaded:
-        validate_dummy_weight_coverage({}, {name}, {name})
+        validate_dummy_weight_coverage({}, {max(aliases)}, [aliases])
     else:
         with pytest.raises(RuntimeError, match="e_score_correction_bias"):
-            validate_dummy_weight_coverage({}, set(), {name})
+            validate_dummy_weight_coverage({}, set(), [aliases])
