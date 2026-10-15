@@ -326,9 +326,7 @@ def test_cli_rejects_offload_fraction_for_muonh():
 
 
 def _routes(layers: int) -> RoutedExpertRows:
-    rows = tuple(
-        np.arange(tokens * layers * 2, dtype=np.uint8).reshape(tokens, layers, 2) % 64 for tokens in (3, 0, 2)
-    )
+    rows = tuple(np.arange(tokens * layers * 2, dtype=np.uint8).reshape(tokens, layers, 2) % 64 for tokens in (3, 0, 2))
     return RoutedExpertRows(rows, response_len=4, num_experts=64)
 
 

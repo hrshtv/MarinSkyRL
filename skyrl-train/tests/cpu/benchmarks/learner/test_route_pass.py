@@ -97,9 +97,7 @@ def test_replayed_routes_come_from_the_position_predicting_each_response_token(n
     assert routes.dtype == dtype
     sequences = batch["sequences"]
     batch_size, seq_len = sequences.shape
-    full, mask = dense_replay_targets(
-        routes.materialize(), batch_size, seq_len, batch.metadata["response_length"]
-    )
+    full, mask = dense_replay_targets(routes.materialize(), batch_size, seq_len, batch.metadata["response_length"])
     prompt_width = seq_len - batch.metadata["response_length"]
     for row, (prompt, response) in enumerate(zip(prompts, responses)):
         left_pad = prompt_width - len(prompt)

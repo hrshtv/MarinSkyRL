@@ -90,7 +90,6 @@ LOGPROB_SAMPLE_SIZE = 4096
 LOGPROB_SAMPLE_SALT = 0x165667B1
 
 
-
 class SignalKind(StrEnum):
     """How a signal's deviation from the reference is measured.
 
