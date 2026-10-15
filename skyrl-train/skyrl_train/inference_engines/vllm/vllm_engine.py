@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -587,6 +588,13 @@ class WorkerWrap:
         model = self.model_runner.model
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
+        digest = hashlib.sha256()
+        tensor_count = 0
+        for name, tensor in (*model.named_parameters(), *model.named_buffers()):
+            digest.update(f"{name}:{tensor.dtype}:{tuple(tensor.shape)}".encode())
+            digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+            tensor_count += 1
+        logger.info("X2_ENGINE_TENSORS tensors={} sha256={}", tensor_count, digest.hexdigest())
         self._skyrl_weight_update_active = False
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.method == "eagle3":

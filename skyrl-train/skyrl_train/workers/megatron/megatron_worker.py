@@ -1,3 +1,4 @@
+import hashlib
 import asyncio
 import copy
 import os
@@ -486,6 +487,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 stats.read_seconds,
                 stats.bytes_read / 1_000_000 / stats.read_seconds if stats.read_seconds else 0.0,
             )
+
+        digest = hashlib.sha256()
+        tensor_count = 0
+        for model_index, model_chunk in enumerate(self.actor_module):
+            for name, tensor in (*model_chunk.named_parameters(), *model_chunk.named_buffers()):
+                digest.update(f"{model_index}:{name}:{tensor.dtype}:{tuple(tensor.shape)}".encode())
+                digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+                tensor_count += 1
+        logger.info("X2_POLICY_TENSORS rank={} tensors={} sha256={}", self._rank, tensor_count, digest.hexdigest())
 
         if self._rank == 0:
             print_model_size(self.actor_module[0])

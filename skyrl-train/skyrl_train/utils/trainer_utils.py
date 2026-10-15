@@ -352,6 +352,9 @@ def dump_per_dataset_eval_results(
                     "uid": uids[i],
                     "prompt_token_ids": trajectory_batch["prompt_token_ids"][i],
                     "response_token_ids": trajectory_batch["response_ids"][i],
+                    "response_logprobs": None
+                    if trajectory_batch["rollout_logprobs"] is None
+                    else trajectory_batch["rollout_logprobs"][i].tolist(),
                     "input_prompt": input_prompts[i],
                     "output_response": output_responses[i],
                     "score": trajectory_batch["rewards"][i],
