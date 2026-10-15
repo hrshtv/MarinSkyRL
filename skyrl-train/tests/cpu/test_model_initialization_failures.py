@@ -44,9 +44,7 @@ async def test_startup_failure_still_runs_trainer_shutdown():
     trainer = object.__new__(RayPPOTrainer)
     trainer._shutdown_complete = False
     trainer.global_step = 0
-    trainer.trajectory_runner = SimpleNamespace()
     trainer._distillation_runtime = None
-    trainer.inference_engine_client = SimpleNamespace()
     trainer.context = SimpleNamespace(close=AsyncMock())
 
     async def fail_startup():
@@ -88,7 +86,6 @@ async def test_training_failure_preserves_receipt_before_shutdown(monkeypatch, t
     trainer = object.__new__(RayPPOTrainer)
     trainer.global_step = 12
     trainer._distillation_runtime = None
-    trainer.inference_engine_client = SimpleNamespace()
     trainer.context = SimpleNamespace(close=AsyncMock())
     trainer.trajectory_runner = SimpleNamespace(startup=AsyncMock())
     trainer.all_startup_timings = {}
