@@ -1,6 +1,7 @@
 import pytest
 import torch
-from skyrl_train.training_batch import TensorBatch
+from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
+from skyrl_train.training_batch import TensorBatch, TrainingInputBatch, pad_training_input
 import pickle
 import ray
 import numpy as np
@@ -231,3 +232,27 @@ def test_train_batch_get_item():
     new_data = data[:2]
     assert torch.equal(new_data["a"], torch.tensor([1, 2]))
     assert torch.equal(new_data["b"], torch.tensor([4, 5]))
+
+
+def test_pad_training_input_clones_rows_without_loss_and_keeps_absent_fields():
+    routes = RoutedExpertRows(tuple(np.full((2, 1, 1), row, dtype=np.int16) for row in range(3)), 2, 8)
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(6).reshape(3, 2),
+            "loss_mask": torch.ones(3, 2),
+            "values": None,
+        },
+        routed_expert_rows=routes,
+    )
+    batch.metadata = {"uids": ["a", "b", "c"], "response_length": 2}
+
+    padded = pad_training_input(batch, 4)
+
+    assert padded.batch_size == 4
+    assert torch.equal(padded["sequences"][3], batch["sequences"][0])
+    assert torch.equal(padded["loss_mask"][3], torch.zeros(2))
+    assert "values" in padded and padded["values"] is None
+    assert len(padded.routed_expert_rows) == 4
+    assert np.array_equal(padded.routed_expert_rows.rows[3], routes.rows[0])
+    assert padded.metadata == {"uids": ["a", "b", "c", "pad0"], "response_length": 2, "pad_size": 1}
+    assert pad_training_input(padded, 4) is padded

@@ -7,9 +7,6 @@ import torch
 import torch.distributed
 
 
-PROFILE_UPDATE_INDEX = 1  # Let one training call warm the kernels before capture.
-
-
 class Profiler:
     """Capture one forward micro-batch on the selected ranks."""
 
@@ -17,6 +14,8 @@ class Profiler:
         if not config.save_path:
             raise ValueError("Profiler save_path is required when profiling is enabled")
         self.save_path = config.save_path
+        # The zero-based training call to capture; the default 1 lets one call warm the kernels.
+        self.capture_update_index = config.update_index
         self.rank = torch.distributed.get_rank()
         self.update_index = -1
         self.captured = False
@@ -32,7 +31,12 @@ class Profiler:
         self.update_index += 1
 
     def for_mini_batch(self, index: int) -> "Profiler | None":
-        if self.prof is not None and self.update_index == PROFILE_UPDATE_INDEX and index == 0 and not self.captured:
+        if (
+            self.prof is not None
+            and self.update_index == self.capture_update_index
+            and index == 0
+            and not self.captured
+        ):
             return self
         return None
 

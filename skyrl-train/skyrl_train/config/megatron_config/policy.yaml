@@ -17,6 +17,8 @@ torch_profiler_config:
   enable: false
   ranks: []
   save_path: null
+  # Zero-based ppo_train call whose first forward micro-batch is captured.
+  update_index: 1
 
 optimizer_config_kwargs:
   overlap_cpu_optimizer_d2h_h2d: false
