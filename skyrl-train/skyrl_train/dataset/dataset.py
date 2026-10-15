@@ -6,6 +6,13 @@ from typing import List
 from transformers import PreTrainedTokenizerBase
 
 
+PARALLEL_DATASET_MIN_ROWS = 10_000
+
+
+def dataset_num_proc(row_count: int, num_workers: int) -> int | None:
+    return num_workers if row_count >= PARALLEL_DATASET_MIN_ROWS else None
+
+
 def read_prompt_files(sources: list[str]) -> datasets.Dataset:
     """Load local parquet/JSON files or explicitly selected Hugging Face splits."""
     loaded = []
@@ -59,9 +66,10 @@ class PromptDataset:
         # filter out too long prompts
         tokenizer = self.tokenizer
         prompt_key = self.prompt_key
+        max_prompt_length = self.max_prompt_length
         self.dataframe = self.dataframe.filter(
-            lambda doc: _prompt_token_count(tokenizer, doc[prompt_key]) <= self.max_prompt_length,
-            num_proc=self.num_workers,
+            lambda doc: _prompt_token_count(tokenizer, doc[prompt_key]) <= max_prompt_length,
+            num_proc=dataset_num_proc(len(self.dataframe), self.num_workers),
             desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
         )
 

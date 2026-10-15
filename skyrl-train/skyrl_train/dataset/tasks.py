@@ -18,7 +18,7 @@ from skyrl_gym.source_task import session_parameters, source_task
 from taskcompendium.models import EnvironmentRequirements, SessionGrader, Source
 from transformers import PreTrainedTokenizerBase
 
-from skyrl_train.dataset.dataset import PromptDataset
+from skyrl_train.dataset.dataset import PromptDataset, dataset_num_proc
 from skyrl_train.rollouts.group_grader import task_group_grader
 from skyrl_train.task_inputs import TaskInput, TrajectoryMetadata, task_messages
 
@@ -45,7 +45,7 @@ class TaskDataset(PromptDataset):
     """Render public conversation fields and retain private lowered tasks for workers."""
 
     def prepare_dataset(self, dataset):
-        return dataset.map(_stored_task_prompt, num_proc=self.num_workers)
+        return dataset.map(_stored_task_prompt, num_proc=dataset_num_proc(len(dataset), self.num_workers))
 
     def collate_fn(self, rows) -> list[dict]:
         inputs = []
@@ -188,6 +188,6 @@ class SourceTaskDataset(TaskDataset):
             mapper,
             with_indices=True,
             remove_columns=dataset.column_names,
-            num_proc=self.num_workers,
+            num_proc=dataset_num_proc(len(dataset), self.num_workers),
             keep_in_memory=True,
         )
