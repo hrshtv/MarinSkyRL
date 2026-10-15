@@ -399,6 +399,15 @@ class MeasuredAsyncPPOExp(BasePPOExp):
             sync_started = time.monotonic()
             await sync_weights()
             publication_and_initial_drain_seconds = time.monotonic() - sync_started
+            if os.environ.get("HERO_PUBLICATION_READBACK", "1") == "0":
+                # Production timing: publish only, with no rank-0 snapshot or serving readback.
+                self.report.setdefault("weight_versions", []).append({
+                    "step": self.trainer.global_step,
+                    "publication_and_initial_drain_seconds": publication_and_initial_drain_seconds,
+                    "readback": False,
+                })
+                save_report(self.output, self.report)
+                return
             started = time.monotonic()
             snapshot = await asyncio.to_thread(rank0_validation_snapshot, self.trainer.policy_model, names)
             if self.trainer.global_step == 0 and self.last_weight_snapshot is None:
@@ -595,6 +604,7 @@ def main(args):
                 "HERO_VLLM_WHEEL_SHA256": os.environ["HERO_VLLM_WHEEL_SHA256"],
                 "VLLM_BATCH_INVARIANT": "1",
                 "HERO_EXPORT_FINAL": os.environ.get("HERO_EXPORT_FINAL", "0"),
+                "HERO_PUBLICATION_READBACK": os.environ.get("HERO_PUBLICATION_READBACK", "1"),
             }
         }
     )
