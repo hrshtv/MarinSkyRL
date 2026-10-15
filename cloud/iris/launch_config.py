@@ -12,10 +12,11 @@ from typing import Any, Mapping
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from skyrl_train.config.mismatch_probe import validate_mismatch_probe_config
+from skyrl_train.config.callbacks import validate_hf_export_config
 from skyrl_train.config.objective_spec import validate_objective
 
 from cloud.iris.ray_storage import RaySpillBackend, resolve_ray_spill_target
-from cloud.iris.role_plan import derive_num_nodes, derive_role_plan
+from cloud.iris.role_plan import derive_num_nodes, derive_policy_export_role_plan, derive_role_plan
 from cloud.iris.rl_config_translation import (
     RL_ENTRYPOINTS,
     RLEntrypoint,
@@ -119,16 +120,6 @@ class IrisConfig:
 
 
 @dataclass
-class IngressConfig:
-    """Optional controller ingress and literal-recording settings."""
-
-    mode: str = "direct"
-    host: str = ""
-    record_literal: bool = False
-    vllm_http_port: int = 8000
-
-
-@dataclass
 class RayConfig:
     """Ray bootstrap settings shared by every task replica."""
 
@@ -173,7 +164,6 @@ class SkyRLLaunchConfig:
     run: RunConfig = field(default_factory=RunConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     iris: IrisConfig = field(default_factory=IrisConfig)
-    ingress: IngressConfig = field(default_factory=IngressConfig)
     ray: RayConfig = field(default_factory=RayConfig)
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     inputs: InputsConfig = field(default_factory=InputsConfig)
@@ -218,7 +208,6 @@ def _compose_source_recipe(config: DictConfig) -> DictConfig:
                 "checkpoint_root": str(config.artifacts.checkpoint_root),
                 "export_root": str(config.artifacts.export_root),
                 "resume_checkpoint_count": int(config.artifacts.resume_checkpoint_count),
-                "trace_root": join_resource_path(str(config.artifacts.attempts_root), "trace_jobs"),
                 "trajectory_root": join_resource_path(str(config.artifacts.attempts_root), "trajectories"),
                 "export_hf_artifact": bool(config.run.export_hf),
                 "seed": int(config.run.seed),
@@ -279,15 +268,15 @@ def _validate_inputs(inputs: dict[str, Any]) -> None:
 
 
 def validate_iris_allocation(config: dict[str, Any]) -> IrisAllocationConfig:
-    """Validate explicit Iris resources against the canonical SkyRL role plan."""
+    """Validate explicit Iris resources against the launch mode's active roles."""
     skyrl = config["skyrl"]
     if not isinstance(skyrl, dict):
         raise TypeError("skyrl must be a mapping")
-    plan = derive_role_plan(skyrl)
+    checkpoint_export = config["run"]["mode"] == RunMode.CHECKPOINT_EXPORT
+    plan = derive_policy_export_role_plan(skyrl) if checkpoint_export else derive_role_plan(skyrl)
     allocation = config["iris"]["allocation"]
     policy = plan.claim("policy")
-    checkpoint_export = config["run"]["mode"] == RunMode.CHECKPOINT_EXPORT
-    expected_nodes = policy.num_nodes if checkpoint_export else derive_num_nodes(plan)
+    expected_nodes = derive_num_nodes(plan)
     if allocation["num_nodes"] != expected_nodes:
         raise ValueError(
             f"iris.allocation.num_nodes={allocation['num_nodes']} does not match SkyRL role plan's "
@@ -317,8 +306,6 @@ def validate_launch_config(config: DictConfig) -> LaunchTopology:
         raise ValueError(f"unsupported run.submission: {raw['run']['submission']!r}")
     if raw["inputs"]["data_kind"] not in {"tasks", "parquet"}:
         raise ValueError(f"unsupported inputs.data_kind: {raw['inputs']['data_kind']!r}")
-    if raw["ingress"]["mode"] not in {"direct", "controller"}:
-        raise ValueError(f"unsupported ingress.mode: {raw['ingress']['mode']!r}")
     if raw["iris"]["timeout"] < 0:
         raise ValueError("iris.timeout cannot be negative")
     _validate_inputs(raw["inputs"])
@@ -343,6 +330,7 @@ def validate_launch_config(config: DictConfig) -> LaunchTopology:
     run = raw["run"]
     if run["mode"] == RunMode.TRAIN:
         validate_objective(config.skyrl)
+        validate_hf_export_config(config.skyrl)
     runtime = raw["runtime"]
     entrypoint = runtime["entrypoint"]
     registered_rl_entrypoint_module(entrypoint)

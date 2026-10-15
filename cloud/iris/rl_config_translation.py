@@ -9,7 +9,7 @@ from importlib.resources import files
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -19,6 +19,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from skyrl_train.config.objective_spec import validate_objective
+from skyrl_train.config.ftpo import FTPOConfig
 
 from cloud.iris.paths import resolve_paths_in_dict
 from cloud.iris.runtime_environment import CHECKPOINT_EXPORT_ENTRYPOINT as CHECKPOINT_EXPORT_MODULE
@@ -26,7 +27,6 @@ from marinskyrl.environment_contract import TrainingType
 from marinskyrl.distillation import DistillationPlan, compile_distillation_plan, validate_distillation_runtime_support
 from marinskyrl.resource_locator import join_resource_path, model_source_for_path
 from marinskyrl.speculative_decoding import STANDARD_TRAINING_ENTRYPOINT, parse_speculative_decoding_config
-from marinskyrl.harbor_agent_names import DEFAULT_HARBOR_AGENT_NAME
 from marinskyrl.remote_io import filesystem_and_path, open_output_stream
 from marinskyrl.rollout_grading import validate_nemotron_ultra_grading
 
@@ -43,6 +43,7 @@ class RLEntrypoint(StrEnum):
     GENERATE = "generate"
     MINI_SWE = "mini_swe"
     STANDARD = "standard"
+    TASKCOMPENDIUM = "taskcompendium"
     TERMINAL_BENCH = "terminal_bench"
     TERMINAL_BENCH_GENERATE = "terminal_bench_generate"
 
@@ -52,6 +53,7 @@ RL_ENTRYPOINTS = MappingProxyType(
         RLEntrypoint.GENERATE: "skyrl_train.entrypoints.main_generate",
         RLEntrypoint.MINI_SWE: "skyrl_train.entrypoints.mini_swe",
         RLEntrypoint.STANDARD: STANDARD_TRAINING_ENTRYPOINT,
+        RLEntrypoint.TASKCOMPENDIUM: "skyrl_train.entrypoints.taskcompendium",
         RLEntrypoint.TERMINAL_BENCH: "skyrl_train.entrypoints.terminal_bench",
         RLEntrypoint.TERMINAL_BENCH_GENERATE: "skyrl_train.entrypoints.terminal_bench_generate",
     }
@@ -109,7 +111,7 @@ _REQUIRED_CONTEXT_BUDGET_FIELDS = frozenset(
     }
 )
 _CONTEXT_BUDGET_FRACTION_FIELDS = frozenset({"generated_budget_fraction", "overlong_cache_fraction"})
-_CONTEXT_BUDGET_FIELDS = _REQUIRED_CONTEXT_BUDGET_FIELDS | _CONTEXT_BUDGET_FRACTION_FIELDS
+_CONTEXT_BUDGET_FIELDS = _REQUIRED_CONTEXT_BUDGET_FIELDS | _CONTEXT_BUDGET_FRACTION_FIELDS | {"serving_window_tokens"}
 _DEFAULT_GENERATED_BUDGET_FRACTION = 0.5
 _DEFAULT_OVERLONG_CACHE_FRACTION = 0.25
 
@@ -119,11 +121,7 @@ _DERIVED_CONTEXT_FIELDS = (
     ("generator", "max_turns"),
     ("generator", "sampling_params", "max_generate_length"),
     ("generator", "engine_init_kwargs", "max_model_len"),
-    ("terminal_bench", "harbor", "max_episodes"),
     ("terminal_bench", "harbor", "max_turns"),
-    ("terminal_bench", "harbor", "llm_call_kwargs", "max_tokens"),
-    ("terminal_bench", "model_info", "max_input_tokens"),
-    ("terminal_bench", "model_info", "max_output_tokens"),
     ("generator", "trajectory_reward_shaping", "overlong", "l_max"),
     ("generator", "trajectory_reward_shaping", "overlong", "l_cache"),
 )
@@ -136,6 +134,7 @@ class ContextBudget:
     request_window_tokens: int
     max_new_tokens_per_turn: int
     max_turns: int
+    serving_window_tokens: int
     generated_budget_fraction: float = _DEFAULT_GENERATED_BUDGET_FRACTION
     overlong_cache_fraction: float = _DEFAULT_OVERLONG_CACHE_FRACTION
 
@@ -143,24 +142,6 @@ class ContextBudget:
     def max_input_tokens(self) -> int:
         """Return the input allowance after reserving one complete response."""
         return self.request_window_tokens - self.max_new_tokens_per_turn
-
-    @property
-    def opencode_limit_output(self) -> int:
-        """OpenCode's per-request output cap (mirrors harbor ``_resolve_model_limit``)."""
-        return min(self.max_new_tokens_per_turn, max(1, self.max_input_tokens - 1))
-
-    @property
-    def opencode_limit_context(self) -> int:
-        """OpenCode's sliding-window / compaction-trigger size.
-
-        Mirrors the formula in ``harbor/src/harbor/agents/installed/opencode.py``
-        ``_resolve_model_limit``: ``context = window - output - margin`` where
-        ``margin`` reserves a small safety band so ``context + output`` stays
-        strictly below the engine's prompt cap.
-        """
-        output = self.opencode_limit_output
-        margin = min(1024, max(0, self.max_input_tokens - output - 1))
-        return max(1, self.max_input_tokens - output - margin)
 
     @property
     def generated_tokens_per_trajectory(self) -> int:
@@ -178,6 +159,7 @@ class ContextBudget:
         """Return the persisted representation, including derived client input."""
         return {
             "request_window_tokens": self.request_window_tokens,
+            "serving_window_tokens": self.serving_window_tokens,
             "max_new_tokens_per_turn": self.max_new_tokens_per_turn,
             "max_turns": self.max_turns,
             "generated_budget_fraction": self.generated_budget_fraction,
@@ -185,8 +167,6 @@ class ContextBudget:
             "max_input_tokens": self.max_input_tokens,
             "generated_tokens_per_trajectory": self.generated_tokens_per_trajectory,
             "overlong_cache_tokens": self.overlong_cache_tokens,
-            "opencode_limit_context": self.opencode_limit_context,
-            "opencode_limit_output": self.opencode_limit_output,
         }
 
 
@@ -251,6 +231,9 @@ def resolve_context_budget(raw: Dict[str, Any], config_path: Path) -> ContextBud
             config["max_new_tokens_per_turn"], "max_new_tokens_per_turn", config_path
         ),
         max_turns=_require_positive_integer(config["max_turns"], "max_turns", config_path),
+        serving_window_tokens=_require_positive_integer(
+            config.get("serving_window_tokens", config["request_window_tokens"]), "serving_window_tokens", config_path
+        ),
         generated_budget_fraction=_require_fraction(
             config.get("generated_budget_fraction", _DEFAULT_GENERATED_BUDGET_FRACTION),
             "generated_budget_fraction",
@@ -269,6 +252,8 @@ def resolve_context_budget(raw: Dict[str, Any], config_path: Path) -> ContextBud
             f"{config_path}: request_window_tokens ({budget.request_window_tokens}) must exceed "
             f"max_new_tokens_per_turn ({budget.max_new_tokens_per_turn})"
         )
+    if budget.serving_window_tokens < budget.request_window_tokens:
+        raise ValueError(f"{config_path}: serving_window_tokens must cover the complete request_window_tokens")
     return budget
 
 
@@ -285,7 +270,7 @@ def _materialize_context_budget(
     generator["max_input_length"] = budget.max_input_tokens
     generator["max_turns"] = budget.max_turns
     generator.setdefault("sampling_params", {})["max_generate_length"] = budget.max_new_tokens_per_turn
-    generator.setdefault("engine_init_kwargs", {})["max_model_len"] = budget.request_window_tokens
+    generator.setdefault("engine_init_kwargs", {})["max_model_len"] = budget.serving_window_tokens
     generator.setdefault("trajectory_reward_shaping", {})["overlong"] = {
         "l_max": budget.generated_tokens_per_trajectory,
         "l_cache": budget.overlong_cache_tokens,
@@ -294,11 +279,6 @@ def _materialize_context_budget(
     if terminal_bench is not None:
         harbor = terminal_bench.setdefault("harbor", {})
         harbor["max_turns"] = budget.max_turns
-        harbor.setdefault("llm_call_kwargs", {})["max_tokens"] = budget.max_new_tokens_per_turn
-        model_info = terminal_bench.get("model_info") or {}
-        model_info["max_input_tokens"] = budget.max_input_tokens
-        model_info["max_output_tokens"] = budget.max_new_tokens_per_turn
-        terminal_bench["model_info"] = model_info
 
     materialized_raw["context_budget"] = budget.as_dict()
     materialized_raw["trainer"] = copy.deepcopy(trainer)
@@ -630,39 +610,6 @@ def parse_checkpoint_export_config(
     )
 
 
-# Explicit mapping from custom environment import_paths to their base environment
-# types. Used to determine tunnel requirements for custom environments.
-IMPORT_PATH_TO_ENV_TYPE = {
-    "harbor.environments.pooled.daytona_dind:PooledDaytonaDinDEnvironment": "daytona",
-}
-
-
-def extract_terminal_bench_agent_env(parsed: ParsedRLConfig) -> tuple:
-    """Extract (agent_name, harbor_env) from a parsed terminal_bench config.
-
-    Raises:
-        ValueError: If import_path is specified but not in IMPORT_PATH_TO_ENV_TYPE.
-    """
-    tb = parsed.terminal_bench or {}
-    harbor = tb.get("harbor", {})
-
-    agent_name = harbor.get("name", DEFAULT_HARBOR_AGENT_NAME)
-
-    import_path = harbor.get("import_path")
-    if import_path:
-        if import_path not in IMPORT_PATH_TO_ENV_TYPE:
-            raise ValueError(
-                f"Unknown environment import_path: {import_path}\n"
-                f"Add it to IMPORT_PATH_TO_ENV_TYPE in rl_config_translation.py.\n"
-                f"Known import paths: {list(IMPORT_PATH_TO_ENV_TYPE.keys())}"
-            )
-        harbor_env = IMPORT_PATH_TO_ENV_TYPE[import_path]
-    else:
-        harbor_env = harbor.get("environment_type", "daytona")
-
-    return agent_name, harbor_env
-
-
 _OPTIONAL_HYDRA_PATTERNS = {
     ".distillation",
     ".domain_weights",
@@ -725,8 +672,6 @@ class TaskLocalSkyRLValues:
     train_data: tuple[str, ...]
     validation_data: tuple[str, ...]
     terminal_bench_data: tuple[str, ...]
-    agent_api_base: str | None
-    literal_log_path: str | None
     policy_model_path: str | None = None
     draft_model_uri: str | None = None
 
@@ -736,8 +681,6 @@ TASK_LOCAL_SKYRL_PATHS = MappingProxyType(
         "train_data": ("data.train_data",),
         "validation_data": ("data.val_data",),
         "terminal_bench_data": ("data.terminal_bench_data",),
-        "agent_api_base": ("terminal_bench_config.agent_api_base",),
-        "literal_log_path": ("terminal_bench_config.literal_log_path",),
         "policy_model_path": ("trainer.policy.model.path", "trainer.ref.model.path"),
         "draft_model_uri": ("generator.speculative_decoding.model.source_uri",),
     }
@@ -847,11 +790,12 @@ def _skyrl_config_sections(
     if hf_hub_repo_id:
         trainer["hf_hub_repo_id"] = hf_hub_repo_id
     terminal_bench = copy.deepcopy(parsed.terminal_bench)
-    if terminal_bench is not None:
-        if not terminal_bench.get("trials_dir") and experiments_dir and job_name:
-            terminal_bench["trials_dir"] = join_resource_path(experiments_dir, job_name, "trace_jobs")
-        if exp_args.get("trace_root"):
-            terminal_bench["trials_dir"] = exp_args["trace_root"]
+    if terminal_bench is not None and terminal_bench.get("installed_agent") is not None:
+        installed_agent = terminal_bench["installed_agent"]
+        if not installed_agent.get("output_path"):
+            installed_agent["output_path"] = join_resource_path(
+                generator["trajectory_retention"]["output_path"], "installed-agents"
+            )
 
     sections = {
         "trainer": trainer,
@@ -869,11 +813,15 @@ def _skyrl_config_sections(
 
 
 _OPEN_CONFIG_ROOTS = frozenset({"teachers", "teacher_routing", "terminal_bench_config"})
+_FTPO_CONFIG_PATHS = frozenset(f"trainer.algorithm.ftpo.{item.name}" for item in fields(FTPOConfig))
 
 
 def _path_allows_new_keys(path: str) -> bool:
-    return path.split(".", 1)[0] in _OPEN_CONFIG_ROOTS or any(
-        pattern in f".{path}" for pattern in _OPTIONAL_HYDRA_PATTERNS
+    return (
+        path in _FTPO_CONFIG_PATHS
+        or path.startswith("environment.task_sessions.")
+        or path.split(".", 1)[0] in _OPEN_CONFIG_ROOTS
+        or any(pattern in f".{path}" for pattern in _OPTIONAL_HYDRA_PATTERNS)
     )
 
 

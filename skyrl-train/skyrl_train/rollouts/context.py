@@ -60,19 +60,17 @@ class RolloutRequestSpec:
 
     samples_per_prompt: int
     sampling_params: dict
-    environment_class: str
 
     @classmethod
     def from_config(cls, config: DictConfig) -> RolloutRequestSpec:
         return cls(
             samples_per_prompt=config.generator.n_samples_per_prompt,
             sampling_params=get_sampling_params_for_backend(config.generator.backend, config.generator.sampling_params),
-            environment_class=config.environment.env_class,
         )
 
     def request(self, prompt: dict, policy_step: int) -> TrajectoryRequestBatch:
         request, _ = prepare_trajectory_request(
-            [prompt], self.samples_per_prompt, self.sampling_params, self.environment_class, "train", policy_step
+            [prompt], self.samples_per_prompt, self.sampling_params, "train", policy_step
         )
         return request
 
@@ -143,7 +141,7 @@ class TrainingContext:
         buffer: ActorHandle,
         content_policy: RolloutContentPolicy,
         request_spec: RolloutRequestSpec,
-        workers: RolloutWorkers | None,
+        workers: RolloutWorkers,
         payloads: PayloadStore,
         *,
         rollout_spans: bool,
@@ -166,9 +164,7 @@ class TrainingContext:
         self._failure: asyncio.Future | None = None
 
     @classmethod
-    def from_config(
-        cls, config: DictConfig, dataset: PromptGroupDataset, workers: RolloutWorkers | None
-    ) -> TrainingContext:
+    def from_config(cls, config: DictConfig, dataset: PromptGroupDataset, workers: RolloutWorkers) -> TrainingContext:
         algorithm = config.trainer.algorithm
         dynamic_sampling = algorithm.dynamic_sampling
         selection = GroupSelectionPolicy(
@@ -215,15 +211,8 @@ class TrainingContext:
             rollout_spans=config.trainer.rollout_spans,
         )
 
-    def attach_workers(self, workers: RolloutWorkers) -> None:
-        """Attach rollout workers once before dispatch starts."""
-        if self._workers is not None:
-            raise RuntimeError("rollout workers are already attached")
-        self._workers = workers
-
     def start(self) -> None:
         """Start dispatching; the buffer grants no lease before the first ``publish``."""
-        assert self._workers is not None, "rollout workers must be attached before dispatch"
         self._failure = asyncio.get_running_loop().create_future()
         self._dispatcher = asyncio.create_task(self._dispatch())
 

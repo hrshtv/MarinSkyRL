@@ -26,25 +26,31 @@ class CountingFileSystem(AbstractFileSystem):
     protocol = "s3"
     cachable = False
 
-    def __init__(self, payload: bytes, **kwargs):
+    def __init__(self, payload: bytes, shards: dict[str, bytes] | None = None, **kwargs):
         super().__init__(**kwargs)
         self.payload = payload
+        self.shards = shards or {}
         self.opens = 0
         self.reads = 0
         self.bytes_read = 0
         self.fetched_bytes = 0
 
     def info(self, path, **kwargs):
-        return {"name": path, "type": "file", "size": len(self.payload)}
+        return {"name": path, "type": "file", "size": len(self.shards.get(path, self.payload))}
 
     def _open(self, path, mode="rb", block_size=None, cache_type="readahead", **kwargs):
         self.opens += 1
         return CountingBufferedFile(
-            self, path, mode, block_size=S3FileSystem.default_block_size, cache_type=cache_type, size=len(self.payload)
+            self,
+            path,
+            mode,
+            block_size=S3FileSystem.default_block_size,
+            cache_type=cache_type,
+            size=len(self.shards.get(path, self.payload)),
         )
 
     def cat_file(self, path, start=None, end=None, **kwargs):
-        payload = self.payload[start:end]
+        payload = self.shards.get(path, self.payload)[start:end]
         self.fetched_bytes += len(payload)
         return payload
 
@@ -55,34 +61,69 @@ def _write_index(metadata_dir: Path, weight_map: dict[str, str]) -> None:
 
 
 @pytest.mark.parametrize("indexed", [True, False])
+@pytest.mark.parametrize("expert_layout", ["stacked", "split"])
 def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
-    tmp_path: Path, monkeypatch, indexed: bool
+    tmp_path: Path, monkeypatch, indexed: bool, expert_layout: str
 ) -> None:
     shard = tmp_path / "model.safetensors"
     tensors = {f"layer.{index}.weight": torch.arange(8 + index, dtype=torch.float32) for index in range(3)}
-    tensors["experts.weight"] = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    expert_key = "model.layers.0.mlp.experts.down_proj.weight"
+    if expert_layout == "stacked":
+        tensors[expert_key] = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    else:
+        for expert in range(3):
+            tensors[f"model.layers.0.mlp.experts.{expert}.down_proj.weight"] = (
+                torch.arange(4, dtype=torch.float32) + expert
+            )
     tensors["unrequested.weight"] = torch.ones(1024)
-    save_file(tensors, shard)
-    filesystem = CountingFileSystem(shard.read_bytes())
+    expert_shard = tmp_path / "experts.safetensors"
+    split_shards = indexed and expert_layout == "split"
+    if split_shards:
+        save_file({key: value for key, value in tensors.items() if ".experts." not in key}, shard)
+        save_file({key: value for key, value in tensors.items() if ".experts." in key}, expert_shard)
+    else:
+        save_file(tensors, shard)
+    shards = {f"bucket/policy/{expert_shard.name}": expert_shard.read_bytes()} if split_shards else {}
+    filesystem = CountingFileSystem(shard.read_bytes(), shards)
     local_filesystem_for = io._get_filesystem
     monkeypatch.setattr(
         io, "_get_filesystem", lambda path: filesystem if path.startswith("s3://") else local_filesystem_for(path)
     )
     metadata = tmp_path / "metadata"
     if indexed:
-        _write_index(metadata, {key: shard.name for key in tensors})
+        _write_index(
+            metadata,
+            {key: expert_shard.name if split_shards and ".experts." in key else shard.name for key in tensors},
+        )
     else:
         metadata.mkdir()
-    store = RemoteSafetensorsTensorStore("s3://bucket/policy", metadata, lazy_first_dim_patterns=("experts.weight",))
+    # Grug's registered Bridge requires Megatron, which is outside the CPU lane.
+    store = RemoteSafetensorsTensorStore(
+        "s3://bucket/policy",
+        metadata,
+        lazy_first_dim_patterns=(
+            "model.layers.*.mlp.experts.gate_proj.weight",
+            "model.layers.*.mlp.experts.up_proj.weight",
+            "model.layers.*.mlp.experts.down_proj.weight",
+        ),
+    )
     for index in (2, 0, 1):
         key = f"layer.{index}.weight"
         torch.testing.assert_close(store.load_tensors([key])[key], tensors[key])
-    experts = store.load_tensors(["experts.weight"])["experts.weight"]
-    for index in (2, 0, 1):
-        torch.testing.assert_close(experts[index], tensors["experts.weight"][index])
+    if expert_layout == "stacked":
+        experts = store.load_tensors([expert_key])[expert_key]
+        for index in (2, 0, 1):
+            torch.testing.assert_close(experts[index], tensors[expert_key][index])
+    else:
+        expert_keys = [f"model.layers.0.mlp.experts.{expert}.down_proj.weight" for expert in (2, 0, 1)]
+        experts = store.load_tensors(expert_keys)
+        for key in expert_keys:
+            torch.testing.assert_close(experts[key], tensors[key], rtol=0, atol=0)
     unrequested = tensors["unrequested.weight"]
-    expected_bytes = len(filesystem.payload) - unrequested.numel() * unrequested.element_size()
-    assert store.read_stats.opens == filesystem.opens == 1
+    expected_bytes = (
+        len(filesystem.payload) + sum(map(len, shards.values())) - unrequested.numel() * unrequested.element_size()
+    )
+    assert store.read_stats.opens == filesystem.opens == (2 if split_shards else 1)
     assert filesystem.fetched_bytes == filesystem.bytes_read == store.read_stats.bytes_read == expected_bytes
 
 

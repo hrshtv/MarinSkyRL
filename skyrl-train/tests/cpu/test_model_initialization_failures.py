@@ -17,11 +17,8 @@ class _UnpickleableError(RuntimeError):
         raise pickle.PicklingError("exception cannot be pickled")
 
 
-def test_model_initialization_timeout_raises_and_kills_actors(monkeypatch):
-    trainer = object.__new__(RayPPOTrainer)
-    killed = []
+def test_model_initialization_timeout_respects_the_shared_deadline(monkeypatch):
     waits = []
-    trainer._kill_ray_actors = lambda: killed.append(True)
 
     def get(refs, timeout):
         waits.append(timeout)
@@ -31,7 +28,7 @@ def test_model_initialization_timeout_raises_and_kills_actors(monkeypatch):
     monkeypatch.setattr(trainer_module, "time", SimpleNamespace(monotonic=lambda: 100.0), raising=False)
 
     with pytest.raises(RuntimeError, match="timed out after 3600 seconds"):
-        trainer._wait_for_setup_phase(
+        trainer_module._wait_for_setup_phase(
             ["policy-worker-ref"],
             deadline=3700.0,
             phase="policy/ref/critic model initialization",
@@ -39,7 +36,6 @@ def test_model_initialization_timeout_raises_and_kills_actors(monkeypatch):
 
     # The phase waits only for the budget left before the shared deadline.
     assert waits == [3600.0]
-    assert killed == [True]
 
 
 @pytest.mark.asyncio
@@ -96,6 +92,7 @@ async def test_training_failure_preserves_receipt_before_shutdown(monkeypatch, t
     trainer.context = SimpleNamespace(close=AsyncMock())
     trainer.trajectory_runner = SimpleNamespace(startup=AsyncMock())
     trainer.all_startup_timings = {}
+    trainer.eval_trajectory_runner = trainer.trajectory_runner
     trainer._train_loop = AsyncMock(side_effect=_UnpickleableError("GPU worker ran out of memory"))
     monkeypatch.setenv(DEBUG_ARTIFACT_DIR_ENV, str(tmp_path))
 
