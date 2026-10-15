@@ -327,6 +327,17 @@ def _zero_std_group_fraction(uids: Sequence[str], rewards: torch.Tensor) -> floa
     return flat_groups / len(group_rewards)
 
 
+def policy_forward_keys(training_input: TrainingInputBatch) -> list[str]:
+    """The training batch fields the pre-update policy, reference and critic forwards receive: the tokens, the
+    replayed routes when the batch carries them, and each row's serving engine rank when the batch carries it."""
+    keys = ["sequences", "attention_mask"]
+    if training_input.routed_experts is not None:
+        keys.append("rollout_routed_experts")
+    if training_input.get(ROLLOUT_ENGINE_DP_RANKS_KEY) is not None:
+        keys.append(ROLLOUT_ENGINE_DP_RANKS_KEY)
+    return keys
+
+
 class RayPPOTrainer:
     """The rollout-buffer training loop.
 
@@ -2900,9 +2911,7 @@ class RayPPOTrainer:
         # identical (replay) path so step 1 is genuinely on-policy (log_ratio ~ 0).
         # Gated on presence: flag-off (8B / no router-replay) batches keep the
         # original forward inputs. Compact routes are carried as a side field.
-        fwd_keys = ["sequences", "attention_mask"]
-        if training_input.routed_experts is not None:
-            fwd_keys.append("rollout_routed_experts")
+        fwd_keys = policy_forward_keys(training_input)
         data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length"])
         data_fwd_pass.metadata["global_step"] = self.global_step
 
