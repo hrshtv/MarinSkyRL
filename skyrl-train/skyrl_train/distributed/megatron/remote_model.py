@@ -1,8 +1,8 @@
 """Megatron-Bridge adapter for range-backed Hugging Face weights."""
 
 from megatron.bridge.models.hf_pretrained.state import StateDict, StateSource
-
-from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore, lazy_first_dim_patterns_for_bridge
+from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore
+from skyrl_train.distributed.megatron.remote_prefetch import lazy_first_dim_patterns_for_bridge
 
 
 class RemoteSafetensorsStateSource(StateSource):

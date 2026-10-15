@@ -7,6 +7,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from omegaconf import open_dict
+from cloud.iris.hf_model_cache import stage_model_metadata
+from marinskyrl.model_manifest import snapshot_model_manifest
+from skyrl_train.workers.megatron import megatron_worker
 import pytest
 import ray
 import torch
@@ -224,3 +227,45 @@ def test_hero_worker_repeated_updates(tmp_path, monkeypatch, tp, pp, ep, cp, pac
         ray.shutdown()
         if io.exists(checkpoint):
             io.remove(checkpoint)
+
+
+def test_hero_remote_read_modes_load_identical_tensors(tmp_path, monkeypatch):
+    require_hoppers(1)
+
+    class InspectablePolicyWorker(megatron_worker.MegatronPolicyWorkerBase):
+        def remote_read_stats(self):
+            return self.remote_hf_state.store.read_stats
+
+    monkeypatch.setattr(megatron_worker, "PolicyWorker", ray.remote(num_gpus=1)(InspectablePolicyWorker))
+    prefix = os.environ.get("MARIN_TEMP_PREFIX", os.environ.get("MARIN_PREFIX", ""))
+    if not prefix.startswith("s3://"):
+        raise ValueError("Run the Hero remote reader test on Iris with CoreWeave object storage configured")
+    remote = posixpath.join(prefix, "tests", "hero-remote-reader", uuid4().hex)
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    original = write_tiny_hero_checkpoint(model_path)
+    manifest = snapshot_model_manifest(model_path, model_id="tiny-hero", revision="fixture")
+    io.upload_directory(str(model_path), remote)
+    snapshots = []
+    try:
+        for mode in ("per_key", "prefetch"):
+            metadata = tmp_path / mode
+            stage_model_metadata(remote, manifest, str(metadata))
+            assert not tuple(metadata.rglob("*.safetensors"))
+            cfg = _config(str(metadata), world_size=1, pp=1, ep=1)
+            cfg.trainer.policy.model.source_uri = remote
+            cfg.trainer.policy.model.remote_read_mode = mode
+            initialize_ray(cfg)
+            try:
+                policy = _init_policy(cfg, 1)
+                snapshots.append(rank0_validation_snapshot(policy, list(original)))
+                stats = ray.get(policy.async_run_ray_method("pass_through", "remote_read_stats"))[0]
+                assert stats.prefetch_misses == stats.prefetch_unused == 0
+                print(f"Hero remote reader {mode}: {stats}")
+            finally:
+                ray.shutdown()
+        assert snapshots[0].keys() == snapshots[1].keys() == original.keys()
+        for name in original:
+            torch.testing.assert_close(snapshots[0][name], snapshots[1][name], rtol=0, atol=0)
+    finally:
+        io.remove(remote)

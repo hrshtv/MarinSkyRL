@@ -10,8 +10,15 @@ import torch
 
 from cloud.iris.hf_model_cache import stage_model_metadata
 from marinskyrl.model_manifest import snapshot_model_manifest
+from skyrl_train.distributed.megatron.remote_prefetch import (
+    lazy_first_dim_patterns_for_bridge,
+    prefetch_items_from_tasks,
+)
 from skyrl_train.io import io
-from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore, lazy_first_dim_patterns_for_bridge
+import skyrl_train.io.remote_safetensors as remote_safetensors
+from skyrl_train.io.remote_safetensors import (
+    RemoteSafetensorsTensorStore,
+)
 
 
 class CountingBufferedFile(AbstractBufferedFile):
@@ -34,6 +41,7 @@ class CountingFileSystem(AbstractFileSystem):
         self.reads = 0
         self.bytes_read = 0
         self.fetched_bytes = 0
+        self.gets = 0
 
     def info(self, path, **kwargs):
         return {"name": path, "type": "file", "size": len(self.shards.get(path, self.payload))}
@@ -50,6 +58,7 @@ class CountingFileSystem(AbstractFileSystem):
         )
 
     def cat_file(self, path, start=None, end=None, **kwargs):
+        self.gets += 1
         payload = self.shards.get(path, self.payload)[start:end]
         self.fetched_bytes += len(payload)
         return payload
@@ -58,6 +67,163 @@ class CountingFileSystem(AbstractFileSystem):
 def _write_index(metadata_dir: Path, weight_map: dict[str, str]) -> None:
     metadata_dir.mkdir()
     (metadata_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+@pytest.mark.parametrize("expert_layout", ["stacked", "per_expert"])
+@pytest.mark.parametrize("header_padding", [0, 9 * 1024**2])
+def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range_fetches(
+    tmp_path, monkeypatch, expert_layout, header_padding
+):
+    tensors = {f"dense.{index}": torch.arange(8, dtype=torch.float32) + index for index in range(24)}
+    tensors["dense.1"] = tensors["dense.1"].to(torch.bfloat16)
+    if expert_layout == "stacked":
+        tensors["experts"] = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
+    else:
+        tensors.update(
+            {
+                f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight": torch.arange(8, dtype=torch.bfloat16)
+                + expert
+                for expert in range(3)
+                for projection in ("gate", "up", "down")
+            }
+        )
+    tensors["outside"] = torch.arange(8, dtype=torch.float32)
+    shards = {}
+    for name in ("a.safetensors", "b.safetensors"):
+        shard = tmp_path / name
+        save_file(
+            {key: value for key, value in tensors.items() if key.startswith("dense.") == (name == "a.safetensors")},
+            shard,
+            metadata={"padding": "x" * header_padding},
+        )
+        shards[f"bucket/policy/{name}"] = shard.read_bytes()
+    metadata = tmp_path / "metadata"
+    _write_index(metadata, {key: "a.safetensors" if key.startswith("dense.") else "b.safetensors" for key in tensors})
+    tasks = [
+        SimpleNamespace(
+            megatron_module=object(),
+            mapping=SimpleNamespace(
+                hf_param={"left": f"dense.{index}", "right": f"dense.{index + 1}"}, megatron_param="dense"
+            ),
+        )
+        for index in range(0, 24, 2)
+    ]
+    tasks += [
+        SimpleNamespace(
+            megatron_module=object(),
+            mapping=SimpleNamespace(
+                hf_param="experts"
+                if expert_layout == "stacked"
+                else {
+                    projection: f"model.layers.0.mlp.experts.{index}.{projection}_proj.weight"
+                    for projection in ("gate", "up", "down")
+                },
+                megatron_param=str(index),
+            ),
+        )
+        for index in (2, 0)
+    ]
+    tasks += [
+        SimpleNamespace(megatron_module=None, mapping=SimpleNamespace(hf_param="outside", megatron_param="other_pp")),
+        SimpleNamespace(
+            megatron_module=object(), mapping=SimpleNamespace(hf_param="synthesized", megatron_param="synthesized")
+        ),
+        tasks[0],
+    ]
+    results = []
+    for prefetched in (False, True):
+        filesystem = CountingFileSystem(b"", shards=shards)
+        monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
+        store = RemoteSafetensorsTensorStore("s3://bucket/policy", metadata, lazy_first_dim_patterns=("experts",))
+        if prefetched:
+            store.plan_prefetch(prefetch_items_from_tasks(tasks, store.lazy_first_dim_keys, int))
+        for index in range(24):
+            value = store.load_tensors([f"dense.{index}"])[f"dense.{index}"]
+            assert torch.equal(value, tensors[f"dense.{index}"])
+            assert value.dtype == tensors[f"dense.{index}"].dtype
+        if expert_layout == "stacked":
+            experts = store.load_tensors(["experts"])["experts"]
+            for index in (-1, 0):
+                assert torch.equal(experts[index], tensors["experts"][index])
+        else:
+            for index in (2, 0):
+                for projection in ("gate", "up", "down"):
+                    key = f"model.layers.0.mlp.experts.{index}.{projection}_proj.weight"
+                    torch.testing.assert_close(store.load_tensors([key])[key], tensors[key], rtol=0, atol=0)
+        store.close()
+        assert store.read_stats.prefetch_misses == store.read_stats.prefetch_unused == 0
+        assert store.read_stats.gets == filesystem.gets
+        results.append((store.read_stats.bytes_read, filesystem.gets))
+    assert results[0][0] == results[1][0]
+    assert results[1][1] < results[0][1]
+
+
+def test_prefetch_large_tensors_split_ranges_and_keep_windows_bounded(tmp_path, monkeypatch):
+    tensor_bytes = remote_safetensors._PREFETCH_MAX_BLOCK + 1024**2
+    tensors = {str(index): torch.full((tensor_bytes,), index, dtype=torch.uint8) for index in range(3)}
+    shard = tmp_path / "model.safetensors"
+    save_file(tensors, shard)
+    metadata = tmp_path / "metadata"
+    _write_index(metadata, {key: shard.name for key in tensors})
+    filesystem = CountingFileSystem(shard.read_bytes())
+    monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
+    monkeypatch.setattr(remote_safetensors, "_PREFETCH_WINDOW_BYTES", 140 * 1024**2)
+    cat_ranges = filesystem.cat_ranges
+
+    def bounded_ranges(paths, starts, ends, **kwargs):
+        sizes = [end - start for start, end in zip(starts, ends, strict=True)]
+        assert sum(sizes) <= 140 * 1024**2
+        assert max(sizes) <= remote_safetensors._PREFETCH_MAX_BLOCK
+        return cat_ranges(paths, starts, ends, **kwargs)
+
+    monkeypatch.setattr(filesystem, "cat_ranges", bounded_ranges)
+    store = RemoteSafetensorsTensorStore("s3://bucket/policy", metadata)
+    store.plan_prefetch((key, None) for key in tensors)
+    try:
+        for key, tensor in tensors.items():
+            assert torch.equal(store.load_tensors([key])[key], tensor)
+    finally:
+        store.close()
+    assert store.read_stats.prefetch_misses == store.read_stats.prefetch_unused == 0
+
+
+@pytest.mark.parametrize("failure", [False, True], ids=["fallback", "range-error"])
+def test_prefetch_unplanned_key_reads_through_and_range_errors_propagate(tmp_path, monkeypatch, failure):
+    shard = tmp_path / "model.safetensors"
+    tensors = {
+        "planned": torch.arange(8, dtype=torch.float32),
+        "outside": torch.arange(8, dtype=torch.float32) + 10,
+        "oversized": torch.arange(16, dtype=torch.float32),
+        "later": torch.arange(8, dtype=torch.float32) + 20,
+    }
+    save_file(tensors, shard)
+    metadata = tmp_path / "metadata"
+    _write_index(metadata, {key: shard.name for key in tensors})
+    filesystem = CountingFileSystem(shard.read_bytes())
+    monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")))
+    payload_budget = tensors["planned"].numel() * tensors["planned"].element_size()
+    monkeypatch.setattr(
+        remote_safetensors, "_PREFETCH_WINDOW_BYTES", remote_safetensors._PREFETCH_MAX_GAP + payload_budget
+    )
+    store = RemoteSafetensorsTensorStore("s3://bucket/policy", metadata)
+    store.plan_prefetch([("planned", None), ("oversized", None), ("later", None)])
+    try:
+        if failure:
+            monkeypatch.setattr(
+                filesystem, "cat_ranges", lambda *args, **kwargs: [RuntimeError("object-store range failed")]
+            )
+            with pytest.raises(RuntimeError, match="object-store range failed"):
+                store.load_tensors(["planned"])
+        else:
+            assert torch.equal(store.load_tensors(["outside"])["outside"], tensors["outside"])
+            assert torch.equal(store.load_tensors(["planned"])["planned"], tensors["planned"])
+            assert torch.equal(store.load_tensors(["oversized"])["oversized"], tensors["oversized"])
+            assert torch.equal(store.load_tensors(["later"])["later"], tensors["later"])
+            assert store.read_stats.prefetch_misses == 2
+    finally:
+        store.close()
+    if not failure:
+        assert store.read_stats.prefetch_unused == 0
 
 
 @pytest.mark.parametrize("indexed", [True, False])
@@ -85,9 +251,13 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         save_file(tensors, shard)
     shards = {f"bucket/policy/{expert_shard.name}": expert_shard.read_bytes()} if split_shards else {}
     filesystem = CountingFileSystem(shard.read_bytes(), shards)
-    local_filesystem_for = io._get_filesystem
+    local_filesystem_and_path = io.filesystem_and_path
     monkeypatch.setattr(
-        io, "_get_filesystem", lambda path: filesystem if path.startswith("s3://") else local_filesystem_for(path)
+        io,
+        "filesystem_and_path",
+        lambda path: (filesystem, path.removeprefix("s3://"))
+        if path.startswith("s3://")
+        else local_filesystem_and_path(path),
     )
     metadata = tmp_path / "metadata"
     if indexed:
@@ -124,6 +294,7 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         len(filesystem.payload) + sum(map(len, shards.values())) - unrequested.numel() * unrequested.element_size()
     )
     assert store.read_stats.opens == filesystem.opens == (2 if split_shards else 1)
+    assert store.read_stats.gets == filesystem.gets
     assert filesystem.fetched_bytes == filesystem.bytes_read == store.read_stats.bytes_read == expected_bytes
 
 
