@@ -42,6 +42,7 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(
     torch.save(
         {
             "global_step": saved_step,
+            "last_evaluated_step": saved_step,
             "sampler_state": {
                 "completed_updates": sampler_step,
                 "checkpoint_path": str(sampler_checkpoint) if sampler_checkpoint is not None else None,
@@ -126,6 +127,7 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(
     trainer.all_metrics = {}
     trainer._domain_balancer = None
     trainer._restored_rollout_state = None
+    trainer._resume_evaluation_progress = True
     trainer.policy_model = Policy()
     trainer.critic_model = None
     trainer.inference_engine_client = Engine()
@@ -149,6 +151,7 @@ async def test_checkpoint_resume_preserves_original_noise_and_optimizer_state(
     assert trainer.global_step == saved_step
     snapshot = trainer._snapshot_checkpoint(rollout_state)
     saved = torch.load(io.BytesIO(snapshot.trainer_state_payload), weights_only=False)
+    assert saved["last_evaluated_step"] == saved_step
     if refresh_period > 1:
         assert saved["sampler_state"] == {
             "completed_updates": sampler_step,

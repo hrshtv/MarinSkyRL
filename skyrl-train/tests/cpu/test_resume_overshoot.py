@@ -94,6 +94,40 @@ class _RecordingCallbackHandler:
         return control
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resume_step,eval_on_resume,expected_saved_quality",
+    [(0, False, 0.75), (20, False, 0.75), (20, None, 0.25)],
+)
+async def test_resume_evaluation_keeps_scheduled_metrics(tmp_path, resume_step, eval_on_resume, expected_saved_quality):
+    def trainer_at(step, quality, callback):
+        trainer = _make_bare_trainer(global_step=step, total_training_steps=40)
+        trainer.cfg.trainer.export_path = str(tmp_path)
+        trainer.callback_handler = CallbackHandler([callback])
+        trainer._log_metrics_stdout = RayPPOTrainer._log_metrics_stdout.__get__(trainer)
+        trainer.eval.return_value = {"eval/accuracy": quality}
+        return trainer
+
+    original = trainer_at(20, 0.75, EvaluationCallback(eval_steps=20))
+    await original._evaluate_and_log(original._create_trainer_state(epoch=0), commit=True)
+    options = {} if eval_on_resume is None else {"eval_on_resume": eval_on_resume}
+    resumed = trainer_at(resume_step, 0.25, EvaluationCallback(eval_steps=20, **options))
+    state = resumed._create_trainer_state(epoch=0)
+    control = await resumed.callback_handler.call_event_async(
+        "on_train_begin", state, TrainerControl(), trainer=resumed
+    )
+    if control.should_evaluate:
+        await resumed._run_pretraining_evaluation(state)
+
+    saved = json.loads((tmp_path / "training_metrics/eval-00000020.json").read_text())
+    assert saved == {"eval/accuracy": expected_saved_quality}
+    initial_metric = tmp_path / "training_metrics/eval-00000000.json"
+    if resume_step == 0:
+        assert json.loads(initial_metric.read_text()) == {"eval/accuracy": 0.25}
+    else:
+        assert not initial_metric.exists()
+
+
 def test_train_end_saves_the_last_completed_step():
     """Final callbacks and artifacts must use completed steps, not the next step index."""
     trainer = _make_bare_trainer(global_step=17, total_training_steps=16)

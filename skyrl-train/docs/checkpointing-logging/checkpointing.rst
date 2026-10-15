@@ -123,6 +123,27 @@ When an explicit callback list is configured, set the checkpoint callback's
 Cleanup preserves the recent committed checkpoints and any older sampler policies
 they require. A newer partial upload does not evict those restore dependencies.
 
+To preserve scheduled evaluation files when continuing a run, disable the
+evaluation callback's before-training evaluation on resume. Fresh starts still
+evaluate at step zero, and interval and train-end evaluations retain their schedule:
+
+.. code-block:: yaml
+
+    trainer:
+      callbacks:
+        - type: checkpoint
+          save_steps: 13
+        - type: evaluation
+          eval_steps: 20
+          eval_before_train: true
+          eval_on_resume: false
+
+``eval_on_resume`` defaults to true, preserving the existing evaluation behavior.
+Checkpoints retain the last evaluated step at the time of the snapshot. When all
+evaluation callbacks opt out of resume evaluation, that progress is restored, so a
+completed run can recognize an evaluation already saved with its checkpoint.
+Resetting the training step for a new stage clears this evaluation progress.
+
 HuggingFace Model Export
 ------------------------
 

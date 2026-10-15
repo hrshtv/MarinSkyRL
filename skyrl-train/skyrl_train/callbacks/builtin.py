@@ -191,6 +191,7 @@ class EvaluationCallback(TrainerCallback):
         eval_steps: Evaluate every N completed steps; non-positive values disable evaluation.
         eval_on_train_end: Evaluate the final policy.
         eval_before_train: Evaluate the initial policy.
+        eval_on_resume: Allow the before-training evaluation after completed updates are restored.
         additional_evaluations: Named sampling overrides passed to the trainer's evaluator.
         metric_groups: Output metric names mapped to source metrics whose mean is reported.
         stop_when: Metrics mapped to minimum scores or gains over the initial evaluation.
@@ -206,10 +207,12 @@ class EvaluationCallback(TrainerCallback):
         additional_evaluations: Dict[str, Dict[str, Any]] | None = None,
         metric_groups: Dict[str, List[str]] | None = None,
         stop_when: Dict[str, Dict[str, float]] | None = None,
+        eval_on_resume: bool = True,
     ):
         self.eval_steps = eval_steps
         self.eval_on_train_end = eval_on_train_end
         self.eval_before_train = eval_before_train
+        self.eval_on_resume = eval_on_resume
         self.additional_evaluations = {
             name: EvaluationSamplingConfig(**parameters) for name, parameters in (additional_evaluations or {}).items()
         }
@@ -262,7 +265,7 @@ class EvaluationCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        if self.eval_before_train and self.eval_steps > 0:
+        if self.eval_before_train and self.eval_steps > 0 and (self.eval_on_resume or state.global_step == 0):
             control.should_evaluate = True
         return control
 

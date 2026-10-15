@@ -127,7 +127,12 @@ from skyrl_train.config.objective_spec import rollout_logprobs_required
 from skyrl_train.utils.algorithm_registry import PolicyLossRegistry
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
 from skyrl_train.callbacks.base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
-from skyrl_train.callbacks.builtin import CheckpointCallback, DefaultCallbackHandler, RefModelUpdateCallback
+from skyrl_train.callbacks.builtin import (
+    CheckpointCallback,
+    DefaultCallbackHandler,
+    EvaluationCallback,
+    RefModelUpdateCallback,
+)
 from skyrl_train.telemetry import (
     TRAINER_ROLE,
     ConsumedWork,
@@ -298,6 +303,7 @@ class RayPPOTrainer:
     _sampler_checkpoint_path: str | None = None
     _restored_sampler_state: SamplerCheckpointState | None = None
     _last_saved_sampler_state: SamplerCheckpointState | None = None
+    _resume_evaluation_progress: bool = False
 
     _training_metrics_enabled: bool = False
     _rollout_spans_enabled: bool = False
@@ -409,6 +415,13 @@ class RayPPOTrainer:
             self.callback_handler = CallbackHandler(callbacks)
         else:
             self.callback_handler = DefaultCallbackHandler(cfg)
+
+        evaluations = [
+            callback for callback in self.callback_handler.callbacks if isinstance(callback, EvaluationCallback)
+        ]
+        self._resume_evaluation_progress = bool(evaluations) and all(
+            not callback.eval_on_resume for callback in evaluations
+        )
 
         if refresh_period > 1 and str(cfg.trainer.resume_mode) != "none":
             if not any(
@@ -3145,6 +3158,7 @@ class RayPPOTrainer:
         # Save additional trainer state
         trainer_state = {
             "global_step": step,
+            "last_evaluated_step": self._last_evaluated_step,
             "config": self.cfg,
             "distillation_scored_tokens_total": self.distillation_scored_tokens_total,
             "ftpo_stopped": self._ftpo_stopped,
@@ -3303,6 +3317,11 @@ class RayPPOTrainer:
         with io.open_file(trainer_state_path, "rb") as f:
             trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         saved_global_step = trainer_state.get("global_step", global_step)
+        self._last_evaluated_step = (
+            trainer_state.get("last_evaluated_step")
+            if self._resume_evaluation_progress and not self.cfg.trainer.reset_global_step_on_resume
+            else None
+        )
         sampler_state = trainer_state.get("sampler_state")
         self._restored_sampler_state = SamplerCheckpointState(**sampler_state) if sampler_state is not None else None
         self._ftpo_stopped = bool(trainer_state.get("ftpo_stopped", False))
