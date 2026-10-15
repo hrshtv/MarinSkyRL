@@ -17,6 +17,7 @@ from skyrl_train.callbacks.base import TrainerCallback
 from skyrl_train.callbacks.builtin import register_callback
 
 from marinskyrl.checkpoint_paths import POLICY_CHECKPOINT_SUBDIRECTORY
+from marinskyrl.runtime_options import EvaluationRunner
 from tests.cpu.tiny_training.cpu_backend import CHECKPOINT_FILE_TEMPLATE, CausalLMPolicy, CPUPolicyWorker
 from tests.cpu.tiny_training.fixed_batch import fixed_training_batch, run_fixed_update
 from skyrl_train.rollouts.payloads import ROLLOUT_OBJECT_SUFFIX
@@ -329,6 +330,7 @@ class _LateInferenceTinyTrainingExp(_OverlappingTinyTrainingExp):
         return client
 
     def run(self):
+        self.cfg.generator.http_endpoint_port = get_free_port()
         with pytest.raises(ray.exceptions.RayTaskError, match="policy initialization failed"):
             super().run()
         # Return the client after the entrypoint's failure cleanup has already run.
@@ -340,7 +342,7 @@ class _LateInferenceTinyTrainingExp(_OverlappingTinyTrainingExp):
             endpoint.bind((self.cfg.generator.http_endpoint_host, self.cfg.generator.http_endpoint_port))
 
 
-def _run_startup_case(root: Path, model: Path, experiment_class, evaluation_runner="training"):
+def _run_startup_case(root: Path, model: Path, experiment_class, evaluation_runner=EvaluationRunner.TRAINING):
     cfg = experiment.tiny_training_config(
         root,
         model,
@@ -352,12 +354,11 @@ def _run_startup_case(root: Path, model: Path, experiment_class, evaluation_runn
     cfg.trainer.placement.policy_strict_spread_pg = True
     cfg.trainer.placement.overlap_init = True
     cfg.trainer.evaluation_runner = evaluation_runner
-    if evaluation_runner == "task":
+    if evaluation_runner == EvaluationRunner.TASK:
         cfg.trainer.eval_interval = 1
         cfg.data.val_data = list(cfg.data.train_data)
     if experiment_class is _LateInferenceTinyTrainingExp:
         cfg.generator.enable_http_endpoint = True
-        cfg.generator.http_endpoint_port = get_free_port()
     control_root = Path(cfg.trainer.export_path)
     control_root.mkdir(parents=True, exist_ok=True)
     for name in (ENGINE_START_FIFO, POLICY_READY_FIFO, ENGINE_RETURN_FIFO):
@@ -365,11 +366,11 @@ def _run_startup_case(root: Path, model: Path, experiment_class, evaluation_runn
     experiment.run_with_exp(cfg, experiment_class)
 
 
-@pytest.mark.parametrize("evaluation_runner", ["training", "task"])
+@pytest.mark.parametrize("evaluation_runner", [EvaluationRunner.TRAINING, EvaluationRunner.TASK])
 def test_tiny_policy_initializes_while_engines_wait_then_trains(runs, tmp_path, tiny_policy, evaluation_runner):
     _run_in_process(runs, _run_startup_case, tmp_path, tiny_policy, _OverlappingTinyTrainingExp, evaluation_runner)
     _assert_trained_to_max_steps(tmp_path, TrainingMode.ASYNC, RolloutShape.SINGLE_TURN)
-    if evaluation_runner == "task":
+    if evaluation_runner == EvaluationRunner.TASK:
         assert any(any(key.startswith("eval/") for key in record) for record in read_metrics(tmp_path))
 
 

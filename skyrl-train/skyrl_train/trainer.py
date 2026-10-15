@@ -706,7 +706,7 @@ class RayPPOTrainer:
     def _configure_training_schedule(self):
         """Count steps in batches of prompt groups, bounded by the configured limit."""
         self.num_steps_per_epoch, self.total_training_steps = _training_schedule(self.cfg, len(self.train_dataset))
-        self.available_training_steps = self.total_training_steps
+        self.available_training_steps = self.num_steps_per_epoch * self.cfg.trainer.epochs
         logger.info(f"Steps per epoch: {self.num_steps_per_epoch}, total training steps: {self.total_training_steps}")
 
     def _create_trainer_state(self, epoch: int, *, active_step_duration: float | None = None) -> TrainerState:
