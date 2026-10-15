@@ -1,9 +1,10 @@
-"""Generate the copyable schema from Hydra YAML and generation-only annotations."""
+"""Generate the author schema from Hydra YAML and generation-only annotations."""
 
 from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "skyrl-train/skyrl_train/config"
 OUTPUT_DIR = ROOT / "marinskyrl/recipe_schema"
-BASE_CONFIG_NAME = "ppo_base_config"
+SIDECAR = ROOT / "scripts/recipe_schema_sidecar.py"
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,8 @@ def field_comments(source: Path, mount: str = "") -> dict[str, str]:
                     break
                 blocks.insert(0, candidate.lstrip()[1:].strip())
                 previous -= 1
+            if previous >= 0 and lines[previous].lstrip().startswith("# @package"):
+                blocks = []
             # Inline comments begin outside quoted scalar values.
             quote = ""
             escaped = False
@@ -84,16 +87,16 @@ def field_comments(source: Path, mount: str = "") -> dict[str, str]:
 
 
 def source_documents(config_dir: Path) -> SourceDocuments:
-    raw = yaml.safe_load((config_dir / f"{BASE_CONFIG_NAME}.yaml").read_text())
+    raw = yaml.safe_load((config_dir / "ppo_base_config.yaml").read_text())
     selections: dict[str, list[str]] = {}
     for selection in raw["defaults"]:
         if isinstance(selection, dict):
             for key in selection:
                 selections.setdefault(key.partition("@")[0], []).append(key)
     groups = {}
-    comments = field_comments(config_dir / f"{BASE_CONFIG_NAME}.yaml")
+    comments = field_comments(config_dir / "ppo_base_config.yaml")
     with initialize_config_dir(version_base=None, config_dir=str(config_dir.resolve())):
-        base = OmegaConf.to_container(compose(config_name=BASE_CONFIG_NAME), resolve=False)
+        base = OmegaConf.to_container(compose(config_name="ppo_base_config"), resolve=False)
         for folder in sorted(path for path in config_dir.iterdir() if path.is_dir()):
             for key in selections.get(folder.name, [folder.name]):
                 options = {}
@@ -155,9 +158,10 @@ def render_sections(
     undeclared = sidecar["UNDECLARED"]
     owned = owners["DERIVED_PATHS"] | owners["LAUNCH_PATHS"]
     class_names: dict[str, str] = {}
-    declared_classes = sidecar.get("CLASSES", {})
-    aliases = sidecar.get("ALIASES", {})
-    used_names: set[str] = {"RecipeSections", *declared_classes, *aliases}
+    declarations = ast.parse((OUTPUT_DIR / "declared.py").read_text())
+    declared_names = [node.name for node in declarations.body if isinstance(node, ast.ClassDef)]
+    declared_names += [node.targets[0].id for node in declarations.body if isinstance(node, ast.Assign)]
+    used_names: set[str] = {"RecipeSections", "ConfigGroups", *declared_names}
     observed: dict[str, list[Any]] = {}
     schema: dict = {}
     missing = object()
@@ -177,7 +181,7 @@ def render_sections(
     for options in (groups or {}).values():
         for document in options.values():
             inventory(document, schema)
-    for table_name in ("TYPES", "OPEN", "NAMES"):
+    for table_name in ("TYPES", "OPEN"):
         stale = set(sidecar[table_name]) - observed.keys()
         if stale:
             raise ValueError(f"{table_name} paths absent from YAML: {', '.join(sorted(stale))}")
@@ -195,6 +199,13 @@ def render_sections(
                 raise ValueError(f"UNDECLARED parent is not a mapping: {path}")
             node = child
         node[keys[-1]] = default
+
+    declared_paths = {
+        ".".join(path.split(".")[:index]) for path in undeclared for index in range(1, len(path.split(".")) + 1)
+    }
+    stale_names = set(names) - observed.keys() - declared_paths
+    if stale_names:
+        raise ValueError(f"NAMES paths absent from schema: {', '.join(sorted(stale_names))}")
 
     def observe_recipe(document: dict, prefix: str = "") -> None:
         for key, value in document.items():
@@ -238,11 +249,15 @@ def render_sections(
         if isinstance(value, str):
             return "str"
         if isinstance(value, list):
-            annotations = sorted({scalar(item, path) for item in value}) or ["Any"]
+            if not value:
+                raise ValueError(f"{path}: add a TYPES entry")
+            annotations = sorted({scalar(item, path) for item in value})
             return f"tuple[{' | '.join(annotations)}, ...]"
+        if isinstance(value, dict) and not value:
+            return "OpenMap"
         if value is None:
             return "None"
-        return "Any"
+        raise ValueError(f"{path}: add a TYPES entry")
 
     def annotation_for(path: str, value: Any) -> str:
         if path in types or path in open_paths or following_source(value):
@@ -255,13 +270,29 @@ def render_sections(
     def camel(text: str) -> str:
         return "".join(piece.capitalize() for piece in text.replace(".", "_").split("_"))
 
+    mapping_paths = []
+
+    def collect_mappings(path: str, mapping: dict) -> None:
+        mapping_paths.append(path)
+        for key, value in mapping.items():
+            child = f"{path}.{key}"
+            annotation = undeclared[child][0] if child in undeclared else types.get(child)
+            if isinstance(value, dict) and value and child not in owned | open_paths and annotation != "NumberMap":
+                collect_mappings(child, value)
+
+    for key, value in schema.items():
+        if key not in undeclared and types.get(key) not in ("OpenMap", "OpenMap | None"):
+            collect_mappings(key, value)
+    leaf_counts = Counter(path.rsplit(".", 1)[-1] for path in mapping_paths)
+
     def class_name(path: str) -> str:
         if path not in class_names:
-            name = names.get(path, camel(path.rsplit(".", 1)[-1]))
+            leaf = path.rsplit(".", 1)[-1]
+            if path not in names and leaf_counts[leaf] > 1:
+                raise ValueError(f"NAMES needs {path}: {leaf!r} names multiple mappings")
+            name = names.get(path, camel(leaf))
             if name in used_names:
-                name = camel(path)
-            if name in used_names:
-                raise ValueError(f"duplicate class name at {path}: {name}")
+                raise ValueError(f"duplicate class name at {path}: {name}; add a NAMES entry")
             class_names[path] = name
             used_names.add(name)
         return class_names[path]
@@ -306,14 +337,11 @@ def render_sections(
                     expression = "unset_field()"
                 else:
                     expression = f"field({default!r})"
-            if field_path in comments:
-                separator = "" if expression.endswith("()") else ", "
-                expression = expression[:-1] + f"{separator}description={comments[field_path]!r})"
             fields.append(f"    {key}: {annotation} = {expression}")
             if field_path in comments:
                 fields.append(f"    {json.dumps(comments[field_path])}")
         body = "\n".join(fields) if fields else "    pass"
-        emitted.append(f'class {name}(Section):\n    """Author schema at {path}."""\n\n{body}\n')
+        emitted.append(f"class {name}(Section):\n{body}\n")
         return name
 
     root_fields = []
@@ -321,42 +349,40 @@ def render_sections(
         if key in undeclared:
             annotation, default = undeclared[key]
             expression = "unset_field()" if default is Ellipsis else f"field({default!r})"
+        elif types.get(key) in ("OpenMap", "OpenMap | None"):
+            annotation = types[key]
+            expression = f"field({base[key]!r})" if key in base else "unset_field()"
         else:
             section_name = emit(key, value)
             annotation = types.get(key, section_name)
             expression = f"Field(default_factory={section_name})" if key in base else "unset_field()"
         root_fields.append(f"    {key}: {annotation} = {expression}")
+    emitted.append("class RecipeSections(Section):\n" + "\n".join(root_fields) + "\n")
+    group_fields = []
+    for group in ("terminal_bench_config", "algorithm_recipe"):
+        options = (groups or {}).get(group)
+        if options:
+            choices = ", ".join(repr(option) for option in sorted(options))
+            group_fields.append(f"    {group}: Literal[{choices}] = unset_field()")
+    emitted.append("class ConfigGroups(Section):\n" + ("\n".join(group_fields) or "    pass") + "\n")
     emitted.append(
-        'class RecipeSections(RecipeDocument):\n    """Generated author root sections."""\n\n'
-        + "\n".join(root_fields)
-        + "\n"
+        "_namespace = {**vars(declared), **globals()}\n"
+        "for _section in [value for value in _namespace.values() if isinstance(value, type) and issubclass(value, Section)]:\n"
+        "    _section.model_rebuild(_types_namespace=_namespace)\ndel _section, _namespace\n"
     )
-    for name, declarations in declared_classes.items():
-        fields = []
-        for key, (annotation, required) in declarations.items():
-            expression = "field()" if required else "unset_field()"
-            fields.append(f"    {key}: {annotation} = {expression}")
-        emitted.append(
-            f'class {name}(Section):\n    """Sparse author configuration for {name}."""\n\n' + "\n".join(fields) + "\n"
-        )
-    for name, annotation in aliases.items():
-        emitted.append(f"{name} = {annotation}\n")
-    section_names = ", ".join((*class_names.values(), "RecipeSections", *declared_classes))
-    emitted.append(
-        f"for _section in ({section_names},):\n    _section.model_rebuild(_types_namespace=globals())\ndel _section\n"
-    )
-    any_import = ", Any" if any("Any" in source for source in emitted) else ""
-    header = f'''"""Generated by scripts/generate_recipe_schema.py; edit YAML or sidecar.py."""
+    referenced = {node.id for node in ast.walk(ast.parse("\n\n".join(emitted))) if isinstance(node, ast.Name)}
+    imports = ", ".join(name for name in declared_names if name in referenced)
+    header = f'''"""Generated by scripts/generate_recipe_schema.py; edit YAML or scripts/recipe_schema_sidecar.py."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Annotated{any_import}, Literal
+from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, NonNegativeInt, PlainSerializer, PositiveInt
+from pydantic import Field, NonNegativeInt, PositiveInt
 
-from .model import FrozenMap, NumberMap, OpenMap, Section, SectionMap, field, thaw, unset_field
-from .operations import RecipeDocument
+from . import declared
+from .declared import {imports}
+from .model import NumberMap, OpenMap, Section, SectionMap, field, unset_field
 
 '''
     return header + "\n\n".join(emitted)
@@ -366,7 +392,7 @@ def generate(
     config_dir: Path = CONFIG_DIR, output_dir: Path = OUTPUT_DIR, recipe_dir: Path = ROOT / "cloud/iris/configs"
 ) -> dict[str, str]:
     """Return repository-formatted author code; the CLI writes or checks it."""
-    sidecar = runpy.run_path(str(output_dir / "sidecar.py"))
+    sidecar = runpy.run_path(str(SIDECAR))
     owners = runpy.run_path(str(output_dir / "ownership.py"))
     sources = source_documents(config_dir)
     sections = render_sections(
@@ -406,8 +432,6 @@ def generate(
         for node in ast.parse(formatted).body:
             if isinstance(node, ast.ClassDef) and node.name != "RecipeSections":
                 exports.append(node.name)
-            elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-                exports.append(node.targets[0].id)
         declarations = "\n".join(
             line for line in public.read_text().splitlines() if not line.startswith("from .sections import ")
         ).rstrip()

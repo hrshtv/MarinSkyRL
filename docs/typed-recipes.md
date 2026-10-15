@@ -50,7 +50,7 @@ other third-party option maps retain their documented pass-through surfaces; Sky
 keys are checked at the recipe root.
 
 The launcher validates expanded source recipes through `SkyRLRecipe.from_document` before Hydra
-composition. It fills omitted allocation node counts, runtime profiles, ingress modes and data kinds
+composition. It fills omitted allocation node counts, runtime profiles and data kinds
 from the composed configuration and checks supplied values. Authored data lists survive when envelope
 inputs are empty; differing nonempty recipe and envelope lists are rejected. Role GPU counts must fit
 the available hardware. Schema-only fields keep their consumer defaults when absent from the recipe.
@@ -67,10 +67,15 @@ uv run python scripts/generate_recipe_schema.py --check
 ```
 
 Commit the generated sections and public exports with the source edit. Put finite choices, null-default
-structures and other constraints that YAML cannot express in `marinskyrl/recipe_schema/sidecar.py`.
+structures and other constraints that YAML cannot express in `scripts/recipe_schema_sidecar.py`.
 `TYPES`, `OPEN` and `NAMES` paths must exist in YAML. `UNDECLARED` entries represent code-default fields
 and cannot shadow YAML keys. Ellipsis keeps those fields unset in an authored document.
 
 Add a migration row to `REMOVED` in `ownership.py` when an authored key changes. Document validation
 reports that row before an unknown-key error. `terminal_bench.harbor.max_episodes` reports
 "use context_budget.max_turns; Harbor reads max_turns".
+
+Marin imports `marinskyrl.recipe_schema` from the standalone `packages/marinskyrl-recipe` wheel.
+Its only runtime dependency is `pydantic>=2.12.2,<3`. The Marin workspace uses a Git subdirectory
+requirement at the same commit as its isolated launcher environment. Build this project with
+`uv build --wheel packages/marinskyrl-recipe`; the wheel uses the shared schema source directly.

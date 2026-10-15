@@ -1,20 +1,18 @@
-"""The authored context declaration and its launch-side token limits."""
+"""The authored request budget and its launch-side token limits."""
 
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Annotated, Any, Self
 
 from pydantic import Field, PositiveInt, model_validator
 
-from .documents import MISSING, get_path
-from .model import Section
-from .ownership import DERIVED_PATHS, REMOVED
+from .model import Section, unset_field
 
 
 class ContextBudget(Section):
     """Reserve a complete response within one rollout request window."""
 
     request_window_tokens: PositiveInt
+    serving_window_tokens: PositiveInt = unset_field()
     max_new_tokens_per_turn: PositiveInt
     max_turns: PositiveInt
     generated_budget_fraction: Annotated[int | float, Field(gt=0, le=1)] = 0.5
@@ -24,21 +22,15 @@ class ContextBudget(Section):
     def _response_fits(self) -> Self:
         if self.request_window_tokens <= self.max_new_tokens_per_turn:
             raise ValueError("request_window_tokens must exceed max_new_tokens_per_turn")
+        if "serving_window_tokens" not in self.model_fields_set:
+            object.__setattr__(self, "serving_window_tokens", self.request_window_tokens)
+        if self.serving_window_tokens < self.request_window_tokens:
+            raise ValueError("serving_window_tokens must cover the complete request_window_tokens")
         return self
 
     @property
     def max_input_tokens(self) -> int:
         return self.request_window_tokens - self.max_new_tokens_per_turn
-
-    @property
-    def opencode_limit_output(self) -> int:
-        return min(self.max_new_tokens_per_turn, max(1, self.max_input_tokens - 1))
-
-    @property
-    def opencode_limit_context(self) -> int:
-        output = self.opencode_limit_output
-        margin = min(1024, max(0, self.max_input_tokens - output - 1))
-        return max(1, self.max_input_tokens - output - margin)
 
     @property
     def generated_tokens_per_trajectory(self) -> int:
@@ -52,33 +44,32 @@ class ContextBudget(Section):
 
     def as_dict(self) -> dict[str, int | float]:
         return {
-            **self.model_dump(),
+            "request_window_tokens": self.request_window_tokens,
+            "serving_window_tokens": self.serving_window_tokens
+            if "serving_window_tokens" in self.model_fields_set
+            else self.request_window_tokens,
+            "max_new_tokens_per_turn": self.max_new_tokens_per_turn,
+            "max_turns": self.max_turns,
+            "generated_budget_fraction": float(self.generated_budget_fraction),
+            "overlong_cache_fraction": float(self.overlong_cache_fraction),
             "max_input_tokens": self.max_input_tokens,
             "generated_tokens_per_trajectory": self.generated_tokens_per_trajectory,
             "overlong_cache_tokens": self.overlong_cache_tokens,
-            "opencode_limit_context": self.opencode_limit_context,
-            "opencode_limit_output": self.opencode_limit_output,
         }
 
-
-def resolve_context_budget(raw: Mapping[str, Any], config_path: Path) -> ContextBudget:
-    """Validate authored context fields and return their launch token budget."""
-    for path, message in REMOVED.items():
-        if get_path(raw, path) is not MISSING:
-            raise ValueError(f"{config_path}: {path}: {message}")
-    declared = sorted(path for path in DERIVED_PATHS if get_path(raw, path) is not MISSING)
-    if declared:
-        raise ValueError(
-            f"{config_path} declares derived context fields: {', '.join(declared)}; set context_budget instead"
-        )
-    config = raw.get("context_budget")
-    if not isinstance(config, Mapping):
-        raise ValueError(f"{config_path}: context_budget must be a mapping")
-    budget = ContextBudget.model_validate(config)
-    return ContextBudget(
-        request_window_tokens=budget.request_window_tokens,
-        max_new_tokens_per_turn=budget.max_new_tokens_per_turn,
-        max_turns=budget.max_turns,
-        generated_budget_fraction=float(budget.generated_budget_fraction),
-        overlong_cache_fraction=float(budget.overlong_cache_fraction),
-    )
+    def derived_values(self, terminal_bench: Mapping[str, Any] | None) -> dict[str, int]:
+        values = {
+            "trainer.max_prompt_length": self.max_input_tokens,
+            "generator.max_input_length": self.max_input_tokens,
+            "generator.max_turns": self.max_turns,
+            "generator.sampling_params.max_generate_length": self.max_new_tokens_per_turn,
+            "generator.engine_init_kwargs.max_model_len": self.serving_window_tokens
+            if "serving_window_tokens" in self.model_fields_set
+            else self.request_window_tokens,
+            "generator.trajectory_reward_shaping.overlong.l_max": self.generated_tokens_per_trajectory,
+            "generator.trajectory_reward_shaping.overlong.l_cache": self.overlong_cache_tokens,
+            "environment.task_sessions.session.max_turns": self.max_turns,
+        }
+        if terminal_bench is not None:
+            values["terminal_bench.harbor.max_turns"] = self.max_turns
+        return values

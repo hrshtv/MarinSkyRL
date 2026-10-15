@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Protocol
+from typing import Any, Dict, Mapping, Optional, Protocol, get_args, get_origin
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
@@ -24,19 +24,12 @@ from marinskyrl.environment_contract import TrainingType
 from marinskyrl.distillation import DistillationPlan, compile_distillation_plan, validate_distillation_runtime_support
 from marinskyrl.resource_locator import join_resource_path, model_source_for_path
 from marinskyrl.speculative_decoding import parse_speculative_decoding_config
-from marinskyrl.harbor_agent_names import DEFAULT_HARBOR_AGENT_NAME
 from marinskyrl.remote_io import filesystem_and_path, open_output_stream
 from marinskyrl.rollout_grading import validate_nemotron_ultra_grading
-from marinskyrl.recipe_schema import (
-    ContextBudget,
-    RL_ENTRYPOINTS,
-    RLEntrypoint,
-    SkyRLRecipe,
-    resolve_context_budget,
-    validate_engine_init_kwargs,
-    validate_tp_divides_heads,
-)
-from marinskyrl.recipe_schema.sidecar import OPEN, TYPES, UNDECLARED
+from marinskyrl.recipe_schema import ContextBudget, RLEntrypoint, SkyRLRecipe
+from marinskyrl.recipe_schema.model import FrozenMap, Section
+from marinskyrl.recipe_schema.documents import set_path
+from marinskyrl.entrypoints import RL_ENTRYPOINTS
 
 # Directory containing the bundled example RL config YAML files.
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
@@ -93,37 +86,15 @@ class HPCGeometry(Protocol):
 def _materialize_context_budget(
     raw: Dict[str, Any], budget: ContextBudget
 ) -> tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
-    """Return SkyRL sections populated from one resolved context budget."""
-    trainer = copy.deepcopy(raw.get("trainer", {}))
-    generator = copy.deepcopy(raw.get("generator", {}))
-    terminal_bench = copy.deepcopy(raw.get("terminal_bench"))
-    materialized_raw = copy.deepcopy(raw)
-
-    trainer["max_prompt_length"] = budget.max_input_tokens
-    generator["max_input_length"] = budget.max_input_tokens
-    generator["max_turns"] = budget.max_turns
-    generator.setdefault("sampling_params", {})["max_generate_length"] = budget.max_new_tokens_per_turn
-    generator.setdefault("engine_init_kwargs", {})["max_model_len"] = budget.request_window_tokens
-    generator.setdefault("trajectory_reward_shaping", {})["overlong"] = {
-        "l_max": budget.generated_tokens_per_trajectory,
-        "l_cache": budget.overlong_cache_tokens,
-    }
-
-    if terminal_bench is not None:
-        harbor = terminal_bench.setdefault("harbor", {})
-        harbor["max_turns"] = budget.max_turns
-        harbor.setdefault("llm_call_kwargs", {})["max_tokens"] = budget.max_new_tokens_per_turn
-        model_info = terminal_bench.get("model_info") or {}
-        model_info["max_input_tokens"] = budget.max_input_tokens
-        model_info["max_output_tokens"] = budget.max_new_tokens_per_turn
-        terminal_bench["model_info"] = model_info
-
-    materialized_raw["context_budget"] = budget.as_dict()
-    materialized_raw["trainer"] = copy.deepcopy(trainer)
-    materialized_raw["generator"] = copy.deepcopy(generator)
-    if terminal_bench is not None:
-        materialized_raw["terminal_bench"] = copy.deepcopy(terminal_bench)
-    return trainer, generator, terminal_bench, materialized_raw
+    """Populate launch-owned token limits from the authored request budget."""
+    materialized = copy.deepcopy(raw)
+    trainer = materialized.setdefault("trainer", {})
+    generator = materialized.setdefault("generator", {})
+    terminal_bench = materialized.get("terminal_bench")
+    for path, value in budget.derived_values(terminal_bench).items():
+        set_path(materialized, path, value)
+    materialized["context_budget"] = budget.as_dict()
+    return trainer, generator, terminal_bench, materialized
 
 
 def write_resolved_context_budget(budget: ContextBudget, destination: Path | str, config_path: Path) -> Path | str:
@@ -154,6 +125,7 @@ class ParsedRLConfig:
     """Result of parsing an RL configuration YAML file."""
 
     config_path: Path
+    recipe: SkyRLRecipe
     raw: Dict[str, Any]
     context_budget: ContextBudget
     entrypoint: str
@@ -241,67 +213,46 @@ def load_rl_recipe(config_path: str) -> DictConfig:
         )
 
 
-def parse_rl_config(
-    config_path: str,
-    model_override: Optional[str] = None,
-) -> ParsedRLConfig:
-    """Parse an RL config YAML and extract all settings."""
+def parse_rl_config(config_path: str, model_override: str | None = None) -> ParsedRLConfig:
+    """Validate an authored recipe and prepare its sparse launch sections."""
     path = resolve_rl_config_path(config_path)
     raw = OmegaConf.to_container(load_rl_recipe(str(path)), resolve=False) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: RL config must contain a mapping at the document root")
-
     config_groups = raw.get("config_groups", {})
     if "algorithm_recipe" in config_groups:
-        recipe = _compose_config_groups({"algorithm_recipe": config_groups["algorithm_recipe"]}, config_name=None)
-        raw = OmegaConf.to_container(OmegaConf.merge(OmegaConf.to_container(recipe, resolve=False), raw), resolve=False)
+        group = _compose_config_groups({"algorithm_recipe": config_groups["algorithm_recipe"]}, config_name=None)
+        raw = OmegaConf.to_container(OmegaConf.merge(OmegaConf.to_container(group, resolve=False), raw), resolve=False)
         assert isinstance(raw, dict)
-    SkyRLRecipe.from_document(raw)
+    try:
+        recipe = SkyRLRecipe.from_document(raw)
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
     distillation_plan = compile_distillation_plan(raw)
-    context_budget = resolve_context_budget(raw, path)
-
-    entrypoint = resolve_rl_entrypoint(raw.get("entrypoint"), config_path=path)
+    context_budget = recipe.context_budget
+    entrypoint = RL_ENTRYPOINTS[recipe.entrypoint]
     trainer, generator, terminal_bench, materialized_raw = _materialize_context_budget(raw, context_budget)
     data = dict(raw.get("data", {}))
-    environment = raw.get("environment", {})
-    trajectory_runner = raw.get("trajectory_runner", {})
-    # data.kind selects launcher staging and is not part of SkyRL's data config.
-    data_kind = data.pop("kind", "tasks")
-
-    # Validate engine_init_kwargs doesn't contain SkyRL-internal keys.
-    engine_init_kwargs = generator.get("engine_init_kwargs", {})
-    validate_engine_init_kwargs(engine_init_kwargs, config_path=path)
-
-    # Resolve relative paths in config sections to absolute paths so they work
-    # regardless of the working directory at runtime. Skip data.train_data /
-    # data.val_data as they may be HF repo IDs.
+    data.pop("kind", None)
     trainer = resolve_paths_in_dict(trainer, skip_keys=TRAINER_NON_PATH_KEYS)
     generator = resolve_paths_in_dict(generator)
-
     parse_speculative_decoding_config(
         generator.get("speculative_decoding"),
-        backend=generator.get("backend", "vllm"),
-        run_engines_locally=generator.get("run_engines_locally", True),
+        backend=recipe.generator.backend,
+        run_engines_locally=recipe.generator.run_engines_locally,
         entrypoint=entrypoint,
-        colocate_all=trainer.get("placement", {}).get("colocate_all", True),
-        num_inference_engines=generator.get("num_inference_engines", 1),
-        tensor_parallel_size=generator.get("inference_engine_tensor_parallel_size", 4),
-        pipeline_parallel_size=generator.get("inference_engine_pipeline_parallel_size", 1),
+        colocate_all=recipe.trainer.placement.colocate_all,
+        num_inference_engines=recipe.generator.num_inference_engines,
+        tensor_parallel_size=recipe.generator.inference_engine_tensor_parallel_size,
+        pipeline_parallel_size=recipe.generator.inference_engine_pipeline_parallel_size,
         engine_init_kwargs=generator.get("engine_init_kwargs", {}),
         context=f"{path}: generator.speculative_decoding",
     )
-
     if model_override:
         trainer.setdefault("policy", {}).setdefault("model", {})["path"] = model_override
-
-    tensor_parallel_size = generator.get("inference_engine_tensor_parallel_size", 1)
-
-    # TP-divides-heads guard (delphi's 42-head arch forbids TP=8). No-op unless the config
-    # declares model_num_attention_heads.
-    validate_tp_divides_heads(tensor_parallel_size, raw.get("model_num_attention_heads"), config_path=path)
-
     return ParsedRLConfig(
         config_path=path,
+        recipe=recipe,
         raw=materialized_raw,
         context_budget=context_budget,
         entrypoint=entrypoint,
@@ -310,11 +261,11 @@ def parse_rl_config(
         trainer=trainer,
         generator=generator,
         data=data,
-        environment=environment,
-        trajectory_runner=trajectory_runner,
+        environment=materialized_raw.get("environment", {}),
+        trajectory_runner=raw.get("trajectory_runner", {}),
         terminal_bench=terminal_bench,
-        tensor_parallel_size=tensor_parallel_size,
-        data_kind=data_kind,
+        tensor_parallel_size=recipe.generator.inference_engine_tensor_parallel_size,
+        data_kind=recipe.data.kind,
     )
 
 
@@ -335,39 +286,6 @@ def parse_checkpoint_export_config(
         config_groups=dict(raw.get("config_groups", {})),
         trainer=trainer,
     )
-
-
-# Explicit mapping from custom environment import_paths to their base environment
-# types. Used to determine tunnel requirements for custom environments.
-IMPORT_PATH_TO_ENV_TYPE = {
-    "harbor.environments.pooled.daytona_dind:PooledDaytonaDinDEnvironment": "daytona",
-}
-
-
-def extract_terminal_bench_agent_env(parsed: ParsedRLConfig) -> tuple:
-    """Extract (agent_name, harbor_env) from a parsed terminal_bench config.
-
-    Raises:
-        ValueError: If import_path is specified but not in IMPORT_PATH_TO_ENV_TYPE.
-    """
-    tb = parsed.terminal_bench or {}
-    harbor = tb.get("harbor", {})
-
-    agent_name = harbor.get("name", DEFAULT_HARBOR_AGENT_NAME)
-
-    import_path = harbor.get("import_path")
-    if import_path:
-        if import_path not in IMPORT_PATH_TO_ENV_TYPE:
-            raise ValueError(
-                f"Unknown environment import_path: {import_path}\n"
-                f"Add it to IMPORT_PATH_TO_ENV_TYPE in rl_config_translation.py.\n"
-                f"Known import paths: {list(IMPORT_PATH_TO_ENV_TYPE.keys())}"
-            )
-        harbor_env = IMPORT_PATH_TO_ENV_TYPE[import_path]
-    else:
-        harbor_env = harbor.get("environment_type", "daytona")
-
-    return agent_name, harbor_env
 
 
 def _apply_policy_model_source(trainer: Dict[str, Any], exp_args: Dict[str, Any]) -> str | None:
@@ -422,8 +340,6 @@ class TaskLocalSkyRLValues:
     train_data: tuple[str, ...]
     validation_data: tuple[str, ...]
     terminal_bench_data: tuple[str, ...]
-    agent_api_base: str | None
-    literal_log_path: str | None
     policy_model_path: str | None = None
     draft_model_uri: str | None = None
 
@@ -433,8 +349,6 @@ TASK_LOCAL_SKYRL_PATHS = MappingProxyType(
         "train_data": ("data.train_data",),
         "validation_data": ("data.val_data",),
         "terminal_bench_data": ("data.terminal_bench_data",),
-        "agent_api_base": ("terminal_bench_config.agent_api_base",),
-        "literal_log_path": ("terminal_bench_config.literal_log_path",),
         "policy_model_path": ("trainer.policy.model.path", "trainer.ref.model.path"),
         "draft_model_uri": ("generator.speculative_decoding.model.source_uri",),
     }
@@ -546,11 +460,12 @@ def _skyrl_config_sections(
     if hf_hub_repo_id:
         trainer["hf_hub_repo_id"] = hf_hub_repo_id
     terminal_bench = copy.deepcopy(parsed.terminal_bench)
-    if terminal_bench is not None:
-        if not terminal_bench.get("trials_dir") and experiments_dir and job_name:
-            terminal_bench["trials_dir"] = join_resource_path(experiments_dir, job_name, "trace_jobs")
-        if exp_args.get("trace_root"):
-            terminal_bench["trials_dir"] = exp_args["trace_root"]
+    if terminal_bench is not None and terminal_bench.get("installed_agent") is not None:
+        installed_agent = terminal_bench["installed_agent"]
+        if not installed_agent.get("output_path"):
+            installed_agent["output_path"] = join_resource_path(
+                generator["trajectory_retention"]["output_path"], "installed-agents"
+            )
 
     sections = {
         "trainer": trainer,
@@ -567,20 +482,34 @@ def _skyrl_config_sections(
     return sections
 
 
-_OPEN_CONFIG_ROOTS = frozenset({"teachers", "teacher_routing", "terminal_bench_config"})
-_SCHEMA_CONFIG_PATHS = frozenset(UNDECLARED.keys() | TYPES.keys())
-_MAPPING_CONFIG_PATHS = (
-    OPEN
-    | {path for path, annotation in TYPES.items() if annotation == "NumberMap"}
-    | {path for path, (annotation, _) in UNDECLARED.items() if annotation == "NumberMap"}
-)
+def _schema_admission() -> tuple[frozenset[str], frozenset[str]]:
+    paths: set[str] = set()
+    mappings: set[str] = set()
+
+    def visit(annotation: Any, path: str) -> None:
+        if isinstance(annotation, type) and issubclass(annotation, Section):
+            for name, field in annotation.model_fields.items():
+                child = f"{path}.{name}" if path else name
+                paths.add(child)
+                visit(field.annotation, child)
+        elif annotation is FrozenMap or get_origin(annotation) in (dict, Mapping):
+            mappings.add(path)
+        else:
+            for child in get_args(annotation):
+                visit(child, path)
+
+    visit(SkyRLRecipe, "")
+    paths = {"terminal_bench_config" if path == "terminal_bench" else path for path in paths}
+    mappings = {"terminal_bench_config" if path == "terminal_bench" else path for path in mappings}
+    return frozenset(paths), frozenset(mappings)
+
+
+_SCHEMA_CONFIG_PATHS, _MAPPING_CONFIG_PATHS = _schema_admission()
 
 
 def _path_allows_new_keys(path: str) -> bool:
-    if path.split(".", 1)[0] in _OPEN_CONFIG_ROOTS:
-        return True
-    return any(path == declared or declared.startswith(f"{path}.") for declared in _SCHEMA_CONFIG_PATHS) or any(
-        path == declared or path.startswith(f"{declared}.") for declared in _MAPPING_CONFIG_PATHS
+    return path in _SCHEMA_CONFIG_PATHS or any(
+        path == root or path.startswith(f"{root}.") for root in _MAPPING_CONFIG_PATHS
     )
 
 

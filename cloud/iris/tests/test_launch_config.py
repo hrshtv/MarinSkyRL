@@ -12,8 +12,10 @@ import pytest
 import yaml
 from omegaconf import OmegaConf
 from omegaconf.errors import MissingMandatoryValue
+from rolloutengine.contracts import ModelTurn
+from skyrl_gym.answer_tasks import grade_gsm8k
+from skyrl_gym.task_sessions import AnswerTaskSession
 
-from cloud.iris import launch_config as launch_config_module
 from cloud.iris import training_driver
 from cloud.iris.launch_config import LaunchTopology, load_launch_config, validate_launch_config
 from cloud.iris.rl_config_translation import (
@@ -24,6 +26,7 @@ from cloud.iris.rl_config_translation import (
 )
 from marinskyrl.recipe_schema import SkyRLRecipe
 from skyrl_train.distributed.step_policy import NonfiniteStepPolicy, nonfinite_step_policy
+from skyrl_train.dataset.tasks import source_row_task
 
 
 def _raw_config() -> dict[str, Any]:
@@ -114,11 +117,55 @@ def _raw_config() -> dict[str, Any]:
     }
 
 
+def test_launch_rejects_terminal_export_without_request_callback(tmp_path):
+    raw = _raw_config()
+    raw["skyrl"]["trainer"].update(export_hf_artifact=True, ckpt_interval=1, hf_save_interval=-1)
+    path = tmp_path / "launch.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="Terminal HF artifact export"):
+        load_launch_config(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,reward", [("#### 12", 1.0), ("#### 12\nMore reasoning.", 0.0)])
+async def test_custom_session_settings_reach_private_grading_through_the_launch_config(
+    tmp_path: Path, text: str, reward: float
+) -> None:
+    raw = _raw_config()
+    raw["skyrl"]["environment"] = {"task_sessions": {"custom_math": {"reward_method": "final_line"}}}
+    path = tmp_path / "launch.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    config = load_launch_config(path)
+    task = source_row_task(
+        {
+            "prompt": [{"role": "user", "content": "What is six plus six?"}],
+            "env_class": "custom_math",
+            "reward_spec": {"ground_truth": "12"},
+        },
+        0,
+        source_name="fixture",
+        environment_configs=OmegaConf.to_container(config.skyrl.environment.task_sessions, resolve=True),
+    )
+    session = AnswerTaskSession(task, None, grader=grade_gsm8k)
+    start = await session.prepare()
+    try:
+        transition = await session.advance(
+            ModelTurn({"role": "assistant", "content": text}, (), (1,), None, "stop", text)
+        )
+        assert transition.done and transition.grade.reward == reward
+        assert (await session.grade((), stop_reason="stop")).reward == reward
+        assert start.messages == ({"role": "user", "content": "What is six plus six?"},)
+    finally:
+        await session.close()
+
+
 @pytest.mark.parametrize("storage_prefix", ["s3://runs/smoke", "gs://runs/smoke"])
 @pytest.mark.parametrize(("loss", "reduction"), [("regular", "token_mean"), ("gspo", "sequence_mean")])
 @pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize("probe_enabled", [False, True])
 def test_launch_config_composes_and_loads_as_structured_hydra(
-    tmp_path: Path, loss: str, reduction: str, storage_prefix: str, nodes: int
+    tmp_path: Path, loss: str, reduction: str, storage_prefix: str, nodes: int, probe_enabled: bool
 ) -> None:
     path = tmp_path / "resolved-launch.yaml"
     raw = _raw_config()
@@ -132,14 +179,24 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
         "archive_uri": f"{storage_prefix}/mismatch_probe",
         "reuse_probe": f"{storage_prefix}/source/mismatch_probe",
     }
+    if probe_enabled:
+        # The direct engine returns exact model tokens without a transport flag.
+        trainer["mismatch_probe"].update(
+            enabled=True, prompts={"count": 2, "samples_per_prompt": 1}, seed=17, updates=0
+        )
+        raw["skyrl"]["generator"].update(
+            sampling_params={"temperature": 1.0, "logprobs": 0},
+            engine_init_kwargs={"logprobs_mode": "processed_logprobs", "generation_config": "vllm"},
+        )
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
 
     config = load_launch_config(path)
 
     assert config.skyrl.trainer.train_batch_size == 8
-    assert Path(launch_config_module.__file__).resolve() == (
-        Path(__file__).resolve().parents[3] / "cloud/iris/launch_config.py"
-    )
+    nested = copy.deepcopy(raw)
+    nested["skyrl"]["generator"].setdefault("engine_init_kwargs", {})["user_options"] = {"nested": {}}
+    path.write_text(yaml.safe_dump(nested, sort_keys=False))
+    assert OmegaConf.to_container(load_launch_config(path).skyrl.generator.engine_init_kwargs.user_options) == {}
     omitted = copy.deepcopy(raw)
     del omitted["iris"]["allocation"]["num_nodes"]
     del omitted["runtime"]["profile"]
@@ -220,7 +277,7 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
     OmegaConf.save(parquet_config, path)
     with pytest.raises(MissingMandatoryValue, match="data_kind"):
         load_launch_config(path)
-    for section, key, value in (("ingress", "mode", "controller"), ("inputs", "data_kind", "parquet")):
+    for section, key, value in (("inputs", "data_kind", "parquet"),):
         conflicting = copy.deepcopy(raw)
         conflicting.setdefault(section, {})[key] = value
         path.write_text(yaml.safe_dump(conflicting, sort_keys=False))
@@ -244,6 +301,25 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
         path.write_text(yaml.safe_dump(raw, sort_keys=False))
         with pytest.raises(ValueError, match="gspo requires trainer.algorithm.loss_reduction=sequence_mean"):
             load_launch_config(path)
+
+
+def test_dpo_launch_with_omitted_allocation_preserves_the_explicit_document(tmp_path):
+    raw = _raw_config()
+    raw["skyrl"].pop("trainer", None)
+    raw["skyrl"].update(
+        config_groups={"algorithm_recipe": "dpo"},
+        environment={"env_class": "preference_pair"},
+        trainer={
+            "strategy": "megatron",
+            "placement": {"policy_num_nodes": 1, "ref_num_nodes": 1, "policy_num_gpus_per_node": 8},
+        },
+    )
+    path = tmp_path / "dpo.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    explicit = OmegaConf.to_container(load_launch_config(path), resolve=True)
+    del raw["iris"]["allocation"]["num_nodes"]
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(explicit)
 
 
 @pytest.mark.parametrize("switch", ["use_abs_kl", "use_kl_estimator_k3"])
@@ -363,6 +439,19 @@ def test_evaluation_metric_names_survive_iris_path_resolution(tmp_path: Path) ->
 
     assert config.trainer.callbacks[0].metric_groups == groups
     assert config.trainer.callbacks[0].additional_evaluations == profiles
+
+
+def test_installed_agent_artifacts_follow_launch_attempt_and_survive_reload(tmp_path: Path) -> None:
+    raw = _raw_config()
+    raw["skyrl"]["config_groups"] = {"terminal_bench_config": "terminal_bench"}
+    raw["skyrl"]["terminal_bench"] = {"installed_agent": {"agent": {"name": "pi"}}}
+    path = tmp_path / "launch.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    resolved = load_launch_config(path)
+    destination = resolved.skyrl.terminal_bench_config.installed_agent.output_path
+    assert destination == "s3://runs/smoke/attempts/trajectories/installed-agents"
+    OmegaConf.save(resolved, path)
+    assert load_launch_config(path).skyrl.terminal_bench_config.installed_agent.output_path == destination
 
 
 def test_null_nonfinite_limit_in_launch_fails_on_first_invalid_step(tmp_path: Path) -> None:

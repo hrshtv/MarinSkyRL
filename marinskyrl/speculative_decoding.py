@@ -11,7 +11,8 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from marinskyrl.resource_locator import is_cloud_uri, is_hugging_face_repo_id
-from marinskyrl.recipe_schema.rules import RL_ENTRYPOINTS, RLEntrypoint
+from marinskyrl.entrypoints import RL_ENTRYPOINTS
+from marinskyrl.recipe_schema.rules import RLEntrypoint
 
 
 _HF_SOURCE_SCHEME = "hf"

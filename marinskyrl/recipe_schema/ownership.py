@@ -8,14 +8,12 @@ DERIVED_PATHS = frozenset(
         "trainer.max_prompt_length",
         "generator.max_input_length",
         "generator.max_turns",
+        "environment.task_sessions.session.max_turns",
         "generator.sampling_params.max_generate_length",
         "generator.engine_init_kwargs.max_model_len",
         "generator.trajectory_reward_shaping.overlong.l_max",
         "generator.trajectory_reward_shaping.overlong.l_cache",
         "terminal_bench.harbor.max_turns",
-        "terminal_bench.harbor.llm_call_kwargs.max_tokens",
-        "terminal_bench.model_info.max_input_tokens",
-        "terminal_bench.model_info.max_output_tokens",
     }
 )
 
@@ -37,9 +35,6 @@ LAUNCH_PATHS = frozenset(
         "trainer.ref.model.tokenizer_revision",
         "generator.engine_init_kwargs.served_model_name",
         "generator.trajectory_retention.output_path",
-        "terminal_bench.trials_dir",
-        "terminal_bench.agent_api_base",
-        "terminal_bench.literal_log_path",
     }
 )
 
@@ -52,6 +47,17 @@ OWNER_MESSAGES = MappingProxyType(
 
 REMOVED = MappingProxyType(
     {
+        "generator.require_exact_chat_transport": "task sessions use the Rollout Engine transport",
+        "generator.use_conversation_multi_turn": "use environment.task_sessions",
+        "generator.append_eos_token_after_stop_str_in_multi_turn": "use environment.task_sessions",
+        "trainer.algorithm.tito_full": "configure trainer.algorithm.off_policy_correction",
+        "environment.skyrl_gym": "use environment.task_sessions",
+        "terminal_bench.harbor.llm_call_kwargs.max_tokens": "use context_budget and environment.task_sessions",
+        "terminal_bench.model_info.max_input_tokens": "use context_budget and environment.task_sessions",
+        "terminal_bench.model_info.max_output_tokens": "use context_budget and environment.task_sessions",
+        "terminal_bench.trials_dir": "use context_budget and environment.task_sessions",
+        "terminal_bench.agent_api_base": "use context_budget and environment.task_sessions",
+        "terminal_bench.literal_log_path": "use context_budget and environment.task_sessions",
         "trainer.fully_async": "use trainer.rollout_buffer (MarinSkyRL #774)",
         "trainer.async_spans": "use trainer.rollout_spans (MarinSkyRL #774)",
         "trainer.generate_spans": "use trainer.rollout_spans (MarinSkyRL #774)",

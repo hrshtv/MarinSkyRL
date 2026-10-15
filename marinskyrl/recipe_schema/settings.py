@@ -18,12 +18,7 @@ def parse_setting(model: type[Section], key: str, raw: str) -> Any:
     for name in parts:
         options = tuple(_annotations(annotation))
         if FrozenMap in options:
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                if raw.lstrip().startswith(("{", "[", '"')):
-                    raise
-                return raw
+            return _json_or_text(raw)
         mapping = next((option for option in options if get_origin(option) in (dict, Mapping)), None)
         if mapping is not None:
             annotation = get_args(mapping)[1]
@@ -42,8 +37,6 @@ def parse_setting(model: type[Section], key: str, raw: str) -> Any:
 
 def _parse_value(annotation: Any, key: str, raw: str) -> Any:
     options = tuple(_annotations(annotation))
-    if Any in options:
-        raise ValueError(f"setting {key!r} targets an untyped field; add its sidecar annotation")
     adapter = TypeAdapter(annotation)
     if raw == "null" or any(
         option is FrozenMap
@@ -52,12 +45,7 @@ def _parse_value(annotation: Any, key: str, raw: str) -> Any:
         and issubclass(option, Section)
         for option in options
     ):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            if raw.lstrip().startswith(("{", "[", '"')):
-                raise
-            return adapter.validate_strings(raw)
+        return _json_or_text(raw)
     parsed = adapter.validate_strings(raw)
     if int in options and float in options:
         try:
@@ -73,3 +61,12 @@ def _annotations(annotation: Any):
     yield annotation
     for child in get_args(annotation):
         yield from _annotations(child)
+
+
+def _json_or_text(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        if raw.lstrip().startswith(("{", "[", '"')):
+            raise
+        return raw

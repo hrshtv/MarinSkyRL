@@ -2,24 +2,34 @@
 
 import ast
 import json
-import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
+
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 
 
-def test_importing_launch_does_not_import_training_stacks() -> None:
-    program = """
+@pytest.mark.parametrize(
+    "module,blocked",
+    [
+        ("cloud.iris.launch", ("flash_attn", "ray", "skyrl_train.objective", "skyrl_train.trainer", "torch", "vllm")),
+        (
+            "skyrl_train.entrypoints.main_base",
+            ("flash_attn", "skyrl_train.objective", "skyrl_train.trainer", "torch", "vllm"),
+        ),
+    ],
+)
+def test_importing_entrypoints_does_not_import_training_stacks(module, blocked) -> None:
+    program = f"""
 import json
 import sys
 
-import cloud.iris.launch
+import {module}
 
-blocked = ("flash_attn", "ray", "skyrl_train.objective", "skyrl_train.trainer", "torch", "vllm")
+blocked = {blocked!r}
 print(json.dumps(sorted(name for name in blocked if name in sys.modules)))
 """
     result = subprocess.run(
@@ -55,7 +65,7 @@ print(json.dumps(sorted(name for name in blocked if name in sys.modules)))
     assert json.loads(result.stdout) == []
 
 
-def test_recipe_schema_copies_and_round_trips_without_launcher_dependencies_or_import_io(tmp_path):
+def test_recipe_schema_imports_only_its_runtime_dependencies():
     source = REPOSITORY_ROOT / "marinskyrl/recipe_schema"
     for path in source.glob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
@@ -67,82 +77,3 @@ def test_recipe_schema_copies_and_round_trips_without_launcher_dependencies_or_i
                     assert node.level == 1 and (source / f"{node.module}.py").is_file(), path
                 else:
                     assert node.module.split(".")[0] in sys.stdlib_module_names | {"pydantic"}, path
-    copied = tmp_path / "copied_recipe"
-    shutil.copytree(source, copied, ignore=shutil.ignore_patterns("__pycache__"))
-    program = """
-import json
-import os
-from pathlib import Path
-import pickle
-import sys
-
-from pydantic import BaseModel
-
-class Bootstrap(BaseModel):
-    value: int
-
-class ImportIOError(Exception):
-    pass
-
-def audit(event, args):
-    if event == "open":
-        path, mode, flags = args
-        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
-            raise ImportIOError("schema import writes a file")
-        caller = sys._getframe(1)
-        import_read = (
-            caller.f_globals.get("__name__") == "importlib._bootstrap_external"
-            and caller.f_code.co_name == "get_data"
-        )
-        if not import_read or not isinstance(path, str) or Path(path).suffix not in {".py", ".pyc", ".so"}:
-            raise ImportIOError(f"schema import reads a resource: {path}")
-    elif event in {"socket.connect", "socket.bind", "subprocess.Popen", "os.system", "os.remove", "os.rename"}:
-        raise ImportIOError(f"schema import performs I/O: {event}")
-
-sys.addaudithook(audit)
-try:
-    import copied_recipe as schema
-except ImportIOError:
-    print(json.dumps({"import_io": True}))
-    raise SystemExit(1)
-
-assert Path(schema.__file__).resolve() == Path.cwd() / "copied_recipe/__init__.py"
-budget = schema.ContextBudget(request_window_tokens=256, max_new_tokens_per_turn=64, max_turns=4)
-recipe = schema.SkyRLRecipe.combine(
-    base=schema.SkyRLRecipe(context_budget=budget),
-    arm=schema.RecipePatch(data=schema.Data(sampling=schema.Sampling(domain_weights={"math": 1, "code": 2}))),
-).with_settings(["data.sampling.domain_weights.math=3"])
-restored = schema.SkyRLRecipe.from_document(recipe.to_skyrl())
-assert restored == recipe
-assert pickle.loads(pickle.dumps(recipe)) == recipe
-assert hash(restored) == hash(recipe)
-blocked = {"cloud", "hydra", "omegaconf", "ray", "skyrl_train", "torch", "yaml"}
-assert not blocked.intersection(name.split(".")[0] for name in sys.modules)
-print(json.dumps({"source": schema.__file__, "document": restored.to_skyrl()}))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"},
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    output = json.loads(result.stdout)
-    assert Path(output["source"]) == copied / "__init__.py"
-    assert output["document"] == {
-        "context_budget": {"request_window_tokens": 256, "max_new_tokens_per_turn": 64, "max_turns": 4},
-        "data": {"sampling": {"domain_weights": {"math": 3, "code": 2}}},
-    }
-    print(f"copied schema source: {output['source']}")
-    entrypoint = copied / "__init__.py"
-    entrypoint.write_text(entrypoint.read_text() + "\nfrom pathlib import Path\nPath(__file__).read_text()\n")
-    rejected = subprocess.run(
-        [sys.executable, "-c", program],
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"},
-        capture_output=True,
-        text=True,
-    )
-    assert rejected.returncode == 1
-    assert json.loads(rejected.stdout) == {"import_io": True}

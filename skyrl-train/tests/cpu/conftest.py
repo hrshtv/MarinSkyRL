@@ -1,6 +1,5 @@
 import json
 import os
-from pathlib import Path
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,9 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
-
-import marinskyrl.recipe_schema as schema
-from scripts import generate_recipe_schema as generator
 
 # CPU tests already run in the locked uv environment. Ray's uv hook would package
 # this checkout and create another environment for every local Ray session.
@@ -25,6 +21,13 @@ from marinskyrl.environment_contract import TrainingType  # noqa: E402
 from skyrl_train import telemetry as training_telemetry  # noqa: E402
 from skyrl_train.distillation import ChosenTokenTeacherEvidence  # noqa: E402
 from skyrl_train.trajectory_runners.types import TrajectoryID, VerifierTestCollection  # noqa: E402
+from tests.cpu.task_specs import lowered_task  # noqa: E402
+from tests.cpu.util import stub_megatron_modules  # noqa: E402
+
+
+@pytest.fixture
+def task_lowering():
+    return lowered_task
 
 
 # A slow test starts its own Ray cluster of about 4 GiB, and four workers running the rest of the suite fill most
@@ -33,15 +36,6 @@ from skyrl_train.trajectory_runners.types import TrajectoryID, VerifierTestColle
 # pytest-xdist sets this in each worker process.
 XDIST_WORKER_COUNT_ENV = "PYTEST_XDIST_WORKER_COUNT"
 HOST_MEMORY_PER_SLOW_TEST_BYTES = 12 * 2**30
-
-
-@pytest.fixture(scope="session")
-def generated_recipe_schema():
-    root = Path(__file__).resolve().parents[3]
-    assert Path(schema.__file__).resolve() == root / "marinskyrl/recipe_schema/__init__.py"
-    assert Path(generator.__file__).resolve() == root / "scripts/generate_recipe_schema.py"
-    print(f"CPU recipe sources: {schema.__file__}; {generator.__file__}")
-    return schema.RecipePatch, OmegaConf.create(generator.source_documents(generator.CONFIG_DIR).base)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -75,6 +69,30 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     group_count = min(int(worker_count), max(1, round(host_memory / HOST_MEMORY_PER_SLOW_TEST_BYTES)))
     for index, item in enumerate(slow):
         item.add_marker(pytest.mark.xdist_group(f"slow-{index % group_count}"))
+
+
+@pytest.fixture
+def megatron_wrapper(monkeypatch):
+    """Construct replay wrappers with single-rank CPU parallel state."""
+    stub_megatron_modules()
+    # Megatron is optional in CPU CI; load the wrapper after installing its stubs.
+    from skyrl_train.workers.megatron import megatron_model_wrapper as mmw
+
+    monkeypatch.setattr(mmw, "get_model_config", lambda model: model.config)
+    monkeypatch.setattr(mmw.mpu, "is_pipeline_first_stage", lambda **kwargs: True, raising=False)
+    monkeypatch.setattr(mmw.mpu, "is_pipeline_last_stage", lambda **kwargs: True, raising=False)
+    monkeypatch.setattr(mmw.mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(mmw.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(mmw.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+
+    def build(*, packing, controller, num_experts):
+        config = OmegaConf.create({"trainer": {"use_sample_packing": packing}})
+        actor = SimpleNamespace(config=SimpleNamespace(num_moe_experts=num_experts))
+        wrapper = mmw.MegatronModelWrapper(config, [actor], logprob_chunk_size=None)
+        wrapper.router_replay = controller
+        return wrapper
+
+    return build
 
 
 @pytest.fixture

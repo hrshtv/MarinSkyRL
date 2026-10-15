@@ -12,19 +12,21 @@ from typing import Any, Mapping
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from skyrl_train.config.mismatch_probe import validate_mismatch_probe_config
+from skyrl_train.config.callbacks import validate_hf_export_config
 from skyrl_train.config.objective_spec import validate_objective
 
 from cloud.iris.ray_storage import RaySpillBackend, resolve_ray_spill_target
-from cloud.iris.role_plan import derive_num_nodes, derive_role_plan
+from cloud.iris.role_plan import derive_num_nodes, derive_policy_export_role_plan, derive_role_plan
 from cloud.iris.rl_config_translation import (
     compose_skyrl_config,
     parse_rl_config,
     registered_rl_entrypoint_module,
-    role_gpus_per_node,
     training_type_for_entrypoint,
 )
 from cloud.iris.runtime_environment import RuntimeMode, runtime_profile_for_strategy
-from marinskyrl.recipe_schema import Generator, RL_ENTRYPOINTS, RLEntrypoint, Trainer, validate_tp_divides_heads
+from marinskyrl.entrypoints import RL_ENTRYPOINTS
+from marinskyrl.recipe_schema import RLEntrypoint
+from marinskyrl.recipe_schema.rules import validate_tp_divides_heads
 from marinskyrl.distillation import validate_generation_logprobs
 from marinskyrl.resource_locator import is_cloud_uri, join_resource_path
 from marinskyrl.task_sources import data_source
@@ -118,16 +120,6 @@ class IrisConfig:
 
 
 @dataclass
-class IngressConfig:
-    """Optional controller ingress and literal-recording settings."""
-
-    mode: str = MISSING
-    host: str = ""
-    record_literal: bool = False
-    vllm_http_port: int = 8000
-
-
-@dataclass
 class RayConfig:
     """Ray bootstrap settings shared by every task replica."""
 
@@ -172,7 +164,6 @@ class SkyRLLaunchConfig:
     run: RunConfig = field(default_factory=RunConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     iris: IrisConfig = field(default_factory=IrisConfig)
-    ingress: IngressConfig = field(default_factory=IngressConfig)
     ray: RayConfig = field(default_factory=RayConfig)
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     inputs: InputsConfig = field(default_factory=InputsConfig)
@@ -190,7 +181,7 @@ def _is_source_recipe(skyrl: DictConfig) -> bool:
     return "context_budget" in skyrl or "config_groups" in skyrl or "defaults" in skyrl
 
 
-def _compose_source_recipe(config: DictConfig) -> DictConfig:
+def _compose_source_recipe(config: DictConfig) -> tuple[DictConfig, str]:
     raw_skyrl = OmegaConf.to_container(config.skyrl, resolve=False)
     if not isinstance(raw_skyrl, dict):
         raise TypeError("skyrl must be a mapping")
@@ -213,40 +204,9 @@ def _compose_source_recipe(config: DictConfig) -> DictConfig:
                 raise ValueError(
                     "iris.allocation.num_nodes is unset; the expanded recipe must set " + ", ".join(missing)
                 )
-            trainer_defaults = Trainer()
-            trainer = {**parsed.trainer}
-            for key in ("train_batch_size", "policy_mini_batch_size", "micro_train_batch_size_per_gpu"):
-                trainer.setdefault(key, getattr(trainer_defaults, key))
-            trainer["algorithm"] = {
-                "use_kl_loss": trainer_defaults.algorithm.use_kl_loss,
-                "use_kl_in_reward": trainer_defaults.algorithm.use_kl_in_reward,
-                **trainer.get("algorithm", {}),
-            }
-            authored_placement = trainer.get("placement", {})
-            placement = {**trainer_defaults.placement.model_dump(mode="json"), **authored_placement}
-            for key in ("policy_num_gpus_per_node", "ref_num_gpus_per_node"):
-                placement[key] = role_gpus_per_node(authored_placement, key, int(config.iris.allocation.gpus_per_node))
-            trainer["placement"] = placement
-            generator_defaults = Generator()
-            generator = {**parsed.generator}
-            for key in (
-                "backend",
-                "run_engines_locally",
-                "inference_engine_tensor_parallel_size",
-                "inference_engine_pipeline_parallel_size",
-                "inference_engine_data_parallel_size",
-                "inference_engine_expert_parallel_size",
-                "inference_engine_mp_backend",
-                "n_samples_per_prompt",
-            ):
-                generator.setdefault(key, getattr(generator_defaults, key))
-            num_nodes = derive_num_nodes(derive_role_plan({**parsed.raw, "trainer": trainer, "generator": generator}))
-        else:
-            num_nodes = int(config.iris.allocation.num_nodes)
         parameters = {
             "job_name": str(config.iris.job_name),
             "experiments_dir": str(config.runtime.experiments_dir),
-            "num_nodes": num_nodes,
             "gpus_per_node": int(config.iris.allocation.gpus_per_node),
             "model_path": str(config.inputs.model.local_path),
             "model_source_uri": model_uri if model_is_cloud else None,
@@ -257,11 +217,12 @@ def _compose_source_recipe(config: DictConfig) -> DictConfig:
             "checkpoint_root": str(config.artifacts.checkpoint_root),
             "export_root": str(config.artifacts.export_root),
             "resume_checkpoint_count": int(config.artifacts.resume_checkpoint_count),
-            "trace_root": join_resource_path(str(config.artifacts.attempts_root), "trace_jobs"),
             "trajectory_root": join_resource_path(str(config.artifacts.attempts_root), "trajectories"),
             "export_hf_artifact": bool(config.run.export_hf),
             "seed": int(config.run.seed),
         }
+        if not nodes_unset:
+            parameters["num_nodes"] = int(config.iris.allocation.num_nodes)
         compiled = compose_skyrl_config(
             parsed,
             parameters,
@@ -276,8 +237,7 @@ def _compose_source_recipe(config: DictConfig) -> DictConfig:
     )
     resolved.runtime.training_type = None if training_type is None else training_type.value
     resolved.skyrl = compiled.config
-    _fill_launch_fields(resolved, data_kind=parsed.data_kind)
-    return compose_launch_config(resolved)
+    return compose_launch_config(resolved), parsed.data_kind
 
 
 def _fill_launch_fields(config: DictConfig, *, data_kind: str | None = None) -> None:
@@ -285,39 +245,33 @@ def _fill_launch_fields(config: DictConfig, *, data_kind: str | None = None) -> 
     skyrl = OmegaConf.to_container(config.skyrl, resolve=True)
     if not isinstance(skyrl, dict):
         raise TypeError("skyrl must be a mapping")
-    plan = derive_role_plan(skyrl)
     checkpoint_export = config.run.mode == RunMode.CHECKPOINT_EXPORT
-    nodes = plan.claim("policy").num_nodes if checkpoint_export else derive_num_nodes(plan)
-    profile = runtime_profile_for_strategy(
-        skyrl.get("trainer", {}).get("strategy"),
-        mode=RuntimeMode.CHECKPOINT_EXPORT if checkpoint_export else RuntimeMode.TRAINING,
-    ).value
-    harbor = (skyrl.get("terminal_bench_config") or {}).get("harbor", {})
-    ingress = "controller" if harbor.get("name") == "opencode" else "direct"
-    expected = {
-        "iris.allocation.num_nodes": nodes,
-        "runtime.profile": profile,
-        "ingress.mode": ingress,
-    }
+    plan = derive_policy_export_role_plan(skyrl) if checkpoint_export else derive_role_plan(skyrl)
+    if OmegaConf.is_missing(config.iris.allocation, "num_nodes"):
+        config.iris.allocation.num_nodes = derive_num_nodes(plan)
+    if OmegaConf.is_missing(config.runtime, "profile"):
+        config.runtime.profile = runtime_profile_for_strategy(
+            skyrl.get("trainer", {}).get("strategy"),
+            mode=RuntimeMode.CHECKPOINT_EXPORT if checkpoint_export else RuntimeMode.TRAINING,
+        ).value
     if data_kind is not None:
-        expected["inputs.data_kind"] = data_kind
-    for path, value in expected.items():
-        parent_path, _, name = path.rpartition(".")
-        parent = OmegaConf.select(config, parent_path)
-        if OmegaConf.is_missing(parent, name):
-            OmegaConf.update(config, path, value)
-        elif path in {"ingress.mode", "inputs.data_kind"} and parent[name] != value:
-            raise ValueError(f"{path}={parent[name]!r} does not match the composed SkyRL value {value!r}")
+        if OmegaConf.is_missing(config.inputs, "data_kind"):
+            config.inputs.data_kind = data_kind
+        elif config.inputs.data_kind != data_kind:
+            raise ValueError(
+                f"inputs.data_kind={config.inputs.data_kind!r} does not match the composed SkyRL value {data_kind!r}"
+            )
 
 
 def load_launch_config(path: Path) -> DictConfig:
     """Load and validate one complete SkyRL launch document."""
     config = compose_launch_config(OmegaConf.load(path))
+    data_kind = None
     if _is_source_recipe(config.skyrl):
         if config.run.mode != RunMode.TRAIN:
             raise ValueError("checkpoint_export launch configs must already contain a composed SkyRL subtree")
-        config = _compose_source_recipe(config)
-    _fill_launch_fields(config)
+        config, data_kind = _compose_source_recipe(config)
+    _fill_launch_fields(config, data_kind=data_kind)
     probe = config.skyrl.get("trainer", {}).get("mismatch_probe", {})
     if probe.get("enabled") and not probe.get("archive_uri"):
         artifact_root = posixpath.dirname(str(config.artifacts.resolved_config_uri))
@@ -352,15 +306,15 @@ def _validate_inputs(inputs: dict[str, Any]) -> None:
 
 
 def validate_iris_allocation(config: dict[str, Any]) -> IrisAllocationConfig:
-    """Validate explicit Iris resources against the canonical SkyRL role plan."""
+    """Validate explicit Iris resources against the launch mode's active roles."""
     skyrl = config["skyrl"]
     if not isinstance(skyrl, dict):
         raise TypeError("skyrl must be a mapping")
-    plan = derive_role_plan(skyrl)
+    checkpoint_export = config["run"]["mode"] == RunMode.CHECKPOINT_EXPORT
+    plan = derive_policy_export_role_plan(skyrl) if checkpoint_export else derive_role_plan(skyrl)
     allocation = config["iris"]["allocation"]
     policy = plan.claim("policy")
-    checkpoint_export = config["run"]["mode"] == RunMode.CHECKPOINT_EXPORT
-    expected_nodes = policy.num_nodes if checkpoint_export else derive_num_nodes(plan)
+    expected_nodes = derive_num_nodes(plan)
     if allocation["num_nodes"] != expected_nodes:
         raise ValueError(
             f"iris.allocation.num_nodes={allocation['num_nodes']} does not match SkyRL role plan's "
@@ -390,8 +344,6 @@ def validate_launch_config(config: DictConfig) -> LaunchTopology:
         raise ValueError(f"unsupported run.submission: {raw['run']['submission']!r}")
     if raw["inputs"]["data_kind"] not in {"tasks", "parquet"}:
         raise ValueError(f"unsupported inputs.data_kind: {raw['inputs']['data_kind']!r}")
-    if raw["ingress"]["mode"] not in {"direct", "controller"}:
-        raise ValueError(f"unsupported ingress.mode: {raw['ingress']['mode']!r}")
     if raw["iris"]["timeout"] < 0:
         raise ValueError("iris.timeout cannot be negative")
     _validate_inputs(raw["inputs"])
@@ -416,6 +368,7 @@ def validate_launch_config(config: DictConfig) -> LaunchTopology:
     run = raw["run"]
     if run["mode"] == RunMode.TRAIN:
         validate_objective(config.skyrl)
+        validate_hf_export_config(config.skyrl)
     runtime = raw["runtime"]
     entrypoint = runtime["entrypoint"]
     registered_rl_entrypoint_module(entrypoint)
