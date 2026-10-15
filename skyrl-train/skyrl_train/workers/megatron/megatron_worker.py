@@ -1,6 +1,5 @@
 import asyncio
 import copy
-import importlib.util
 import os
 from collections import defaultdict
 from datetime import timedelta
@@ -15,11 +14,12 @@ import torch.distributed
 from huggingface_hub import snapshot_download
 from loguru import logger
 from megatron.bridge import AutoBridge
-from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from omegaconf import OmegaConf
 from skyrl_train.distributed.dispatch import MeshRank
+from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
 from skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
@@ -30,7 +30,6 @@ from skyrl_train.distributed.megatron.megatron_utils import (
 from skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
-    init_megatron_optim_config,
 )
 from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state
 from skyrl_train.distributed.utils import init_worker_process_group_with_device
@@ -61,7 +60,9 @@ from skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronModelWrapper,
     MegatronPolicyMicroBatch,
 )
+from skyrl_train.workers.megatron.bridge_provider_config import configure_bridge_provider
 from skyrl_train.workers.megatron.router_replay_install import install_megatron_router_replay
+from skyrl_train.workers.megatron.output_projection_layout import install_dpo_batch_major_output_projection
 from skyrl_train.workers.megatron.weight_extractor import BucketedMegatronWeightExtractor, mapping_hf_names
 from skyrl_train.workers.worker import (
     CriticWorkerBase,
@@ -149,21 +150,15 @@ class MegatronWorker:
             if model_source_uri:
                 self.remote_hf_state = install_remote_hf_state(bridge, model_source_uri, model_path)
             provider = bridge.to_megatron_provider()
-            provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
-            provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
-            provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
-            provider.context_parallel_size = megatron_config.context_parallel_size
-            provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
-            provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
-            provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
-            provider.attention_backend = "flash" if flash_attn else "fused"
-            provider.variable_seq_lengths = True
-            provider.masked_softmax_fusion = True
-            provider.moe_token_dispatcher_type = "alltoall"
-            # Megatron-Bridge enables wgrad fusion whenever Transformer Engine is present, but the
-            # non-TE output layer still needs APEX's fused_weight_gradient_mlp_cuda extension.
-            provider.gradient_accumulation_fusion = (
-                importlib.util.find_spec("fused_weight_gradient_mlp_cuda") is not None
+            configure_bridge_provider(
+                provider,
+                tensor_model_parallel_size=megatron_config.tensor_model_parallel_size,
+                pipeline_model_parallel_size=megatron_config.pipeline_model_parallel_size,
+                context_parallel_size=megatron_config.context_parallel_size,
+                expert_model_parallel_size=megatron_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=megatron_config.expert_tensor_parallel_size,
+                bf16=bf16,
+                attention_backend="flash" if flash_attn else "fused",
             )
 
             for k, v in transformer_config_kwargs.items():
@@ -197,6 +192,7 @@ class MegatronWorker:
             model = self.provider.provide_distributed_model(
                 ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
             )
+            install_dpo_batch_major_output_projection(model, self.provider, self.cfg.trainer.algorithm.policy_loss_type)
             return model
 
     def forward(self, data, *, probe_micro_batch_size: int | None = None):
@@ -462,9 +458,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             tokenizer_revision=self.cfg.trainer.policy.model.get("tokenizer_revision"),
         )
 
+        ddp_config = self.cfg.trainer.policy.megatron_config.ddp_config if for_training else None
+        if for_training and str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() == "muonh":
+            ddp_config = dict(ddp_config)
+            if ddp_config.get("use_distributed_optimizer", False):
+                raise ValueError("Hero MuonH needs unsharded Megatron DDP gradient buffers")
+            ddp_config["use_distributed_optimizer"] = False
+            ddp_config["overlap_param_gather"] = False
+
         self.actor_module = self.make_megatron_module(
             wrap_with_ddp=for_training,
-            ddp_config=self.cfg.trainer.policy.megatron_config.ddp_config if for_training else None,
+            ddp_config=ddp_config,
             bf16=self.cfg.trainer.bf16,
         )
 
@@ -497,11 +501,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         # create optimizer
         with Timer("megatron/optimizer"):
-            optim_config = init_megatron_optim_config(
+            self.optimizer = get_megatron_optimizer(
+                self.actor_module,
                 self.cfg.trainer.policy.optimizer_config,
                 self.cfg.trainer.policy.megatron_config.optimizer_config_kwargs,
             )
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
 
         self._normalize_mini_batch_size()
 
@@ -607,6 +611,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         distillation=experience.distillation,
                         ftpo=experience.ftpo,
                         rollout_routed_experts=experience.rollout_routed_experts,
+                        pair_roles=experience.pair_roles,
                     )
                 )
 
@@ -830,6 +835,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             await cache_reset_task
         torch.cuda.empty_cache()
         torch.distributed.barrier()
+
+    def grug_optimizer_route_snapshot(self):
+        """Return this rank and the optimizer route for each named parameter."""
+        if str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() != "muonh":
+            raise ValueError("Optimizer route snapshot requires Hero MuonH")
+        names = {id(parameter): name for chunk in self.actor_module for name, parameter in chunk.named_parameters()}
+        optimizers = (
+            self.optimizer.chained_optimizers if isinstance(self.optimizer, ChainedOptimizer) else [self.optimizer]
+        )
+        routes = {}
+        for wrapped in optimizers:
+            default_route = "grug_muonh" if isinstance(wrapped.optimizer, MegatronGrugMuonH) else "adam"
+            for index, group in enumerate(wrapped.optimizer.param_groups):
+                route = group.get("optimizer", default_route)
+                for parameter in (*wrapped.float16_groups[index], *wrapped.fp32_from_fp32_groups[index]):
+                    routes[names[id(parameter)]] = route
+        return {"rank": torch.distributed.get_rank(), "routes": routes}
 
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights in HF layout, gathered on rank 0.
