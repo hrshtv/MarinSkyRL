@@ -15,27 +15,12 @@ from skyrl_train.checkpoint_generation import (
     MANIFEST_FILENAME,
     resolve_checkpoint_payload,
 )
-from skyrl_train.distributed.megatron import direct_checkpoint
 from skyrl_train.io import io
-from skyrl_train.workers.megatron.megatron_worker import MegatronPolicyWorkerBase
 from tests.gpu.fault_injection.checkpoint_config import CHECKPOINT_S3_PREFIX, checkpoint_config
+from tests.gpu.fault_injection.checkpoint_faults import FailingOnceMegatronPolicyWorker
 from tests.gpu.gpu_ci.test_trainer_full_checkpointing import create_minimal_trainer
 from tests.gpu.test_megatron_worker import get_test_training_batch
 from tests.gpu.utils import import_worker
-
-
-class FailingOnceMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def fail_after_next_distributed_save(self) -> int:
-        """Fail after all ranks finish DCP, before trainer generation publication."""
-        real_save = direct_checkpoint.checkpoint.save
-
-        def save_then_fail(*args, **kwargs):
-            real_save(*args, **kwargs)
-            direct_checkpoint.checkpoint.save = real_save
-            raise OSError("injected post-DCP save failure")
-
-        direct_checkpoint.checkpoint.save = save_then_fail
-        return self._rank
 
 
 def _test_root() -> str:

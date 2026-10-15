@@ -73,14 +73,15 @@ or `resume`) and `run.checkpoint_parity_root`. Both phases use the same source,
 dependencies, model identity, trainer settings and durable root. Generation engines
 are disabled; this is a numerical recovery check, not a save-performance workload.
 
-The reference performs an update, saves through the full trainer checkpoint path,
-and records all ranks' model, optimizer, scheduler and RNG hashes before and after
-a second update. The resume phase loads that checkpoint and requires identical
-hashes on identical inputs. It also restores the real rollout context's loader
-position and pending retry prompt. Gradients must be finite and nonzero, and the
-second update must change model values. Separate standard-entrypoint resumes
-exercise live rollout generation. Hashing and inspection code is diagnostic and
-does not participate in measured checkpoint pauses.
+The reference saves step 1, injects a failure after every rank completes step 2's
+distributed save, and requires that step 1 remains readable through latest. It
+retries step 2 with a distinct attempt, then records all ranks' model, optimizer,
+scheduler and RNG hashes before and after an uninterrupted step 3. The resume
+phase loads the committed retry and requires identical hashes on identical inputs.
+It also restores the real rollout context's loader position and pending retry
+prompt. Gradients must be finite and nonzero, and step 3 must change model values.
+Separate standard-entrypoint resumes exercise live rollout generation. Hashing,
+failure injection and inspection are separate from measured checkpoint pauses.
 
 ## Distributed debug artifact acceptance
 

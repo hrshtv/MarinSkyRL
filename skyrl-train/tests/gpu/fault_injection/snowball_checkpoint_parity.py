@@ -12,7 +12,8 @@ import ray
 import torch
 
 from cloud.iris.launch_config import load_launch_config
-from skyrl_train.checkpoint_generation import resolve_checkpoint_payload
+from marinskyrl.checkpoint_paths import LATEST_CHECKPOINT_FILE
+from skyrl_train.checkpoint_generation import COMMIT_FILENAME, resolve_checkpoint_payload
 from skyrl_train.distributed.megatron.megatron_utils import materialize_megatron_params
 from skyrl_train.entrypoints.main_base import run_ray_driver
 from skyrl_train.io import io
@@ -21,8 +22,9 @@ from skyrl_train.tokenizer import tokenizer_from_config
 from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.utils.tracking import Tracking
-from skyrl_train.workers.megatron.megatron_worker import CriticWorker, MegatronPolicyWorkerBase, RefWorker
+from skyrl_train.workers.megatron.megatron_worker import CriticWorker, RefWorker
 from tests.gpu.fault_injection.checkpoint_digest import digest_value
+from tests.gpu.fault_injection.checkpoint_faults import FailingOnceMegatronPolicyWorker
 
 
 WORLD_SIZE = 32
@@ -56,7 +58,7 @@ class NoRollouts:
         pass
 
 
-class ParityWorker(MegatronPolicyWorkerBase):
+class ParityWorker(FailingOnceMegatronPolicyWorker):
     def parity_rng(self):
         return self._rank, digest_value(
             {
@@ -110,7 +112,7 @@ def fixed_batch(samples):
             "response_mask": torch.ones(shape),
         }
     )
-    batch.metadata = {"response_length": RESPONSE_LENGTH, "global_step": 1}
+    batch.metadata = {"response_length": RESPONSE_LENGTH, "global_step": 2}
     return batch
 
 
@@ -122,6 +124,51 @@ def update(trainer, batch):
 
 def require_equal(expected, actual, stage):
     assert expected == actual, f"Checkpoint parity mismatch at {stage}: expected={expected}, actual={actual}"
+
+
+async def fail_and_retry(trainer, root):
+    first = root + "/checkpoints/global_step_1"
+    second = root + "/checkpoints/global_step_2"
+    latest = root + "/checkpoints/" + LATEST_CHECKPOINT_FILE
+    previous_commit = io.read_bytes(first + "/" + COMMIT_FILENAME)
+    previous_payload = resolve_checkpoint_payload(first, verify_files=True)
+    assert io.read_bytes(latest) == b"1"
+    armed = ray.get(trainer.policy_model.async_run_ray_method("pass_through", "fail_after_next_distributed_save"))
+    assert sorted(armed) == list(range(WORLD_SIZE))
+    try:
+        await trainer.save_checkpoints()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("The armed checkpoint error did not reach the trainer")
+    assert all(rank_values(trainer, "checkpoint_failure_seen").values()), "Failure occurred before injection"
+    assert io.read_bytes(latest) == b"1", "Failed save changed latest checkpoint"
+    assert io.read_bytes(first + "/" + COMMIT_FILENAME) == previous_commit
+    require_equal(
+        previous_payload, resolve_checkpoint_payload(first, verify_files=True), "prior checkpoint after failure"
+    )
+    assert not io.exists(second + "/" + COMMIT_FILENAME)
+    try:
+        resolve_checkpoint_payload(second, verify_files=True)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("An incomplete attempt was readable as a committed checkpoint")
+    files = io.find_files(second)
+    failed_attempts = {path.split("/_attempts/", 1)[1].split("/", 1)[0] for path in files}
+    assert len(failed_attempts) == 1
+    assert sum(path.endswith(".distcp") for path in files) == WORLD_SIZE
+    rng = rank_values(trainer, "parity_rng")
+    driver = driver_rng()
+    await trainer.save_checkpoints()
+    require_equal(rng, rank_values(trainer, "parity_rng"), "retry preserves worker RNG")
+    require_equal(driver, driver_rng(), "retry preserves driver RNG")
+    assert io.read_bytes(latest) == b"2"
+    retry = json.loads(io.read_bytes(second + "/" + COMMIT_FILENAME))
+    assert retry["attempt_id"] not in failed_attempts
+    assert io.read_bytes(first + "/" + COMMIT_FILENAME) == previous_commit
+    assert resolve_checkpoint_payload(second, verify_files=True).endswith(retry["attempt_id"])
+    return {"failed_attempt": next(iter(failed_attempts)), "retry_attempt": retry["attempt_id"]}
 
 
 async def execute(cfg):
@@ -152,7 +199,7 @@ async def execute(cfg):
     model = contract["policy"]["model"]
     model["path"] = model["tokenizer_path"] = model["source_identity"]
     fingerprint = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
-    checkpoint = root + "/checkpoints/global_step_1"
+    checkpoint = root + "/checkpoints/global_step_2"
     record_path = root + "/parity-reference.json"
     batch = fixed_batch(cfg.generator.n_samples_per_prompt)
     batch_digest = digest_value({"batch": dict(batch), "metadata": batch.metadata})
@@ -168,7 +215,9 @@ async def execute(cfg):
         try:
             trainer.build_models(ray.remote(num_gpus=1)(ParityWorker), CriticWorker, RefWorker)
             if probe.phase == "reference":
-                assert not io.exists(record_path) and not io.exists(checkpoint), "Reference needs a fresh prefix"
+                assert not io.exists(record_path) and not io.exists(root + "/checkpoints"), (
+                    "Reference needs a fresh prefix"
+                )
                 prompts = [context.loader.next_prompt(set()) for _ in range(32)]
                 context.loader.retry(prompts[-1])
                 trainer._offload_policy_optimizer(trainer.all_timings, timer_label="parity_initial_offload")
@@ -180,6 +229,10 @@ async def execute(cfg):
                 await trainer.save_checkpoints()
                 require_equal(saved_rng, rank_values(trainer, "parity_rng"), "save preserves worker RNG")
                 require_equal(saved_driver_rng, driver_rng(), "save preserves driver RNG")
+                update(trainer, fixed_batch(cfg.generator.n_samples_per_prompt))
+                trainer.global_step = 2
+                trainer._offload_policy_optimizer(trainer.all_timings, timer_label="parity_retry_offload")
+                fault = await fail_and_retry(trainer, root)
                 pre = rank_values(trainer, "parity_state")
                 assert all(state["optimizer"]["tensor_count"] > 0 for state in pre.values()), (
                     "Optimizer is uninitialized"
@@ -206,6 +259,7 @@ async def execute(cfg):
                     "driver_post": driver_rng(),
                     "rollout": rollout,
                     "next_prompt": next_prompt,
+                    "fault": fault,
                 }
                 with io.open_file(record_path, "w") as output:
                     json.dump(record, output, sort_keys=True)
@@ -218,7 +272,9 @@ async def execute(cfg):
                 require_equal(record["geometry"], list(GEOMETRY), "geometry")
                 require_equal(record["world_size"], WORLD_SIZE, "world size")
                 loaded_step, payload = trainer.load_checkpoints()
-                require_equal((loaded_step, payload), (1, record["payload"]), "own committed checkpoint")
+                require_equal((loaded_step, payload), (2, record["payload"]), "own committed retry")
+                assert payload.endswith(record["fault"]["retry_attempt"])
+                assert record["fault"]["failed_attempt"] not in payload
                 trainer.global_step = loaded_step
                 assert trainer._restored_rollout_state is not None, "Missing rollout continuation state"
                 await context.load_state_dict(trainer._restored_rollout_state)
