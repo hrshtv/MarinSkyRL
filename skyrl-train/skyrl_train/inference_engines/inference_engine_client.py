@@ -110,6 +110,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         self.http_endpoint_host = full_config.generator.http_endpoint_host
         self.http_endpoint_port = full_config.generator.http_endpoint_port
         self.generation_paused_event = threading.Event()
+        self._server_thread: threading.Thread | None = None
         # One wake-up event per event loop that has passed the pause barrier since the last
         # release: the trainer's loop and, with the HTTP endpoint, the server thread's loop.
         self._resume_events: dict[asyncio.AbstractEventLoop, asyncio.Event] = {}
