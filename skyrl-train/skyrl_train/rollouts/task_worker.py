@@ -152,7 +152,7 @@ def _failed_rollout(
         raise error
     exception_type = type(error).__name__
     diagnostics = {"operation": interruption.operation.value, "timed_out": isinstance(error, TimeoutError)}
-    if isinstance(error, TaskMachineError) and error.__cause__ is not None:
+    if error.__cause__ is not None:
         diagnostics["cause_error_type"] = type(error.__cause__).__name__
     if isinstance(error, TimeoutError):
         exception_type = {
