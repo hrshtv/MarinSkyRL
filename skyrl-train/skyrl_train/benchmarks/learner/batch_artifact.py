@@ -112,7 +112,10 @@ def routes_path(batch_path: str, checkpoint_id: str) -> str:
 
 
 def _tensors_payload(batch: TrainingInputBatch) -> bytes:
-    present = {key: value.contiguous() for key, value in batch.items() if value is not None}
+    # GRPO-style estimators return one tensor as both advantages and returns; safetensors rejects shared storage.
+    present = {
+        key: value.clone(memory_format=torch.contiguous_format) for key, value in batch.items() if value is not None
+    }
     none_keys = sorted(key for key, value in batch.items() if value is None)
     return safetensors.torch.save(present, metadata={NONE_KEYS_METADATA: json.dumps(none_keys)})
 
