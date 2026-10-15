@@ -647,6 +647,7 @@ class PPORayActorGroup:
                     force_cvd_mask=self._force_cvd_mask,
                 )
                 self._actor_handlers.append(worker_actor)
+            # Await every constructor before starting the collective rendezvous.
             addresses = ray.get([actor.get_master_addr_port.remote() for actor in self._actor_handlers])
             master_addr, master_port = addresses[0]
 
