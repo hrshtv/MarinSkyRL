@@ -46,6 +46,12 @@ from skyrl_train.benchmarks.learner.flops import (
     accelerator_from_device_name,
     mfu,
 )
+from skyrl_train.benchmarks.learner.truncate_checkpoint import (
+    TRUNCATION_PROVENANCE_FILENAME,
+    read_truncation_provenance,
+    slice_routes,
+)
+from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.distributed.dispatch import concatenate_outputs_after_mesh_dispatch
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.io import io
@@ -241,7 +247,12 @@ def rows_per_update(entries: Sequence[EnsembleEntry], layout: ParallelLayout, mi
         raise ValueError(
             f"scheduled batches pad to different sizes {sorted(padded)} (rows {sizes}, multiple {multiple})"
         )
-    return padded.pop()
+    rows = padded.pop()
+    # pad_training_input pads by cloning leading rows, so it cannot more than double a batch.
+    too_small = sorted({entry.num_sequences for entry in entries if 2 * entry.num_sequences < rows})
+    if too_small:
+        raise ValueError(f"batches with {too_small} rows cannot be padded to {rows} rows by cloning")
+    return rows
 
 
 def compose_base_config() -> DictConfig:
@@ -592,6 +603,38 @@ def ensemble_entries(spec: BenchmarkSpec) -> list[EnsembleEntry]:
     return entries
 
 
+def source_num_layers(model_path: str, model_num_layers: int) -> int:
+    """Return the layer count of the checkpoint ``model_path`` was truncated from, or its own if not truncated."""
+    if not io.exists(f"{model_path.rstrip('/')}/{TRUNCATION_PROVENANCE_FILENAME}"):
+        return model_num_layers
+    provenance = read_truncation_provenance(model_path)
+    if provenance.num_layers != model_num_layers:
+        raise ValueError(
+            f"{model_path} truncation provenance records {provenance.num_layers} layers, config has {model_num_layers}"
+        )
+    return provenance.source_num_layers
+
+
+def replay_routes(routes: RoutedExpertRows, model_num_layers: int, full_num_layers: int) -> RoutedExpertRows:
+    """Fit routes to the benchmarked model's decoder layers.
+
+    Routes recorded on the full checkpoint (``full_num_layers`` layers) are sliced to the leading layers of a
+    depth-truncated model; routes recorded on the benchmarked model itself are used as they are.
+    """
+    route_layers = {row.shape[1] for row in routes.rows}
+    if len(route_layers) != 1:
+        raise ValueError(f"route rows disagree on the layer count: {sorted(route_layers)}")
+    (layers,) = route_layers
+    if layers == model_num_layers:
+        return routes
+    if layers == full_num_layers:
+        return slice_routes(routes, model_num_layers)
+    raise ValueError(
+        f"routes carry {layers} layers; expected the model's {model_num_layers} or its source checkpoint's "
+        f"{full_num_layers}"
+    )
+
+
 def _init_policy_group(cfg: DictConfig, layout: ParallelLayout) -> PPORayActorGroup:
     from skyrl_train.workers.megatron.megatron_worker import PolicyWorker  # optional megatron extra
 
@@ -639,6 +682,7 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
     if not isinstance(model_config, GrugMoeConfig):
         raise ValueError(f"learner benchmark FLOPs model supports Grug MoE only, got {type(model_config).__name__}")
     flops_model = GrugFlopsModel.from_config(model_config)
+    full_num_layers = source_num_layers(spec.model_path, model_config.num_hidden_layers)
     multiple = spec.layout.data_parallel * spec.micro_batch_size_per_gpu
 
     initialize_ray(cfg)
@@ -648,6 +692,9 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
         hardware: Hardware | None = None
         for update in schedule:
             batch, _ = read_ensemble_batch(update.entry.path, routes_checkpoint=spec.routes_checkpoint)
+            batch.routed_expert_rows = replay_routes(
+                batch.routed_expert_rows, model_config.num_hidden_layers, full_num_layers
+            )
             batch.metadata["global_step"] = update.index
             padded = pad_training_input(batch, multiple)
             scoring_seconds = _score_old_logprobs(policy, padded) if spec.score_old_logprobs else None

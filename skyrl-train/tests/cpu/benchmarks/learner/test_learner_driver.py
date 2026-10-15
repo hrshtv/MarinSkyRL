@@ -1,6 +1,8 @@
+import dataclasses
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from omegaconf.errors import ConfigKeyError
@@ -22,14 +24,18 @@ from skyrl_train.benchmarks.learner.driver import (
     build_policy_cfg,
     compose_base_config,
     parse_spec,
+    replay_routes,
     result_json,
     rows_per_update,
     schedule_updates,
+    source_num_layers,
     summarize,
     update_record,
     worker_observation,
 )
+from skyrl_train.benchmarks.learner.truncate_checkpoint import TRUNCATION_PROVENANCE_FILENAME, TruncationProvenance
 from skyrl_train.benchmarks.learner.flops import Accelerator, GrugFlopsModel, RecomputePolicy
+from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.models.grug_moe import GrugMoeConfig
 from skyrl_train.timing_observability import PPO_TRAIN_PHASE_SECONDS_KEY
 from skyrl_train.training_batch import TrainingInputBatch
@@ -111,6 +117,9 @@ def test_rows_per_update_pads_to_data_parallel_micro_batches():
     assert rows_per_update(_entries(), LAYOUT, 2) == 64
     with pytest.raises(ValueError, match="pad to different sizes"):
         rows_per_update([*_entries(), EnsembleEntry("x", LONG, 1, 70)], LAYOUT, 2)
+    # Padding clones leading rows, so 3 rows cannot reach the 8-row multiple.
+    with pytest.raises(ValueError, match="cannot be padded"):
+        rows_per_update([EnsembleEntry("x", LONG, 0, 3)], LAYOUT, 2)
 
 
 def test_policy_cfg_trains_whole_batch_with_router_replay(base_cfg):
@@ -314,3 +323,41 @@ def test_cli_rejects_offload_fraction_for_muonh():
         parse_spec(
             [*REQUIRED_ARGS, "--optimizer=MuonH", "--adam-lr=1e-6", "--offload-momentum", "--offload-fraction=0.5"]
         )
+
+
+def _routes(layers: int) -> RoutedExpertRows:
+    rows = tuple(
+        np.arange(tokens * layers * 2, dtype=np.uint8).reshape(tokens, layers, 2) % 64 for tokens in (3, 0, 2)
+    )
+    return RoutedExpertRows(rows, response_len=4, num_experts=64)
+
+
+def test_replay_routes_slice_full_model_routes_to_a_truncated_model():
+    full = _routes(8)
+    assert replay_routes(full, 8, 8) is full
+    sliced = replay_routes(full, 4, 8)
+    for full_row, row in zip(full.rows, sliced.rows, strict=True):
+        np.testing.assert_array_equal(row, full_row[:, :4])
+    # Routes recorded on the truncated model itself replay unchanged.
+    assert replay_routes(_routes(4), 4, 8).rows[0].shape[1] == 4
+
+
+@pytest.mark.parametrize("route_layers", [2, 6, 12])
+def test_replay_routes_reject_layer_counts_of_neither_model(route_layers):
+    with pytest.raises(ValueError, match="layers"):
+        replay_routes(_routes(route_layers), 4, 8)
+
+
+def test_source_num_layers_reads_truncation_provenance(tmp_path):
+    assert source_num_layers(str(tmp_path), 48) == 48
+    provenance = TruncationProvenance(
+        source_path="s3://models/hero",
+        source_config_sha256="abc",
+        source_manifest_identity=None,
+        source_num_layers=48,
+        num_layers=8,
+    )
+    (tmp_path / TRUNCATION_PROVENANCE_FILENAME).write_text(json.dumps(dataclasses.asdict(provenance)))
+    assert source_num_layers(str(tmp_path), 8) == 48
+    with pytest.raises(ValueError, match="provenance"):
+        source_num_layers(str(tmp_path), 12)
