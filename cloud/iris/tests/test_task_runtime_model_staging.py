@@ -133,7 +133,9 @@ def test_hugging_face_draft_mirror_uses_the_policy_tokenizer(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("tokenizer_has_config", [False, True])
-def test_requested_local_policy_tokenizer_is_staged_independently(tmp_path, monkeypatch, tokenizer_has_config) -> None:
+def test_requested_local_policy_tokenizer_uses_own_or_fallback_config(
+    tmp_path, monkeypatch, tokenizer_has_config
+) -> None:
     tokenizer_source = tmp_path / "tokenizer-source"
     tokenizer_source.mkdir()
     (tokenizer_source / "tokenizer.json").write_text('{"identity": "requested"}')
