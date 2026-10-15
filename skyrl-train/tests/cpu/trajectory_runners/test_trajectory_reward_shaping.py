@@ -2,7 +2,9 @@ from copy import deepcopy
 
 import pytest
 
-from skyrl_train.trajectory_runners.base import TrajectoryRequestBatch, TrajectoryRunner, TrajectoryBatch
+from tests.cpu.trajectory_runners.fixture_runner import FixtureRunner
+from skyrl_train.trajectory_runners.types import TrajectoryRequestBatch, TrajectoryBatch, TaskRequestBatch
+from tests.cpu.task_specs import task_input, lowered_task, text_task
 from skyrl_train.trajectory_runners.trajectory_reward_shaping import (
     parse_trajectory_reward_shaping_config,
     shape_trajectory_rewards,
@@ -381,7 +383,7 @@ def test_concatenation_preserves_later_passthrough_disposition():
     assert concatenated["error_treatments"] == [None, "passthrough"]
 
 
-class _SharedShapingRunner(TrajectoryRunner):
+class _SharedShapingRunner(FixtureRunner):
     trajectory_runner_cfg = {
         "trajectory_reward_shaping": {
             "enabled": True,
@@ -389,13 +391,13 @@ class _SharedShapingRunner(TrajectoryRunner):
         }
     }
 
-    async def _run(self, input_batch: TrajectoryRequestBatch, disable_tqdm: bool = False) -> TrajectoryBatch:
+    async def _run(self, input_batch: TrajectoryRequestBatch) -> TrajectoryBatch:
         return _output([[1, 2]], [1.0], ["length"])
 
 
 @pytest.mark.asyncio
 async def test_trajectory_runner_applies_shared_shaping_after_generation():
-    output = await _SharedShapingRunner().run({})
+    output = await _SharedShapingRunner().run(TaskRequestBatch(rows=(task_input(lowered_task(text_task())),)))
 
     assert output["unshaped_rewards"] == [1.0]
     assert output["rewards"] == pytest.approx([0.6])

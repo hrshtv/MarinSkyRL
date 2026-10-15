@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import fnmatch
 import json
 import math
@@ -73,7 +73,10 @@ class RemoteSafetensorsTensorStore:
         self.source_uri = source_uri.rstrip("/")
         index_path = Path(metadata_dir) / HF_WEIGHT_INDEX_FILENAME
         self._headers: dict[str, tuple[int, dict[str, object]]] = {}
-        self.read_stats = ReadStats()
+        self._opens = 0
+        self._reads = 0
+        self._bytes_read = 0
+        self._read_seconds = 0.0
         self._handles: dict[str, BinaryIO] = {}
         if index_path.exists():
             try:
@@ -99,21 +102,25 @@ class RemoteSafetensorsTensorStore:
     def get_all_keys(self) -> list[str]:
         return sorted(self._weight_map)
 
+    @property
+    def read_stats(self) -> ReadStats:
+        return ReadStats(self._opens, self._reads, self._bytes_read, self._read_seconds)
+
+    def _source(self, shard: str) -> BinaryIO:
+        source = self._handles.get(shard)
+        if source is None:
+            started = time.monotonic()
+            source = io.open_file(join_resource_path(self.source_uri, shard), "rb", cache_type="none")
+            self._handles[shard] = source
+            self._opens += 1
+            self._read_seconds += time.monotonic() - started
+        return source
+
     def _header(self, shard: str) -> tuple[int, dict[str, object]]:
         cached = self._headers.get(shard)
         if cached is not None:
             return cached
-        shard_uri = join_resource_path(self.source_uri, shard)
-        source = self._handles.get(shard)
-        if source is None:
-            started = time.monotonic()
-            source = io.open_file(shard_uri, "rb", cache_type="none")
-            self._handles[shard] = source
-            self.read_stats = replace(
-                self.read_stats,
-                opens=self.read_stats.opens + 1,
-                read_seconds=self.read_stats.read_seconds + time.monotonic() - started,
-            )
+        source = self._source(shard)
         source.seek(0)
         started = time.monotonic()
         header_bytes, _keys = read_safetensors_header(source, join_resource_path(self.source_uri, shard))
@@ -123,12 +130,9 @@ class RemoteSafetensorsTensorStore:
         return cached
 
     def _record_read(self, size: int, started: float) -> None:
-        self.read_stats = replace(
-            self.read_stats,
-            reads=self.read_stats.reads + 1,
-            bytes_read=self.read_stats.bytes_read + size,
-            read_seconds=self.read_stats.read_seconds + time.monotonic() - started,
-        )
+        self._reads += 1
+        self._bytes_read += size
+        self._read_seconds += time.monotonic() - started
 
     def _tensor_descriptor(
         self, key: str, shard: str, header: dict[str, object]
@@ -158,7 +162,7 @@ class RemoteSafetensorsTensorStore:
         shard = self._weight_map[key]
         shard_uri = join_resource_path(self.source_uri, shard)
         data_offset, header = self._header(shard)
-        source = self._handles[shard]
+        source = self._source(shard)
         dtype, shape, start, _end = self._tensor_descriptor(key, shard, header)
         if not shape:
             raise IndexError(f"Cannot slice scalar safetensors tensor {key!r}")
@@ -191,7 +195,7 @@ class RemoteSafetensorsTensorStore:
         for shard, shard_keys in by_shard.items():
             shard_uri = join_resource_path(self.source_uri, shard)
             data_offset, header = self._header(shard)
-            source = self._handles[shard]
+            source = self._source(shard)
             for key in shard_keys:
                 dtype, shape, start, end = self._tensor_descriptor(key, shard, header)
                 source.seek(data_offset + start)
