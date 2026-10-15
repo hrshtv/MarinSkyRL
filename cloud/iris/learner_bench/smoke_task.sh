@@ -13,7 +13,7 @@ tokenizer=(--tokenizer marin-community/marin-tokenizer --tokenizer-revision a5ca
 model=/tmp/lb-model
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
-"$py" cloud/iris/learner_bench/stage_model.py --source "$LB_MODEL" --destination "$model" "${tokenizer[@]}" --workers 12
+"$py" cloud/iris/learner_bench/stage_model.py --source "$LB_MODEL" --destination "$model" --workers 12
 
 ensemble_root="${LB_ENSEMBLE_ROOT:-}"
 if [[ -z "$ensemble_root" ]]; then

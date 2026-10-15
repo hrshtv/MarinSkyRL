@@ -1,7 +1,4 @@
-"""Copy an object-store HF checkpoint to local disk and save the Hero tokenizer next to it.
-
-The Hero exports carry no tokenizer files; the learner loads the tokenizer from the model directory.
-"""
+"""Copy an object-store HF checkpoint (weights, config and tokenizer) to local disk."""
 
 import argparse
 import json
@@ -13,7 +10,6 @@ from urllib.parse import urlsplit
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-from transformers import AutoTokenizer
 
 SKIPPED_PREFIXES = (".export-progress-",)
 TRANSFER = TransferConfig(multipart_chunksize=64 * 2**20, max_concurrency=8)
@@ -52,18 +48,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--source", required=True)
     parser.add_argument("--destination", type=Path, required=True)
-    parser.add_argument("--tokenizer", required=True)
-    parser.add_argument("--tokenizer-revision", required=True)
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     stage(args.source, args.destination, args.workers)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, revision=args.tokenizer_revision)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.save_pretrained(args.destination)
-    vocab_size = json.loads((args.destination / "config.json").read_text())["vocab_size"]
-    if len(tokenizer) != vocab_size:
-        raise ValueError(f"tokenizer has {len(tokenizer)} tokens, config vocab_size is {vocab_size}")
 
 
 if __name__ == "__main__":
