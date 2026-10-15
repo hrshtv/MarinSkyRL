@@ -1,23 +1,16 @@
 from argparse import Namespace
 import hashlib
 import json
-import os
 from pathlib import Path
-import signal
-import subprocess
-import sys
 
 import fsspec
-from fsspec.implementations.memory import MemoryFileSystem
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
 from safetensors.numpy import save
 
-from cloud.iris import hf_model_cache, runtime_bundle, task_runtime
-from cloud.iris.tests.test_launch_config import _raw_config
+from cloud.iris import hf_model_cache, task_runtime
 from cloud.iris.hf_model_cache import HuggingFaceSnapshot, HuggingFaceSnapshotFile, publish_hugging_face_snapshot
-from cloud.iris.rl_config_translation import RL_CONFIG_PAYLOAD_ENV
 from cloud.iris.task_runtime import (
     _write_final_config,
     policy_chat_template_model,
@@ -25,7 +18,6 @@ from cloud.iris.task_runtime import (
     prepare_policy_model,
     prepare_policy_tokenizer,
 )
-from marinskyrl.environment_contract import DEBUG_ARTIFACT_DIR_ENV
 from marinskyrl.speculative_decoding import SpeculatorModelConfig
 from marinskyrl.resource_locator import RolloutModelLoading
 
@@ -140,98 +132,30 @@ def test_hugging_face_draft_mirror_uses_the_policy_tokenizer(tmp_path, monkeypat
     assert manifest.tokenizer_mode == "policy"
 
 
-def test_requested_local_policy_tokenizer_is_staged_independently(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("tokenizer_has_config", [False, True])
+def test_requested_local_policy_tokenizer_is_staged_independently(tmp_path, monkeypatch, tokenizer_has_config) -> None:
     tokenizer_source = tmp_path / "tokenizer-source"
     tokenizer_source.mkdir()
     (tokenizer_source / "tokenizer.json").write_text('{"identity": "requested"}')
     (tokenizer_source / "tokenizer_config.json").write_text('{"chat_template": "requested"}')
+    policy_config = tmp_path / "config.json"
+    policy_config.write_text('{"model_type": "llama"}')
+    if tokenizer_has_config:
+        (tokenizer_source / "config.json").write_text('{"model_type": "qwen2"}')
     destination = tmp_path / "prepared-tokenizer"
     monkeypatch.setattr(task_runtime, "_metadata_path", lambda _uri, _revision: str(destination))
 
     prepared = prepare_policy_tokenizer(
-        Namespace(policy_tokenizer=str(tokenizer_source), policy_tokenizer_revision="tokenizer-commit")
+        Namespace(policy_tokenizer=str(tokenizer_source), policy_tokenizer_revision="tokenizer-commit"),
+        policy_config_path=policy_config,
     )
 
     assert prepared is not None
     assert prepared.local_path == str(destination)
     assert (destination / "tokenizer.json").read_text() == '{"identity": "requested"}'
     assert (destination / "tokenizer_config.json").read_text() == '{"chat_template": "requested"}'
-
-
-def test_main_stages_policy_config_with_the_independent_tokenizer_before_ray(tmp_path, monkeypatch) -> None:
-    s3_class = fsspec.get_filesystem_class("s3")
-    fsspec.register_implementation("s3", MemoryFileSystem, clobber=True)
-    handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
-    try:
-        policy_uri = f"s3://policy-{tmp_path.name}/model"
-        manifest = publish_hugging_face_snapshot(
-            _memory_model_snapshot(f"main-policy-source/{tmp_path.name}"),
-            policy_uri,
-            model_id="org/policy",
-            revision="a" * 40,
-        )
-        tokenizer_source = tmp_path / "requested-tokenizer"
-        tokenizer_source.mkdir()
-        (tokenizer_source / "tokenizer.json").write_text('{"identity": "requested"}')
-        (tokenizer_source / "tokenizer_config.json").write_text('{"chat_template": "requested"}')
-
-        source = runtime_bundle.LauncherSource(
-            root=runtime_bundle.resolve_launcher_source().root,
-            commit="a" * 40,
-            kind=runtime_bundle.LauncherSourceKind.INSTALLED,
-        )
-        monkeypatch.setattr(runtime_bundle, "resolve_launcher_source", lambda: source)
-        monkeypatch.setattr(task_runtime.tempfile, "gettempdir", lambda: str(tmp_path))
-        bundle = runtime_bundle.build_runtime_bundle(source.commit)
-        monkeypatch.setattr(runtime_bundle, "PROJECT_ROOT", bundle)
-        monkeypatch.setattr(os, "environ", os.environ.copy())
-        for name in (
-            "IRIS_TASK_ID",
-            "IRIS_NUM_TASKS",
-            RL_CONFIG_PAYLOAD_ENV,
-            DEBUG_ARTIFACT_DIR_ENV,
-        ):
-            os.environ.pop(name, None)
-
-        config = _raw_config()
-        config["iris"].update(cluster="cw-us-east-02a", cluster_config="configs/cw-us-east-02a.yaml")
-        config["inputs"]["model"].update(
-            uri=policy_uri,
-            identity=manifest.identity,
-            tokenizer_uri=str(tokenizer_source),
-            tokenizer_revision="fixture-tokenizer",
-        )
-        config["ray"].update(
-            spill_dir=str(tmp_path / "spill"),
-            rendezvous_dir=str(tmp_path / "rendezvous"),
-            log_dir=str(tmp_path / "ray-logs"),
-        )
-        config_path = tmp_path / "launch.yaml"
-        OmegaConf.save(OmegaConf.create(config), config_path)
-        monkeypatch.setattr(sys, "argv", ["task-runtime", "--config", str(config_path)])
-        run = subprocess.run
-
-        def unavailable_ray(command, *args, **kwargs):
-            if Path(command[0]).name == "ray" and "--head" in command:
-                raise subprocess.CalledProcessError(1, command)
-            return run(command, *args, **kwargs)
-
-        monkeypatch.setattr(subprocess, "run", unavailable_ray)
-        with pytest.raises(subprocess.CalledProcessError):
-            task_runtime.main()
-
-        staged = tmp_path / "marinskyrl" / "model_metadata"
-        tokenizer_directory = next(
-            path.parent
-            for path in staged.glob("*/tokenizer.json")
-            if json.loads(path.read_text()).get("identity") == "requested"
-        )
-        assert (tokenizer_directory / "config.json").read_text() == "{}"
-        assert (tokenizer_directory / "tokenizer_config.json").read_text() == '{"chat_template": "requested"}'
-    finally:
-        fsspec.register_implementation("s3", s3_class, clobber=True)
-        for number, handler in handlers.items():
-            signal.signal(number, handler)
+    expected_model_type = "qwen2" if tokenizer_has_config else "llama"
+    assert json.loads((destination / "config.json").read_text()) == {"model_type": expected_model_type}
 
 
 def test_staged_models_are_written_as_structured_config(tmp_path, monkeypatch) -> None:
