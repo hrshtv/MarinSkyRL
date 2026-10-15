@@ -1,3 +1,4 @@
+from skyrl_train.inference_engines.ray_wrapped_inference_engine import RayWrappedInferenceEngine
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,
     InferenceEngineInput,
@@ -148,8 +149,6 @@ class InferenceEngineClient(InferenceEngineInterface):
 
     def discard_engines(self) -> None:
         """Close the HTTP endpoint and terminate the client's local Ray engines."""
-        from skyrl_train.inference_engines.ray_wrapped_inference_engine import RayWrappedInferenceEngine
-
         self.shutdown_http_endpoint()
         for engine in self.engines:
             if isinstance(engine, RayWrappedInferenceEngine):
