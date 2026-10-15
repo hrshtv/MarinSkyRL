@@ -16,7 +16,8 @@ from taskcompendium.grading_result import GradeResult, Outcome
 from skyrl_train.batch_sampling import filter_trajectory_batch
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
 from skyrl_train.trajectory_runners.trajectory_processing import concatenate_trajectory_batches
-from skyrl_train.trajectory_runners.types import TrajectoryID
+from skyrl_train.trajectory_runners.types import TrajectoryID, TaskRequestBatch
+from tests.cpu.task_specs import lowered_task, task_input, text_task
 
 
 class Tokenizer:
@@ -76,12 +77,14 @@ def trajectory(*turns):
 
 
 def request(count=1, *, environments=None):
-    return {
-        "prompts": [[]] * count,
-        "env_classes": environments,
-        "trajectory_ids": [TrajectoryID("task", index) for index in range(count)],
-        "sampling_params": {"logprobs": True},
-    }
+    return TaskRequestBatch(
+        rows=tuple(
+            task_input(lowered_task(text_task()), metric_class=(environments or ["fixture"] * count)[index])
+            for index in range(count)
+        ),
+        trajectory_ids=tuple(TrajectoryID("task", index) for index in range(count)),
+        sampling_params={"logprobs": True},
+    )
 
 
 def test_whole_projection_preserves_tokens_rewards_and_tool_masks():
@@ -101,6 +104,16 @@ def test_whole_projection_preserves_tokens_rewards_and_tool_masks():
     assert batch["loss_masks"] == [[1, 0, 1]]
     np.testing.assert_allclose(batch["rollout_logprobs"][0], [-0.1, 0.0, -0.1])
     assert "trajectory_ids" not in batch
+
+
+def test_projection_retains_the_verifier_reason_when_harbor_classifies_it_as_a_failure():
+    record = replace(
+        rollout([3, 4], 0.0, grade=GradeResult(Outcome.INFRA_ERROR, None, error="Request timed out.")),
+        failure=RolloutFailure("VerifierRuntimeError"),
+    )
+    batch = WholeTaskProjection(config(), Tokenizer()).project([record], request())
+    assert batch["verification_results"][0].reason == "Request timed out."
+    assert batch["exception_types"] == ["VerifierRuntimeError"]
 
 
 def test_projection_preserves_partial_server_error_diagnostics():

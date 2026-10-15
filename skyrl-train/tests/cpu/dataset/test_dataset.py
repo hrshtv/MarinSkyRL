@@ -5,11 +5,11 @@ from unittest.mock import patch
 from datasets import Dataset
 from transformers import BatchEncoding
 from omegaconf import OmegaConf
-from rolloutengine.spec import LoweredTaskSpec
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, SourceTaskDataset, TaskDataset, source_row_task, write_tasks
+from skyrl_train.dataset.tasks import SourceTaskDataset, TaskDataset, source_row_task, write_tasks
 from skyrl_train.entrypoints.main_base import BasePPOExp
+from skyrl_train.task_inputs import task_messages
 
 
 class _StubTokenizer:
@@ -66,18 +66,21 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert dataset is not None
     assert len(dataset) == 2
     rows = dataset.collate_fn([dataset[0], dataset[1]])
-    assert [row["prompt"] for row in rows] == [
+    assert [task_messages(row["input"].lowered) for row in rows] == [
         [{"role": "user", "content": "short prompt"}],
         [{"role": "user", "content": "a" * 120}],
     ]
     assert [row["uid"] for row in rows] == ["0", "1"]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in rows]
+    tasks = [row["input"].lowered.task for row in rows]
     assert [task.source.row for task in tasks] == ["0", "1"]
-    assert all(row["env_class"] == "gsm8k" for row in rows)
+    assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
 
 
 @pytest.mark.parametrize("num_workers", [1, 2])
-def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, num_workers):
+@pytest.mark.parametrize(("nested_source", "expected_source"), [(None, "fixture"), ("nested-source", "nested-source")])
+def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(
+    tmp_path, num_workers, nested_source, expected_source
+):
     rows = [
         {
             "prompt": [{"role": "user", "content": content}],
@@ -85,7 +88,7 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
             "reward_spec": {"ground_truth": "PRIVATE_ANSWER"},
             "teacher_route": "math",
             "data_source": "fixture",
-            "extra_info": {"grade": index},
+            "extra_info": {"grade": index, "data_source": nested_source},
         }
         for index, content in enumerate(("First question", "x" * 200, "Last question"))
     ]
@@ -100,9 +103,10 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
         num_workers=num_workers,
     )
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [row["prompt"] for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in prepared]
+    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
+    tasks = [row["input"].lowered.task for row in prepared]
     assert [task.source.row for task in tasks] == ["0", "2"]
+    assert [row["input"].metadata.data_source for row in prepared] == [expected_source, expected_source]
     assert dataset.dataframe.cache_files == []
 
 
@@ -153,18 +157,13 @@ def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, num_work
 
     dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=num_workers)
 
-    assert len(dataset) == 2
+    inputs = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
     for index, source in enumerate(rows):
-        prompt, environment, extras, uid = dataset[index]
-        assert prompt == source["prompt"]
-        assert environment == source["env_class"]
-        assert uid == str(index)
-        assert LoweredTaskSpec.model_validate_json(extras[LOWERED_TASK_COLUMN]) == tasks[index]
-        for key in ("prompt_token_ids", "teacher_route"):
-            if key in source:
-                assert extras[key] == source[key]
-            else:
-                assert key not in extras
+        task = inputs[index]["input"]
+        assert task.metadata.metric_class == source["env_class"]
+        assert inputs[index]["uid"] == str(index)
+        assert task.lowered == tasks[index]
+        assert task.metadata.teacher_route == source.get("teacher_route")
 
 
 @pytest.mark.parametrize(
