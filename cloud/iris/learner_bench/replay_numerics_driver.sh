@@ -19,25 +19,31 @@ replay=(--routes-checkpoint "$LB_ROUTES_CHECKPOINT")
 bench=("$py" -m skyrl_train.benchmarks.learner.driver)
 numerics=("$py" -m skyrl_train.benchmarks.learner.numerics)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Steps whose output already exists are skipped, so a rerun into the same LB_OUTPUT resumes.
+exists() { "$py" -c "import sys; from skyrl_train.io import io; sys.exit(0 if io.exists(sys.argv[1]) else 1)" "$1"; }
 
-"${bench[@]}" "${common[@]}" "${replay[@]}" --tp 1 --pp 2 --ep 16 --memory-breakdown --output "$LB_OUTPUT/result_replay.json"
-"${bench[@]}" "${common[@]}" --tp 1 --pp 2 --ep 16 --output "$LB_OUTPUT/result_native.json"
+exists "$LB_OUTPUT/result_replay.json" || "${bench[@]}" "${common[@]}" "${replay[@]}" --tp 1 --pp 2 --ep 16 \
+  --memory-breakdown --output "$LB_OUTPUT/result_replay.json"
+exists "$LB_OUTPUT/result_native.json" || "${bench[@]}" "${common[@]}" --tp 1 --pp 2 --ep 16 \
+  --output "$LB_OUTPUT/result_native.json"
 
 record() {
   local name="$1"
   shift
-  "${numerics[@]}" record --record-output "$LB_OUTPUT/numerics/$name.json" --num-updates 2 "$@" \
-    "${common[@]}" "${replay[@]}" --tp 1 --output "$LB_OUTPUT/unused.json"
+  exists "$LB_OUTPUT/numerics/$name.json" && return
+  "${numerics[@]}" record --record-output "$LB_OUTPUT/numerics/$name.json" --num-updates 2 \
+    "${common[@]}" "${replay[@]}" --tp 1 --output "$LB_OUTPUT/unused.json" "$@"
 }
 record pp2-ep16 --pp 2 --ep 16
 record pp4-ep8 --pp 4 --ep 8
-record pp4-ep16 --pp 4 --ep 16
+# Held out from calibration: the PP4/EP8 layout with two-row micro-batches (a different reduction order).
+record pp4-ep8-mbs2 --pp 4 --ep 8 --micro-batch-size-per-gpu 2
 record pp2-ep16-negate --control negate_advantages --pp 2 --ep 16
 record pp2-ep16-double --control double_advantages --pp 2 --ep 16
 
 "${numerics[@]}" calibrate --records "$LB_OUTPUT/numerics/pp2-ep16.json" "$LB_OUTPUT/numerics/pp4-ep8.json" \
   --reference "$LB_OUTPUT/numerics/reference.json"
-for candidate in pp4-ep16 pp2-ep16-negate pp2-ep16-double; do
+for candidate in pp4-ep8-mbs2 pp2-ep16-negate pp2-ep16-double; do
   status=0
   "${numerics[@]}" compare --reference "$LB_OUTPUT/numerics/reference.json" \
     --record "$LB_OUTPUT/numerics/$candidate.json" --output "$LB_OUTPUT/numerics/compare-$candidate.json" || status=$?
