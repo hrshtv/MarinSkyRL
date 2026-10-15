@@ -22,7 +22,6 @@ import argparse
 import asyncio
 import json
 import logging
-import posixpath
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -32,7 +31,12 @@ import ray
 import torch
 from transformers import AutoConfig
 
-from skyrl_train.benchmarks.learner.batch_artifact import list_ensemble, read_ensemble_batch, write_routes
+from skyrl_train.benchmarks.learner.batch_artifact import (
+    list_ensemble,
+    read_ensemble_batch,
+    routes_path,
+    write_routes,
+)
 from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
 from skyrl_train.inference_engines.base import InferenceEngineInterface
 from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
@@ -44,8 +48,6 @@ from skyrl_train.trajectory_runners.routed_experts import decode_routed_experts
 
 logger = logging.getLogger(__name__)
 
-ROUTES_DIR = "routes"
-ROUTES_SUFFIX = ".safetensors"
 # The same attribute names the trainer resolves the routed-expert count from.
 NUM_EXPERTS_CONFIG_ATTRS = ("num_experts", "num_local_experts", "n_routed_experts")
 NUMPY_ROUTE_DTYPES = {torch.uint8: np.uint8, torch.int16: np.int16, torch.int64: np.int64}
@@ -237,10 +239,6 @@ async def batch_routes(
     )
     _, layers, top_k = rows[0].shape
     return routed_expert_rows(rows, int(batch.metadata["response_length"]), num_experts, layers=layers, top_k=top_k)
-
-
-def routes_path(batch_dir: str, checkpoint_id: str) -> str:
-    return posixpath.join(batch_dir, ROUTES_DIR, f"{checkpoint_id}{ROUTES_SUFFIX}")
 
 
 def num_experts_from_config(model: str, revision: str | None) -> int:

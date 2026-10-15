@@ -104,7 +104,8 @@ def ensemble_batch_path(root: str, ensemble_version: str, profile: LengthProfile
     return f"{root.rstrip('/')}/{ensemble_version}/{profile}/batch_{batch_index}"
 
 
-def _routes_path(batch_path: str, checkpoint_id: str) -> str:
+def routes_path(batch_path: str, checkpoint_id: str) -> str:
+    """Return the routes file of ``checkpoint_id`` inside a batch directory, validating the id."""
     if not CHECKPOINT_ID_PATTERN.match(checkpoint_id):
         raise ValueError(f"checkpoint_id {checkpoint_id!r} must match {CHECKPOINT_ID_PATTERN.pattern}")
     return f"{batch_path.rstrip('/')}/{ROUTES_DIR}/{checkpoint_id}.safetensors"
@@ -311,11 +312,11 @@ def write_routes(path: str, checkpoint_id: str, routes: RoutedExpertRows) -> Non
     payload = safetensors.numpy.save(
         {ROUTE_ROWS_KEY: rows.astype(numpy_dtype), ROUTE_OFFSETS_KEY: offsets}, metadata=metadata
     )
-    io.write_bytes_atomic(_routes_path(path, checkpoint_id), payload)
+    io.write_bytes_atomic(routes_path(path, checkpoint_id), payload)
 
 
 def read_routes(path: str, checkpoint_id: str) -> RoutedExpertRows:
-    payload = io.read_bytes(_routes_path(path, checkpoint_id))
+    payload = io.read_bytes(routes_path(path, checkpoint_id))
     metadata = _safetensors_metadata(payload)
     if metadata["checkpoint_id"] != checkpoint_id:
         raise ValueError(f"routes file names checkpoint {metadata['checkpoint_id']}, expected {checkpoint_id}")
