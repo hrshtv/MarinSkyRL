@@ -357,9 +357,10 @@ def _run_startup_case(root: Path, model: Path, experiment_class, evaluation_runn
     if experiment_class is _LateInferenceTinyTrainingExp:
         cfg.generator.enable_http_endpoint = True
         cfg.generator.http_endpoint_port = get_free_port()
-    root.mkdir(parents=True, exist_ok=True)
+    control_root = Path(cfg.trainer.export_path)
+    control_root.mkdir(parents=True, exist_ok=True)
     for name in (ENGINE_START_FIFO, POLICY_READY_FIFO, ENGINE_RETURN_FIFO):
-        os.mkfifo(root / name)
+        os.mkfifo(control_root / name)
     experiment.run_with_exp(cfg, experiment_class)
 
 
