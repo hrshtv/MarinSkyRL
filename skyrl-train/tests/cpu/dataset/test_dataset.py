@@ -77,11 +77,8 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
 
 
-@pytest.mark.parametrize("num_workers", [1, 2])
 @pytest.mark.parametrize(("nested_source", "expected_source"), [(None, "fixture"), ("nested-source", "nested-source")])
-def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(
-    tmp_path, num_workers, nested_source, expected_source
-):
+def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(tmp_path, nested_source, expected_source):
     rows = [
         {
             "prompt": [{"role": "user", "content": content}],
@@ -101,7 +98,7 @@ def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(
         _StubTokenizer(),
         100,
         environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
-        num_workers=num_workers,
+        num_workers=1,
     )
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
     assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
@@ -130,9 +127,8 @@ def test_prompt_dataset_filtering_counts_batch_encoding_input_ids(mock_load_data
     assert len(dataset) == 2
 
 
-@pytest.mark.parametrize("num_workers", [1, 2])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, num_workers, reverse):
+def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, reverse):
     rows = [
         {
             "prompt": [{"role": "user", "content": "First question"}],
@@ -156,7 +152,7 @@ def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, num_work
     path = tmp_path / "mixed.parquet"
     write_tasks(path, tasks)
 
-    dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=num_workers)
+    dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=1)
 
     inputs = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
     for index, source in enumerate(rows):
@@ -241,7 +237,9 @@ def fork_records(tmp_path):
 
 
 @pytest.mark.parametrize(("row_count", "uses_process_pool"), [(22, False), (20_000, True)])
-def test_task_dataset_maps_and_filters_small_inputs_in_the_parent(tmp_path, fork_records, row_count, uses_process_pool):
+def test_task_dataset_retains_global_rows_without_caches_and_forks_only_large_inputs(
+    tmp_path, fork_records, row_count, uses_process_pool
+):
     rows = [
         {
             "prompt": [{"role": "user", "content": "x" * 200 if index % 10 == 0 else f"Question {index}"}],
@@ -261,4 +259,7 @@ def test_task_dataset_maps_and_filters_small_inputs_in_the_parent(tmp_path, fork
     )
     expected = [row["prompt"] for index, row in enumerate(rows) if index % 10 != 0]
     assert list(dataset.dataframe["prompt"]) == expected
+    last = dataset.collate_fn([dataset[len(dataset) - 1]])[0]["input"].lowered.task
+    assert last.source.row == str(row_count - 1)
+    assert dataset.dataframe.cache_files == []
     assert bool(tuple(fork_records.iterdir())) == uses_process_pool

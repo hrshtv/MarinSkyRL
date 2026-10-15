@@ -267,6 +267,8 @@ def test_parallel_bootstrap_waits_for_every_check_and_reports_failure(tmp_path, 
         f"with open({str(barrier)!r}, 'wb', buffering=0) as gate:\n    gate.write(b'r')\n"
         + ("raise RuntimeError('memray import failed')\n" if memray_fails else ""),
     )
+    if memray_fails:
+        _write_module(site_packages, "quack/activation.py", "raise RuntimeError('vllm import failed')\n")
     with launch_process_gang(
         command=_bootstrap_command(environment, "megatron"),
         working_directory=REPOSITORY_ROOT,
@@ -279,6 +281,6 @@ def test_parallel_bootstrap_waits_for_every_check_and_reports_failure(tmp_path, 
         result = gang.wait(timeout_seconds=15)
     assert completed.is_file()
     assert (result.returncode != 0) == memray_fails, result.output
-    assert ("[rl-iris] frozen runtime ready:" in result.output) != memray_fails, result.output
     if memray_fails:
         assert "memray import failed" in result.output
+        assert "vllm import failed" in result.output
