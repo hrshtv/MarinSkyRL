@@ -734,6 +734,8 @@ def _skyrl_config_sections(
     validate_distillation_runtime_support(parsed.distillation_plan)
 
     trainer = copy.deepcopy(parsed.trainer)
+    trainer.setdefault("placement", {}).setdefault("policy_strict_spread_pg", True)
+    trainer["placement"].setdefault("overlap_init", True)
     generator = copy.deepcopy(parsed.generator)
     data = copy.deepcopy(parsed.data)
     environment = copy.deepcopy(parsed.environment)
