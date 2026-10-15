@@ -98,7 +98,7 @@ class _Unset(Enum):
 
 
 def unset_field(**kwargs: Any) -> Any:
-    """Keep a field sparse without accepting an authored null or resolving its default."""
+    """Keep a following field sparse without resolving its default."""
     return Field(default=_Unset.VALUE, validate_default=False, exclude_if=lambda value: value is _Unset.VALUE, **kwargs)
 
 

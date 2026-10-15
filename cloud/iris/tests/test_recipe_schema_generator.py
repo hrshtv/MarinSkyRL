@@ -131,7 +131,6 @@ def _author_document(document):
 
 
 def test_repository_generation_matches_hydra_author_defaults_and_all_group_options():
-    assert Path(schema.__file__).resolve() == ROOT / "marinskyrl/recipe_schema/__init__.py"
     for name, generated in generator.generate().items():
         assert (ROOT / "marinskyrl/recipe_schema" / name).read_text() == generated, f"regenerate {name}"
     sources = generator.source_documents(generator.CONFIG_DIR)

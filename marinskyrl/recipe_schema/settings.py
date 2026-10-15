@@ -32,10 +32,10 @@ def parse_setting(model: type[Section], key: str, raw: str) -> Any:
             annotation = Annotated[info.annotation, *info.metadata] if info.metadata else info.annotation
             continue
         raise ValueError(f"setting {key!r} descends into a scalar at {name!r}")
-    return _parse_value(annotation, key, raw)
+    return _parse_value(annotation, raw)
 
 
-def _parse_value(annotation: Any, key: str, raw: str) -> Any:
+def _parse_value(annotation: Any, raw: str) -> Any:
     options = tuple(_annotations(annotation))
     adapter = TypeAdapter(annotation)
     if raw == "null" or any(

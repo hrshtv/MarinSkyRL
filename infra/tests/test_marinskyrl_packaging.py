@@ -22,7 +22,6 @@ PYPROJECT = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
 
 @dataclass(frozen=True)
 class BuiltWheel:
-    path: Path
     names: set[str]
     metadata: str
     entry_points: str
@@ -39,10 +38,10 @@ def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> BuiltWheel:
         entry_points_name = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
         metadata = archive.read(metadata_name).decode()
         entry_points = archive.read(entry_points_name).decode()
-    return BuiltWheel(path=wheel, names=names, metadata=metadata, entry_points=entry_points)
+    return BuiltWheel(names=names, metadata=metadata, entry_points=entry_points)
 
 
-def test_root_wheel_owns_launcher_and_training_packages(built_wheel: BuiltWheel, tmp_path: Path) -> None:
+def test_root_wheel_owns_launcher_and_training_packages(built_wheel: BuiltWheel) -> None:
     metadata = Parser().parsestr(built_wheel.metadata)
     assert metadata["Name"] == "marinskyrl"
     assert "marinskyrl = cloud.iris.launch:main" in built_wheel.entry_points
@@ -178,7 +177,7 @@ def test_standalone_recipe_wheel_authors_without_launcher_dependencies(tmp_path:
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         metadata = Parser().parsestr(archive.read(next(name for name in names if name.endswith(".dist-info/METADATA"))).decode())
-    assert metadata.get_all("Requires-Dist") == ["pydantic<3,>=2.12.2"]
+    assert [Requirement(value) for value in metadata.get_all("Requires-Dist", [])] == [Requirement("pydantic>=2.12.2,<3")]
     assert "marinskyrl/__init__.py" not in names
     assert all(name.startswith("marinskyrl/recipe_schema/") or ".dist-info/" in name for name in names)
     environment = tmp_path / "schema-environment"
