@@ -1,32 +1,22 @@
 import asyncio
 import base64
-import importlib.util
 import io
-import sys
-import types
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-# batch_artifact is built in parallel; until it lands, route_pass's file I/O imports resolve to an empty stub.
-_BATCH_ARTIFACT = "skyrl_train.benchmarks.learner.batch_artifact"
-if importlib.util.find_spec(_BATCH_ARTIFACT) is None:
-    _stub = types.ModuleType(_BATCH_ARTIFACT)
-    _stub.list_ensemble = _stub.read_ensemble_batch = _stub.write_routes = None
-    sys.modules[_BATCH_ARTIFACT] = _stub
-
-from skyrl_train.benchmarks.learner.route_pass import (  # noqa: E402
+from skyrl_train.benchmarks.learner.route_pass import (
     RouteRequest,
     batch_routes,
     engine_assignments,
     route_requests,
     routed_expert_rows,
 )
-from skyrl_train.dataset.preprocess import convert_prompts_responses_to_batch_tensors  # noqa: E402
-from skyrl_train.models.megatron_router_replay import dense_replay_targets  # noqa: E402
-from skyrl_train.training_batch import TrainingInputBatch  # noqa: E402
+from skyrl_train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
+from skyrl_train.models.megatron_router_replay import dense_replay_targets
+from skyrl_train.training_batch import TrainingInputBatch
 
 PAD = 0
 LAYERS = 3
