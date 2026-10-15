@@ -32,8 +32,8 @@ from megatron.core import parallel_state as mpu
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from skyrl_train.benchmarks.learner.numerics import canonical_parameter_group, global_layer_indices
 from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
+from skyrl_train.distributed.megatron.parameter_fingerprint import canonical_parameter_group, global_layer_indices
 
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 

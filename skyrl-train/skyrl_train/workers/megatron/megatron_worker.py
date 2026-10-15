@@ -18,7 +18,6 @@ from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from omegaconf import OmegaConf
-from skyrl_train.benchmarks.learner.numerics import parameter_delta_statistics, statistics_to_wire
 from skyrl_train.distributed.dispatch import MeshRank
 from skyrl_train.distributed.megatron.grug_muonh import MegatronGrugMuonH
 from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
@@ -29,6 +28,7 @@ from skyrl_train.distributed.megatron.megatron_utils import (
     numerics_parameter_shards,
     print_model_size,
 )
+from skyrl_train.distributed.megatron.parameter_fingerprint import parameter_delta_statistics, statistics_to_wire
 from skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
