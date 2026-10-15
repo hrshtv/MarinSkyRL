@@ -472,10 +472,13 @@ def _response_logprobs(policy, batch: TrainingInputBatch) -> torch.Tensor:
 def record_numerics(policy, batch: TrainingInputBatch, provenance: NumericsProvenance) -> NumericsRecord:
     """Score, update ``provenance.num_updates`` times, fingerprint the parameter delta, and score again.
 
-    ``policy`` is the Megatron policy actor group. The batch is used as given; set its ``action_log_probs``
-    to the pre-update scores beforehand if the update should be on-policy.
+    ``policy`` is the Megatron policy actor group; ``batch`` must already be padded to its data-parallel size
+    and carry the replay routes. The batch's ``action_log_probs`` are replaced in place by the pre-update scores,
+    so the first update is on-policy: a stored ensemble batch carries the log-probs of the model that generated
+    its text, not of the model under test.
     """
     pre_update = _response_logprobs(policy, batch)
+    batch["action_log_probs"] = pre_update * batch["response_mask"]
     ray.get(policy.async_run_ray_method("pass_through", "capture_numerics_baseline"))
     statuses = []
     for _ in range(provenance.num_updates):
