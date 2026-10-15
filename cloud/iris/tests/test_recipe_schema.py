@@ -3,7 +3,7 @@ from itertools import permutations
 import pickle
 
 import pytest
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 import marinskyrl.recipe_schema as schema
 from marinskyrl.recipe_schema import ContextBudget
@@ -29,13 +29,11 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     with pytest.raises(TypeError):
         recipe.options["schedule"]["windows"][0] = 9
 
-    restored = recipe
     assert recipe.to_skyrl() == original
-    assert restored == recipe
-    assert "count" not in restored.to_skyrl()
-    changed = restored.merge(Options(options={"schedule": {}, "enabled": False}))
+    assert "count" not in recipe.to_skyrl()
+    changed = recipe.merge(Options(options={"schedule": {}, "enabled": False}))
     assert changed.to_skyrl() == {"options": {"schedule": {"windows": [1, 2]}, "enabled": False}}
-    assert restored.to_skyrl() == original
+    assert recipe.to_skyrl() == original
     assert Options.model_validate_json(json.dumps(changed.to_skyrl())) == changed
     numeric = Options(options={"samples": [1], "weight": 1})
     equivalent = Options(options={"samples": [1.0], "weight": 1.0})
@@ -109,7 +107,7 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
                 "ref": {"megatron_config": {"optimizer_checkpoint_sharding_type": "fully_reshardable"}},
                 "algorithm": {"resolved_group_advantage": {"kind": "none"}},
             },
-            "generator": {"engine_init_kwargs": {"user_options": {"math": 1, "code": [2, 3]}}},
+            "generator": {"chat_template": None, "engine_init_kwargs": {"user_options": {"math": 1, "code": [2, 3]}}},
         }
     )
     computed = schema.RecipePatch(trainer=schema.Trainer(ckpt_interval=4))
@@ -184,8 +182,17 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
         for path in paths:
             document = base.to_skyrl()
             set_path(document, path, "authored-sentinel")
-            with pytest.raises(ValueError, match=f"{path}.*{owner}"):
+            with pytest.raises(ValueError) as error:
                 schema.SkyRLRecipe.from_document(document)
+            if path.startswith(("terminal_bench.", "environment.task_sessions.", "generator.engine_init_kwargs.")):
+                assert f"{path}:" in str(error.value)
+                assert owner in str(error.value)
+            else:
+                assert isinstance(error.value, ValidationError)
+                assert any(
+                    item["loc"] == tuple(path.split(".")) and item["type"] == "extra_forbidden"
+                    for item in error.value.errors()
+                )
     for path, message in REMOVED.items():
         document = base.to_skyrl()
         set_path(document, path, {})

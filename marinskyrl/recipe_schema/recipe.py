@@ -19,6 +19,12 @@ from .sections import ConfigGroups, RecipeSections
 from .settings import parse_setting
 
 
+def _reject_paths(document: Mapping[str, Any], table: Mapping[str, str]) -> None:
+    problems = [f"{path}: {message}" for path, message in table.items() if get_path(document, path) is not MISSING]
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
 class RecipePatch(RecipeSections):
     """An authored contribution with optional context and sparse section values."""
 
@@ -29,26 +35,17 @@ class RecipePatch(RecipeSections):
     extra_env: OpenMap = Field(default_factory=FrozenMap)
     model_num_attention_heads: PositiveInt | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def _author_owners(cls, data: Any) -> Any:
-        document = thaw(data)
-        if isinstance(document, Mapping):
-            for table in (REMOVED, OWNER_MESSAGES):
-                problems = [
-                    f"{path}: {message}" for path, message in table.items() if get_path(document, path) is not MISSING
-                ]
-                if problems:
-                    raise ValueError("; ".join(problems))
-        return data
-
     @model_validator(mode="after")
-    def _author_engine_options(self) -> Self:
+    def _author_rules(self) -> Self:
+        document = self.to_skyrl()
+        for table in (REMOVED, OWNER_MESSAGES):
+            _reject_paths(document, table)
         validate_engine_init_kwargs(self.generator.engine_init_kwargs)
         return self
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> Self:
+        _reject_paths(document, REMOVED)
         return cls.model_validate_json(json.dumps(thaw(freeze(document)), allow_nan=False))
 
     @classmethod
