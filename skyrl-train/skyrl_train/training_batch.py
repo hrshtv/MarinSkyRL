@@ -16,7 +16,6 @@ from skyrl_train.distillation import distillation_input_from_tensors
 
 DictType = TypeVar("DictType")
 ROUTED_EXPERTS_KEY = "rollout_routed_experts"
-ENGINE_DP_RANKS_KEY = "rollout_engine_dp_ranks"
 
 
 class RouterReplayPayload(Protocol):
