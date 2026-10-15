@@ -114,7 +114,7 @@ class MegatronWorker:
         transformer_config_kwargs,
         tokenizer_path: str,
         tokenizer_revision: str | None,
-        remote_read_mode: str,
+        remote_read_mode: RemoteReadMode,
         bf16=True,
         flash_attn=False,
         model_revision: str | None = None,
@@ -457,7 +457,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             flash_attn=self.cfg.trainer.flash_attn,
             model_revision=self.cfg.trainer.policy.model.get("revision"),
             model_source_uri=self.cfg.trainer.policy.model.get("source_uri"),
-            remote_read_mode=self.cfg.trainer.policy.model.remote_read_mode,
+            remote_read_mode=RemoteReadMode(self.cfg.trainer.policy.model.remote_read_mode),
             tokenizer_path=self.cfg.trainer.policy.model.get("tokenizer_path"),
             tokenizer_revision=self.cfg.trainer.policy.model.get("tokenizer_revision"),
         )
@@ -976,7 +976,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             flash_attn=self.cfg.trainer.flash_attn,
             model_revision=self.cfg.trainer.ref.model.get("revision"),
             model_source_uri=self.cfg.trainer.ref.model.get("source_uri"),
-            remote_read_mode=self.cfg.trainer.ref.model.remote_read_mode,
+            remote_read_mode=RemoteReadMode(self.cfg.trainer.ref.model.remote_read_mode),
             tokenizer_path=self.cfg.trainer.ref.model.get("tokenizer_path"),
             tokenizer_revision=self.cfg.trainer.ref.model.get("tokenizer_revision"),
         )

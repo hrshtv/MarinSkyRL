@@ -70,8 +70,9 @@ def _write_index(metadata_dir: Path, weight_map: dict[str, str]) -> None:
 
 
 @pytest.mark.parametrize("expert_layout", ["stacked", "per_expert"])
+@pytest.mark.parametrize("header_padding", [0, 9 * 1024**2])
 def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range_fetches(
-    tmp_path, monkeypatch, expert_layout
+    tmp_path, monkeypatch, expert_layout, header_padding
 ):
     tensors = {f"dense.{index}": torch.arange(8, dtype=torch.float32) + index for index in range(24)}
     tensors["dense.1"] = tensors["dense.1"].to(torch.bfloat16)
@@ -93,6 +94,7 @@ def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range
         save_file(
             {key: value for key, value in tensors.items() if key.startswith("dense.") == (name == "a.safetensors")},
             shard,
+            metadata={"padding": "x" * header_padding},
         )
         shards[f"bucket/policy/{name}"] = shard.read_bytes()
     metadata = tmp_path / "metadata"
@@ -150,6 +152,7 @@ def test_conversion_task_prefetch_preserves_rank_owned_tensors_and_reduces_range
                     torch.testing.assert_close(store.load_tensors([key])[key], tensors[key], rtol=0, atol=0)
         store.close()
         assert store.read_stats.prefetch_misses == store.read_stats.prefetch_unused == 0
+        assert store.read_stats.gets == filesystem.gets
         results.append((store.read_stats.bytes_read, filesystem.gets))
     assert results[0][0] == results[1][0]
     assert results[1][1] < results[0][1]
@@ -291,6 +294,7 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         len(filesystem.payload) + sum(map(len, shards.values())) - unrequested.numel() * unrequested.element_size()
     )
     assert store.read_stats.opens == filesystem.opens == (2 if split_shards else 1)
+    assert store.read_stats.gets == filesystem.gets
     assert filesystem.fetched_bytes == filesystem.bytes_read == store.read_stats.bytes_read == expected_bytes
 
 

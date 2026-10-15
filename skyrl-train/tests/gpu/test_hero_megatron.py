@@ -7,6 +7,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from omegaconf import open_dict
+from cloud.iris.hf_model_cache import stage_model_metadata
+from marinskyrl.model_manifest import snapshot_model_manifest
+from skyrl_train.workers.megatron import megatron_worker
 import pytest
 import ray
 import torch
@@ -228,9 +231,6 @@ def test_hero_worker_repeated_updates(tmp_path, monkeypatch, tp, pp, ep, cp, pac
 
 def test_hero_remote_read_modes_load_identical_tensors(tmp_path, monkeypatch):
     require_hoppers(1)
-    from cloud.iris.hf_model_cache import stage_model_metadata
-    from marinskyrl.model_manifest import snapshot_model_manifest
-    from skyrl_train.workers.megatron import megatron_worker
 
     class InspectablePolicyWorker(megatron_worker.MegatronPolicyWorkerBase):
         def remote_read_stats(self):

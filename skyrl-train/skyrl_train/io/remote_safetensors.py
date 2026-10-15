@@ -64,6 +64,16 @@ class ReadStats:
     prefetch_unused: int = 0
 
 
+class _CountingReader:
+    def __init__(self, source: BinaryIO):
+        self.source = source
+        self.reads = 0
+
+    def read(self, size: int) -> bytes:
+        self.reads += 1
+        return self.source.read(size)
+
+
 class RemoteSafetensorsTensorStore:
     """Load requested tensors with object-store range reads and no weight files on disk."""
 
@@ -146,7 +156,7 @@ class RemoteSafetensorsTensorStore:
             self._read_seconds += time.monotonic() - started
         return source
 
-    def _take_prefetch_window(self):
+    def _take_prefetch_window(self) -> list[tuple[str, int | None, str, int, int]]:
         items = []
         budget = 0
         while self._prefetch_plan:
@@ -203,8 +213,10 @@ class RemoteSafetensorsTensorStore:
             for part_start in range(start, end, _PREFETCH_MAX_BLOCK):
                 part_end = min(part_start + _PREFETCH_MAX_BLOCK, end)
                 block = bisect_right(fetched, part_start, key=lambda entry: entry[0]) - 1
+                if block < 0:
+                    raise ValueError(f"Prefetch did not cover {key!r}")
                 low, high, payload = fetched[block]
-                if block < 0 or not low <= part_start < part_end <= high:
+                if not low <= part_start < part_end <= high:
                     raise ValueError(f"Prefetch did not cover {key!r}")
                 value.extend(payload[part_start - low : part_end - low])
             self._prefetched[key, index] = value
@@ -244,9 +256,10 @@ class RemoteSafetensorsTensorStore:
         source = self._source(shard)
         source.seek(0)
         started = time.monotonic()
-        header_bytes, _keys = read_safetensors_header(source, join_resource_path(self.source_uri, shard))
+        reader = _CountingReader(source)
+        header_bytes, _keys = read_safetensors_header(reader, join_resource_path(self.source_uri, shard))
         self._record_read(len(header_bytes), started)
-        self._gets += 1
+        self._gets += reader.reads
         cached = len(header_bytes), json.loads(header_bytes[SAFETENSORS_LENGTH_PREFIX_BYTES:])
         self._headers[shard] = cached
         return cached
