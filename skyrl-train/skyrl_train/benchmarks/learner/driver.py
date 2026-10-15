@@ -155,6 +155,8 @@ class BenchmarkSpec:
             update is excluded from summaries.
         score_old_logprobs: Run the policy forward before each update and train against its log-probs, timing
             it separately, as the production trainer does.
+        routes_checkpoint: Checkpoint id whose stored routes the learner replays, or ``None`` to route natively
+            with router replay off.
     """
 
     run_name: str
@@ -169,7 +171,7 @@ class BenchmarkSpec:
     ensemble_root: str
     ensemble_version: str
     profiles: tuple[LengthProfile, ...]
-    routes_checkpoint: str
+    routes_checkpoint: str | None
     warmup_updates: int
     measured_updates: int
     score_old_logprobs: bool
@@ -294,7 +296,7 @@ def build_policy_cfg(spec: BenchmarkSpec, rows: int, base: DictConfig) -> DictCo
     megatron.context_parallel_size = spec.layout.context_parallel
     megatron.expert_model_parallel_size = spec.layout.expert_parallel
     megatron.expert_tensor_parallel_size = spec.layout.expert_tensor_parallel
-    megatron.moe_router_replay = True
+    megatron.moe_router_replay = spec.routes_checkpoint is not None
     recompute = megatron.transformer_config_kwargs
     if spec.recompute is RecomputePolicy.FULL_LAYERS:
         recompute.recompute_granularity = "full"
@@ -692,9 +694,10 @@ def run_benchmark(spec: BenchmarkSpec) -> BenchmarkResult:
         hardware: Hardware | None = None
         for update in schedule:
             batch, _ = read_ensemble_batch(update.entry.path, routes_checkpoint=spec.routes_checkpoint)
-            batch.routed_expert_rows = replay_routes(
-                batch.routed_expert_rows, model_config.num_hidden_layers, full_num_layers
-            )
+            if batch.routed_expert_rows is not None:
+                batch.routed_expert_rows = replay_routes(
+                    batch.routed_expert_rows, model_config.num_hidden_layers, full_num_layers
+                )
             batch.metadata["global_step"] = update.index
             padded = pad_training_input(batch, multiple)
             scoring_seconds = _score_old_logprobs(policy, padded) if spec.score_old_logprobs else None
@@ -773,7 +776,7 @@ def parse_spec(argv: Sequence[str] | None = None) -> BenchmarkSpec:
     parser.add_argument("--ensemble-root", required=True)
     parser.add_argument("--ensemble-version", required=True)
     parser.add_argument("--profiles", nargs="+", choices=[profile.value for profile in LengthProfile], required=True)
-    parser.add_argument("--routes-checkpoint", required=True)
+    parser.add_argument("--routes-checkpoint", help="replay these stored routes; omit to route natively")
     parser.add_argument("--warmup-updates", type=int, required=True)
     parser.add_argument("--measured-updates", type=int, required=True)
     parser.add_argument("--score-old-logprobs", action="store_true")
