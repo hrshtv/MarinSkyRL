@@ -78,6 +78,7 @@ from skyrl_train.rollouts.task_projections import (
 )
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig
 from skyrl_train.trajectory_runners.types import (
+    ENGINE_DP_RANKS_KEY,
     RESPONSE_POLICY_STEPS_KEY,
     ROUTED_EXPERTS_KEY,
     TokenProvenance,
@@ -214,6 +215,7 @@ async def _model_turn(
                     "behavior_topk_logprobs",
                     ROUTED_EXPERTS_KEY,
                     RESPONSE_POLICY_STEPS_KEY,
+                    ENGINE_DP_RANKS_KEY,
                 )
                 if output.get(name) is not None
             },

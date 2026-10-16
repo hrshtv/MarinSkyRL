@@ -64,6 +64,8 @@ def _make_min_cfg():
                 "http_endpoint_host": "127.0.0.1",
                 "http_endpoint_port": 0,
                 "weight_sync_pause_timeout_seconds": 30.0,
+                "inference_engine_data_parallel_size": 1,
+                "run_engines_locally": True,
             },
         }
     )
@@ -401,6 +403,8 @@ def test_generate_batched_routing_and_order_preservation(num_prompts, with_sessi
             }
 
     cfg = _make_min_cfg()
+    # Engines list each data-parallel rank of every engine group in order, so engine i serves rank i % 2.
+    cfg.generator.inference_engine_data_parallel_size = 2
 
     engines = [MockEngine() for _ in range(num_engines)]
     tokenizer = object()  # not used when prompt_token_ids are provided
@@ -418,6 +422,13 @@ def test_generate_batched_routing_and_order_preservation(num_prompts, with_sessi
     }
 
     out = asyncio.run(client.generate(input_batch))
+    serving_rank = {
+        ids[0]: index % 2
+        for index, engine in enumerate(engines)
+        for batch in engine.inputs
+        for ids in batch["prompt_token_ids"]
+    }
+    assert out["engine_dp_ranks"] == [serving_rank[i] for i in range(num_prompts)]
 
     # Validate reconstruction and ordering
     assert len(out["responses"]) == num_prompts
@@ -934,7 +945,7 @@ async def test_chat_completion_retry_resends_original_when_no_tokens_generated_y
 
     # Since finish_reason != abort on the second call and base_response was None,
     # client should return the second response directly (no accumulation)
-    assert out == engines[0].responses[1]
+    assert out == {**engines[0].responses[1], "engine_dp_rank": 0}
 
 
 @pytest.mark.asyncio
@@ -975,7 +986,7 @@ async def test_chat_completion_accepts_tool_call_response_without_text_content()
         "headers": {},
     }
 
-    assert await client.chat_completion(request) == response
+    assert await client.chat_completion(request) == {**response, "engine_dp_rank": 0}
 
 
 # -------------------------------------------
@@ -1219,7 +1230,7 @@ async def test_generate_retry_no_gen_finish():
     assert first_call["sampling_params"]["max_tokens"] == 16
     assert second_call["sampling_params"]["max_tokens"] == 16
 
-    assert out == {**engines[0].responses[1], "prompt_logprobs": None}
+    assert out == {**engines[0].responses[1], "prompt_logprobs": None, "engine_dp_ranks": [0]}
 
 
 # -------------------------------------------
@@ -1644,8 +1655,9 @@ async def _fail_over_engine_zero(client: InferenceEngineClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_weight_sync_pause_skips_an_engine_that_already_died():
-    """A pause must not wait on, or fail because of, an engine the client already knows is dead."""
+async def test_weight_sync_pause_and_exactness_check_skip_an_engine_that_already_died():
+    """A pause and the exactness check's generation must not wait on, or fail because of, an engine the client
+    already knows is dead."""
     dead, live = _DeadEngine(), _MockGenerateEngine()
     client = InferenceEngineClient(engines=[dead, live], tokenizer=object(), full_config=_make_min_cfg())
     await _fail_over_engine_zero(client)
@@ -1655,6 +1667,10 @@ async def test_weight_sync_pause_skips_an_engine_that_already_died():
     assert live.scheduler_paused
     await client.resume_generation(policy_step=1)
     assert not live.scheduler_paused
+
+    # One data-parallel rank per engine group, so the live second engine serves rank 0.
+    outputs = await client.generate_on_live_engines([1, 2, 3], {"max_tokens": 5})
+    assert [output["engine_dp_ranks"] for output in outputs] == [[0]]
 
 
 class _DraftGenerateEngine(_MockGenerateEngine):

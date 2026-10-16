@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from skyrl_train.inference_engines.base import ENGINE_DP_RANK_KEY
 from skyrl_train.inference_engines.inference_http_backend import InferenceHTTPBackend
 from skyrl_train.inference_engines.vllm.stats import HTTPBridgeStatsAccumulator
 
@@ -366,6 +367,8 @@ async def handle_openai_request(
             error_code = response["error"]["code"] if "error" in response else response["code"]
             return _json_response(response, endpoint=endpoint, bridge_stats=bridge_stats, status_code=error_code)
         else:
+            # The serving engine's rank stays inside the trainer; agents receive the OpenAI response.
+            response.pop(ENGINE_DP_RANK_KEY, None)
             return _json_response(response, endpoint=endpoint, bridge_stats=bridge_stats)
 
     except json.JSONDecodeError as e:
