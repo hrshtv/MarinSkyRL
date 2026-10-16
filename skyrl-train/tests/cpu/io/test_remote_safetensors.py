@@ -12,20 +12,13 @@ from cloud.iris.hf_model_cache import stage_model_metadata
 from marinskyrl.model_manifest import snapshot_model_manifest
 from skyrl_train.io import io
 from skyrl_train.models.grug_moe import GRUG_STACKED_EXPERT_SLICE_PATTERNS
-from skyrl_train.distributed.megatron.remote_prefetch import (
+from skyrl_train.distributed.megatron.remote_weight_tasks import (
     lazy_first_dim_patterns_for_bridge,
     prefetch_items_from_tasks,
 )
 from skyrl_train.config.remote_read import RemoteReadMode
 import skyrl_train.io.remote_safetensors as remote_safetensors
 from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore
-
-
-class CountingBufferedFile(AbstractBufferedFile):
-    def read(self, length=-1):
-        payload = super().read(length)
-        self.fs.bytes_read += len(payload)
-        return payload
 
 
 class CountingFileSystem(AbstractFileSystem):
@@ -37,7 +30,6 @@ class CountingFileSystem(AbstractFileSystem):
         self.payload = payload
         self.shards = shards or {}
         self.opens = 0
-        self.bytes_read = 0
         self.fetched_bytes = 0
         self.gets = 0
 
@@ -46,7 +38,7 @@ class CountingFileSystem(AbstractFileSystem):
 
     def _open(self, path, mode="rb", block_size=None, cache_type="readahead", **kwargs):
         self.opens += 1
-        return CountingBufferedFile(
+        return AbstractBufferedFile(
             self,
             path,
             mode,
@@ -98,7 +90,7 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         )
     else:
         metadata.mkdir()
-    results = []
+    results = {}
     local_filesystem_for = io.filesystem_and_path
     for mode in RemoteReadMode:
         filesystem = CountingFileSystem(shard.read_bytes(), shards)
@@ -168,8 +160,8 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         store.close()
         if mode == RemoteReadMode.PREFETCH:
             assert store.read_stats.prefetch_misses == store.read_stats.prefetch_unused == 0
-        results.append(filesystem.gets)
-    assert results[1] < results[0]
+        results[mode] = filesystem.gets
+    assert results[RemoteReadMode.PREFETCH] < results[RemoteReadMode.PER_KEY]
 
 
 def test_invalid_index_is_not_replaced_by_single_file_fallback(tmp_path: Path) -> None:
@@ -273,3 +265,4 @@ def test_prefetch_bounded_ranges_and_unplanned_reads_preserve_tensors(tmp_path, 
     finally:
         store.close()
     assert filesystem.fetched_bytes == len(filesystem.payload)
+    assert store.read_stats.prefetch_unused == 0
