@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -12,12 +13,13 @@ import numpy as np
 import fsspec
 import ray
 import torch
+from omegaconf import OmegaConf
 
 from skyrl_train.entrypoints.main_base import BasePPOExp
 from skyrl_train.objective.correction import compute_correction
 from skyrl_train.config.objective_spec import off_policy_correction
 from skyrl_train.objective.score_centering import collate_score_centering
-from skyrl_train.trainer import RayPPOTrainer, convert_prompts_responses_to_batch_tensors
+from skyrl_train.trainer import RayPPOTrainer, convert_prompts_responses_to_batch_tensors, _token_staleness_metrics
 from skyrl_train.training_batch import TrainingInputBatch
 
 
@@ -143,13 +145,18 @@ class ReadinessTrainer(RayPPOTrainer):
             self.tokenizer, prompts, responses, rewards, masks, chosen, None, None
         )
         sequences, attention, response_mask, _, loss_mask, sampled, _, _ = values
+        policy_steps = torch.full_like(loss_mask, -1, dtype=torch.int32)
+        for row, (_, output, index) in enumerate(outputs):
+            stamps = output["response_policy_steps"][index]
+            policy_steps[row, : len(stamps)] = torch.tensor(stamps, dtype=torch.int32)
+        staleness = torch.where(response_mask.bool(), self.global_step - policy_steps, 0)
         payload = {
             "sequences": sequences,
             "attention_mask": attention,
             "response_mask": response_mask,
             "loss_mask": loss_mask,
             "rollout_logprobs": sampled,
-            "rollout_staleness": torch.full_like(loss_mask, self.global_step - 1, dtype=torch.int32),
+            "rollout_staleness": staleness,
             "base_action_log_probs": None,
             "values": None,
             "returns": torch.zeros_like(loss_mask),
@@ -167,6 +174,8 @@ class ReadinessTrainer(RayPPOTrainer):
             )
             payload.update(score_topk_indices=ids, score_behavior_logprobs=behavior)
         batch = TrainingInputBatch(payload)
+        if self._training_metrics_enabled:
+            self.all_metrics.update(_token_staleness_metrics(staleness, loss_mask, policy_steps))
         batch.metadata = {"response_length": response_mask.shape[1], "uids": list(map(str, range(len(prompts))))}
         return batch
 
@@ -184,7 +193,7 @@ class ReadinessTrainer(RayPPOTrainer):
         return stats
 
     async def prefix_replay(self, outputs, *, temperature=1.0):
-        prefixes, overrides, expected = [], [], []
+        prefixes, overrides, expected, samples = [], [], [], []
         for prompt, output, index in outputs[:: max(1, len(outputs) // 8)]:
             response = output["response_ids"][index]
             for position in sorted({0, len(response) // 2, len(response) - 1}):
@@ -196,6 +205,19 @@ class ReadinessTrainer(RayPPOTrainer):
                 prefixes.append(prompt + response[:position])
                 overrides.append({"logprob_token_ids": ids})
                 expected.append(scores)
+                samples.append(
+                    {
+                        "prompt_ids": prompt,
+                        "response_prefix_ids": response[:position],
+                        "chosen_token_id": response[position],
+                        "position": position,
+                        "captured_support_ids": ids,
+                        "captured_support_logprobs": scores,
+                        "captured_chosen_logprob": output["response_logprobs"][index][position],
+                        "temperature": temperature,
+                        "generating_policy_step": output["response_policy_steps"][index][position],
+                    }
+                )
         replay = await self.inference_engine_client.generate(
             {
                 "prompt_token_ids": prefixes,
@@ -213,6 +235,7 @@ class ReadinessTrainer(RayPPOTrainer):
         for index, target in enumerate(expected):
             assert replay["student_topk_indices"][index][0] == overrides[index]["logprob_token_ids"]
             gaps.extend(np.asarray(replay["behavior_topk_logprobs"][index][0]) - np.asarray(target))
+            samples[index]["prefix_replay_support_logprobs"] = replay["behavior_topk_logprobs"][index][0]
         return {
             "prefixes": len(prefixes),
             "prefix_ids_sha256": digest(prefixes),
@@ -221,6 +244,7 @@ class ReadinessTrainer(RayPPOTrainer):
             "same_engine_decode_prefill_gap_abs_mean": float(np.abs(gaps).mean()),
             "same_engine_decode_prefill_gap_abs_max": float(np.abs(gaps).max()),
             "policy_steps": sorted({step for row in replay["response_policy_steps"] for step in row}),
+            "samples": samples,
         }
 
     async def update(self, batch):
@@ -239,6 +263,7 @@ class ReadinessTrainer(RayPPOTrainer):
         update = time.perf_counter() - trained
         assert status["policy_update_steps"] == 1 and status["skipped_steps"] == 0
         assert math.isfinite(status["raw_grad_norm"]) and status["raw_grad_norm"] > 0
+        self._readiness_applied_updates += int(status["policy_update_steps"])
         self._policy_version_step = self.global_step
         await asyncio.to_thread(self._offload_policy_optimizer, self.all_timings, timer_label="probe_offload")
         memory = await asyncio.to_thread(
@@ -254,13 +279,23 @@ class ReadinessTrainer(RayPPOTrainer):
 
     async def _train_loop(self):
         short = os.environ["SC_READINESS_WORKLOAD"] == "qwen"
+        self._readiness_applied_updates = 0
         self.probe = {
             "schema": 1,
             "workload": "qwen" if short else "snowball",
-            "candidate": "101dc9998f86b93e1f104a3527939e25aebfb635",
+            "candidate": os.environ["SC_READINESS_CANDIDATE_SHA"],
             "windows": [],
             "qualification": {},
             "setup_timings": self.all_startup_timings,
+        }
+        self.probe["runtime"] = {
+            "lock_sha256": hashlib.sha256((Path(os.environ["SKYRL_HOME"]) / "uv.lock").read_bytes()).hexdigest(),
+            "versions": {
+                name: importlib.metadata.version(name)
+                for name in ("torch", "vllm", "megatron-core", "transformers", "marin-iris")
+            },
+            "policy_parallelism": OmegaConf.to_container(self.cfg.trainer.policy.megatron_config),
+            "sampling": OmegaConf.to_container(self.cfg.generator.sampling_params),
         }
         await self._init_weight_sync()
         await self._sync_policy_for_rollouts(reason="initial")
@@ -283,6 +318,7 @@ class ReadinessTrainer(RayPPOTrainer):
         batch = self.batch(captured, 128)
         self.probe["qualification"]["reference"] = await self.reference(batch)
         batch = await asyncio.to_thread(self.fwd_logprobs_values_reward, batch)
+        matching_logprobs = batch["action_log_probs"].clone()
         valid = batch["loss_mask"] > 0
         gap = batch["action_log_probs"][valid] - batch["rollout_logprobs"][valid]
         self.probe["qualification"]["matching_weights_tim"] = {
@@ -290,6 +326,14 @@ class ReadinessTrainer(RayPPOTrainer):
             "abs_mean": gap.abs().mean().item(),
             "abs_p99": torch.quantile(gap.abs(), 0.99).item(),
             "abs_max": gap.abs().max().item(),
+        }
+        head_gap = (batch["score_old_logprobs"] - batch["score_behavior_logprobs"])[valid]
+        sampled_head_gap = head_gap.flatten()[:: max(1, head_gap.numel() // 65536)]
+        self.probe["qualification"]["matching_weights_head_tim"] = {
+            "entries": head_gap.numel(),
+            "abs_mean": head_gap.abs().mean().item(),
+            "abs_max": head_gap.abs().max().item(),
+            "sampled_abs_p99": torch.quantile(sampled_head_gap.abs(), 0.99).item(),
         }
         self.save_probe()
         # This second temperature exercises the actual engine and trainer scaling before any updates.
@@ -315,7 +359,7 @@ class ReadinessTrainer(RayPPOTrainer):
                 started = time.perf_counter()
                 outputs = await self.generate_workload(width, short=short)
                 generated = time.perf_counter() - started
-                self.global_step += 1
+                self.global_step = self._readiness_applied_updates + 1
                 prepared = time.perf_counter()
                 batch = self.batch(outputs, width)
                 preparation = time.perf_counter() - prepared
@@ -332,18 +376,26 @@ class ReadinessTrainer(RayPPOTrainer):
                     sequence_shape=list(batch["sequences"].shape),
                     response_ids_sha256=digest([o["response_ids"][i] for _, o, i in outputs]),
                     inference_memory=await self.inference_memory(),
-                    applied_updates=self.global_step - 1,
+                    applied_updates=self._readiness_applied_updates,
                     generator_applied_updates=0,
                     generator_policy_step=1,
                 )
                 self.probe["windows"].append(result)
                 self.save_probe()
         await self.settings(128, True, diagnostic_tokens=16)
-        self.global_step += 1
-        result = await self.update(self.batch(captured, 128))
+        self.global_step = self._readiness_applied_updates + 1
+        stale_batch = self.batch(captured, 128)
+        result = await self.update(stale_batch)
+        drift = (stale_batch["action_log_probs"] - matching_logprobs)[valid]
+        assert drift.abs().max() > 0
+        self.probe["qualification"]["trainer_weight_drift_on_identical_tokens"] = {
+            "abs_mean": drift.abs().mean().item(),
+            "abs_max": drift.abs().max().item(),
+            "changed_fraction": (drift != 0).float().mean().item(),
+        }
         self.probe["qualification"]["sampled_diagnostics"] = result
         self.probe["qualification"]["stale_prefix_replay"] = await self.prefix_replay(captured)
         assert self.probe["qualification"]["stale_prefix_replay"]["policy_steps"] == [1]
         self.probe["complete"] = True
-        self.probe["applied_updates"] = self.global_step - 1
+        self.probe["applied_updates"] = self._readiness_applied_updates
         self.save_probe()

@@ -23,6 +23,7 @@ from marinskyrl.runtime_options import (
     PREFERENCE_PAIR_ENV_CLASS,
     AdvantageEstimator,
     PolicyLossType,
+    ftpo_requested,
 )
 
 
@@ -337,8 +338,8 @@ def validate_objective(cfg: DictConfig, *, loss_spec: LossSpec | None = None) ->
         raise ValueError("score centering and its sampled diagnostics require score_centering_topk > 0")
     if centering_width:
         score_centering_tis_cap(algorithm)
-        if algorithm.policy_loss_type != PolicyLossType.REGULAR or plan is not None:
-            raise ValueError("score centering requires regular PPO without distillation")
+        if algorithm.policy_loss_type != PolicyLossType.REGULAR or plan is not None or ftpo_requested(algorithm):
+            raise ValueError("score centering requires regular PPO without distillation or auxiliary FTPO")
         policy = cfg.trainer.policy
         if (
             cfg.trainer.strategy != "megatron"
