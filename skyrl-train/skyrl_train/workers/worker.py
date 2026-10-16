@@ -29,6 +29,14 @@ from ray.util.placement_group import (
 
 from skyrl_train.batch_assembly import BatchPlan, assemble_slice, forward_input
 from skyrl_train.batch_digest import BatchInputPhase, digest
+from skyrl_train.batch_metrics import install_correction, training_metrics, token_staleness_metrics
+from skyrl_train.group_admission import GroupAdvantageInvariant
+from skyrl_train.utils.advantage_estimators import (
+    apply_loop_advantages,
+    drop_advantage_inputs,
+    batch_advantages,
+)
+from skyrl_train.utils.importance_ratio_diagnostics import WorldReduction
 from skyrl_train.batch_sampling import RowOwnership, filter_trajectory_batch
 from skyrl_train.rollouts.buffer import PayloadReference
 from skyrl_train.rollouts.context import RolloutReader
@@ -969,6 +977,76 @@ class PolicyWorkerBase(Worker):
         data.metadata.update(pad_size=0, global_step=plan.global_step)
         self._loaded_batches[plan.batch_id] = LoadedBatch(plan, data)
         return time.perf_counter() - started
+
+    def _forward_loaded_logprobs(self, data: TrainingInputBatch) -> torch.Tensor:
+        return self.forward(data)["output"]
+
+    def forward_loaded(self, batch_id: int) -> TrainingOutputBatch:
+        """Retain completed policy scores and return globally reduced diagnostics."""
+        loaded = self._loaded_batches[batch_id]
+        batch = loaded.batch
+        batch["action_log_probs"] = self._forward_loaded_logprobs(forward_input(batch))
+        batch["base_action_log_probs"], batch["values"] = None, None
+        reduction = WorldReduction(self.strategy.all_reduce, self.mesh_rank.is_collection_dp_rank())
+        metrics = (
+            token_staleness_metrics(batch, loaded.plan.facts, reduction=reduction)
+            if self.cfg.trainer.training_metrics
+            else {}
+        )
+        metrics.update(
+            training_metrics(
+                batch,
+                algorithm=self.cfg.trainer.algorithm,
+                reduction=reduction,
+                phase="forward",
+                step_wise=False,
+                training_metrics_enabled=self.cfg.trainer.training_metrics,
+                rollout_logprobs_enabled=self.cfg.generator.sampling_params.logprobs is not None,
+            )
+        )
+        output = TrainingOutputBatch({})
+        output.metadata = {"batch_metrics": metrics}
+        return output
+
+    def prepare_loaded(self, batch_id: int) -> TrainingOutputBatch:
+        """Install outcome or uniform credit and finalize the retained training input."""
+        loaded = self._loaded_batches[batch_id]
+        batch, plan, algorithm = loaded.batch, loaded.plan, self.cfg.trainer.algorithm
+        reduction = WorldReduction(self.strategy.all_reduce, self.mesh_rank.is_collection_dp_rank())
+        metrics = install_correction(batch, algorithm, reduction=reduction)
+        if plan.advantages is not None:
+            rows = plan.rank_rows(self.mesh_rank.dp, self.mesh_rank.dp_size)
+            batch["advantages"] = (
+                torch.from_numpy(plan.advantages[rows.start : rows.stop].copy())[:, None] * batch["response_mask"]
+            )
+            batch["returns"] = batch["advantages"]
+        else:
+            rows = plan.rank_rows(self.mesh_rank.dp, self.mesh_rank.dp_size)
+            batch["advantages"], batch["returns"] = batch_advantages(
+                batch,
+                algorithm,
+                invariant=GroupAdvantageInvariant.from_config(algorithm.resolved_group_advantage),
+            )
+        metrics.update(
+            training_metrics(
+                batch,
+                algorithm=algorithm,
+                reduction=reduction,
+                phase="advantages",
+                step_wise=False,
+                group_scores=(
+                    plan.uids,
+                    torch.from_numpy(np.concatenate([facts.score for facts in plan.facts]))[:, None],
+                ),
+            )
+        )
+        loaded.batch = drop_advantage_inputs(apply_loop_advantages(batch))
+        output = TrainingOutputBatch({})
+        output.metadata = {"batch_metrics": metrics}
+        return output
+
+    def train_loaded(self, batch_id: int) -> TrainingOutputBatch:
+        return self.ppo_train(self._loaded_batches[batch_id].batch)
 
     def digest_loaded(self, batch_id: int, phase: BatchInputPhase):
         data = self._loaded_batches[batch_id].batch

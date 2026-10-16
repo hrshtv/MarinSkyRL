@@ -13,21 +13,25 @@ from marinskyrl.runtime_options import (
     parse_batch_builder,
     reference_model_required,
 )
-from skyrl_train.batch_assembly import BatchPlan, fields_from_facts
+from skyrl_train.batch_assembly import BatchPlan, fields_from_facts, plan_batch
 from skyrl_train.trajectory_runners.types import BatchFields
 from skyrl_train.rollouts.context import RolloutBatchMetadata, RolloutReader
 from skyrl_train.utils.advantage_estimators import OUTCOME_ADVANTAGE_ESTIMATORS
 from skyrl_train.trajectory_runners.trajectory_reward_shaping import parse_trajectory_reward_shaping_config
 from skyrl_train.utils.utils import moe_router_replay_requested
+from skyrl_train.distributed.dispatch import collect_actor_results
 
 from marinskyrl.distillation import DistillationRewardMode
 from skyrl_train.batch_metrics import (
     consumed_work,
     install_correction,
+    consumed_stop_metrics,
+    rollout_metrics,
+    reward_metrics,
 )
 from skyrl_train.rollouts.buffer import RolloutGroup
 from skyrl_train.rollouts.context import TrainingContext
-from skyrl_train.telemetry import ConsumedWork, critical_phase
+from skyrl_train.telemetry import ConsumedWork, critical_phase, record_rollout_staleness, record_consumed_staleness
 from skyrl_train.timing_observability import StepWallTime
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.utils import Timer
@@ -86,7 +90,6 @@ def require_worker_batch_support(cfg, *, trainer_type, facts=None, policy_mesh=N
             (megatron.get("expert_tensor_parallel_size") or megatron.tensor_model_parallel_size) > 1,
         ),
         ("dense batch dumping", mode is BatchBuilder.WORKER and cfg.trainer.dump_data_batch),
-        ("worker optimization", mode is BatchBuilder.WORKER),
     ]
     if facts is not None:
         valid_facts = all(group is not None and isinstance(group.fields, BatchFields) for group in facts)
@@ -328,7 +331,7 @@ class WorkerBatchSource:
         fields = fields_from_facts(facts)
         if not moe_router_replay_requested(self.cfg):
             fields = fields.without_routes()
-        self._plan = BatchPlan(
+        self._plan = plan_batch(
             batch_id=self._metadata.batch_id,
             global_step=global_step,
             uids=tuple(group.uid for group in groups for _ in group.row_facts.response_len),
@@ -338,13 +341,119 @@ class WorkerBatchSource:
                 global_step - group.policy_step for group in groups for _ in group.row_facts.response_len
             ),
             num_experts=self.num_experts,
+            algorithm=self.cfg.trainer.algorithm,
         )
+        staleness = [global_step - group.policy_step for group in groups]
+        record_rollout_staleness(staleness, global_step)
+        assert max(staleness) <= self.context.config.max_staleness_steps
+        self.metrics.update(
+            rollout_metrics(facts, tis_lcs_alert_threshold=float(self.cfg.trainer.algorithm.tis_lcs_alert_threshold))
+        )
+        self.metrics.update(
+            reward_metrics(facts, self._plan.uids, n_samples_per_prompt=self.cfg.generator.n_samples_per_prompt)
+        )
+        self.metrics.update(
+            {
+                "async/staleness_mean": sum(staleness) / len(staleness),
+                "async/staleness_max": max(staleness),
+                "async/staleness_min": min(staleness),
+                "async/staleness_ratio": sum(value > 0 for value in staleness) / len(staleness),
+            }
+        )
+        if self.cfg.trainer.training_metrics:
+            record_consumed_staleness(
+                self._plan.uids,
+                self._plan.rollout_staleness,
+                [int(value) for group in facts for value in group.response_len],
+                step=global_step,
+            )
         self._pending = self.policy.read_batch_groups(self._plan, self._reader)
         self._references = list(await self.context.wait(asyncio.gather(*self._pending)))
         self._pending = self.policy.load_batch(self._plan, self._reader, self._references, self.pad_token_id)
         loaded = await self.context.wait(asyncio.gather(*self._pending))
         self._pending = []
         self.timings["load_worker_batch"] = max(loaded)
+        self.trainer._log_rollout_batch_completed(
+            groups=len(facts),
+            sequences=len(self._plan.uids),
+            response_tokens=sum(int(group.response_len.sum()) for group in facts),
+            duration_seconds=self.timings["wait_for_generation_buffer"],
+        )
+
+    async def _run_loaded(self, method: str):
+        self._pending = self.policy.async_run_ray_method("pass_through", method, self.admitted_plan.batch_id)
+        outputs = await self.context.wait(asyncio.gather(*self._pending))
+        self._pending = []
+        return outputs
+
+    async def forward(self, *, step_wall: StepWallTime | None) -> None:
+        await self.trainer._drain_policy_event_loops()
+        with Timer("fwd_logprobs_values_reward", self.timings):
+            if self.cfg.trainer.placement.colocate_all:
+                await asyncio.to_thread(self.policy.backload_to_gpu, backload_optimizer=False, backload_model=True)
+            outputs = await self._run_loaded("forward_loaded")
+            self.metrics.update(outputs[0].metadata["batch_metrics"])
+            if self.cfg.trainer.placement.colocate_all:
+                await asyncio.to_thread(self.policy.offload_to_cpu, offload_optimizer=False, offload_model=True)
+            else:
+                await self.context.wait(
+                    asyncio.gather(*self.policy.async_run_ray_method("pass_through", "empty_cache"))
+                )
+
+    async def finalize(self, *, step_wall: StepWallTime | None) -> None:
+        if step_wall is not None:
+            step_wall.start("advantages")
+        with Timer("prepare_worker_training_input", self.timings):
+            outputs = await self._run_loaded("prepare_loaded")
+            self.metrics.update(outputs[0].metadata["batch_metrics"])
+
+    async def train(self, *, step_wall: StepWallTime | None) -> dict:
+        if step_wall is not None:
+            step_wall.start("policy_training")
+        with (
+            Timer("train_critic_and_policy", self.timings),
+            critical_phase("train_step", self.admitted_plan.global_step),
+        ):
+            if self.cfg.trainer.placement.colocate_all:
+                await asyncio.to_thread(self.policy.backload_to_gpu)
+            elif self.cfg.trainer.offload_optimizer_during_rollouts:
+                with Timer("backload_policy_optimizer_to_gpu", self.timings):
+                    await asyncio.to_thread(self.policy.backload_to_gpu, backload_optimizer=True, backload_model=False)
+            with Timer("policy_train", self.timings):
+                self._pending = self.policy.async_run_ray_method(
+                    "pass_through", "train_loaded", self.admitted_plan.batch_id
+                )
+                outputs = await asyncio.to_thread(
+                    collect_actor_results, self.policy.actor_infos, self._pending, operation="policy train_loaded"
+                )
+                self._pending = []
+            status = outputs[0].metadata["train_status"]
+            self.metrics.update({f"policy/{key}": value for key, value in status.items()})
+            await self.context.wait(asyncio.gather(*self.policy.async_run_ray_method("pass_through", "empty_cache")))
+        self.trainer.finish_policy_update(status)
+        return status
+
+    def summary(self) -> BatchSummary:
+        plan = self.admitted_plan
+        response_lengths = tuple(int(value) for group in plan.facts for value in group.response_len)
+        fields = plan.fields
+        return BatchSummary(
+            ConsumedWork(
+                len(plan.uids),
+                sum(response_lengths),
+                sum(int(value) for group in plan.facts for value in group.loss_tokens),
+            ),
+            len(plan.facts),
+            consumed_stop_metrics(
+                tuple(value for group in plan.facts for value in group.stop_reasons)
+                if "stop_reasons" in fields.first_group_list_fields
+                else None,
+                len(plan.uids),
+            ),
+            tuple(float(value) for group in plan.facts for value in group.scalar_values)
+            if not fields.token_rewards
+            else (),
+        )
 
     async def release(self, error: BaseException | None = None) -> None:
         try:
@@ -377,7 +486,14 @@ def make_batch_source(mode: BatchBuilder, *, driver: DriverBatchSource) -> Batch
     worker = WorkerBatchSource(driver.trainer)
     if mode is BatchBuilder.WORKER:
         return worker
-    return VerifyBatchSource(worker, driver=driver, context=driver.context, policy=driver.trainer.policy_model)
+    return VerifyBatchSource(
+        worker,
+        context=driver.context,
+        policy=driver.trainer.policy_model,
+        cfg=driver.trainer.cfg,
+        tokenizer=driver.trainer.tokenizer,
+        timings=driver.trainer.all_timings,
+    )
 
 
 @asynccontextmanager
