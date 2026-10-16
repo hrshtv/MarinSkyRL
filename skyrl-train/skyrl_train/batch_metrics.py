@@ -1,3 +1,9 @@
+from omegaconf import DictConfig
+from skyrl_train.config.objective_spec import off_policy_correction
+from skyrl_train.objective.correction import compute_correction
+from skyrl_train.utils.importance_ratio_diagnostics import LocalReduction
+from skyrl_train.training_batch import TrainingInputBatch
+from collections.abc import Sequence
 from collections import defaultdict
 from typing import Dict, List
 import re
@@ -43,3 +49,38 @@ def domain_reward_metrics(data_sources: List[str | None], rewards: List[float]) 
         overflow = [reward for source in sources[MAX_DOMAIN_REWARD_METRICS:] for reward in rewards_by_source[source]]
         metrics["reward/domain_overflow/avg_raw_reward"] = float(np.mean(overflow))
     return metrics
+
+
+def consumed_stop_metrics(stop_reasons: Sequence[str | None] | None, sequence_count: int) -> dict[str, float]:
+    """Count length stops on admitted sequences; the fraction needs every stop reason."""
+    reasons = [None] * sequence_count if stop_reasons is None else stop_reasons
+    known = sum(reason is not None and reason != "" for reason in reasons)
+    length_stops = sum(reason == "length" for reason in reasons)
+    metrics = {
+        "sequences": float(sequence_count),
+        "length_stop_count": float(length_stops),
+        "known_stop_count": float(known),
+        "unknown_stop_count": float(sequence_count - known),
+    }
+    if sequence_count:
+        metrics["stop_reason_coverage"] = known / sequence_count
+        if known == sequence_count:
+            metrics["length_stop_fraction"] = length_stops / sequence_count
+    return {f"consumed/{name}": value for name, value in metrics.items()}
+
+
+def install_correction(
+    batch: TrainingInputBatch, algorithm: DictConfig, *, reduction: LocalReduction
+) -> dict[str, float]:
+    """Install configured policy correction weights and return their diagnostics."""
+    correction = off_policy_correction(algorithm)
+    if not correction.rules:
+        return {}
+    rollout_logprobs = batch.get("rollout_logprobs")
+    if rollout_logprobs is None:
+        raise ValueError("off_policy_correction requires rollout_logprobs")
+    result = compute_correction(
+        batch["action_log_probs"], rollout_logprobs, batch["loss_mask"], correction, reduction=reduction
+    )
+    batch["correction_weights"] = result.weights
+    return result.metrics

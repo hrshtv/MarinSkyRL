@@ -1,3 +1,4 @@
+from skyrl_train.trajectory_runners.rollout_metrics import rollout_length_metrics
 from typing import List, Tuple, Union, Optional, Dict, Any, Sequence
 from collections import defaultdict
 from enum import StrEnum
@@ -16,7 +17,6 @@ from skyrl_train.trajectory_runners.types import (
 )
 from skyrl_train.trajectory_runners.trajectory_retention import RETENTION_METRIC_PREFIX
 from skyrl_train.metric_names import (
-    ENVIRONMENT_METRIC_PREFIX,
     IDENTITY_AWARE_REWARD_METRIC_PREFIX,
     TASK_ROLLOUT_METRIC_PREFIX,
     TIS_ALIGNED_TOKENS_METRIC,
@@ -39,7 +39,6 @@ from skyrl_train.trajectory_runners.trajectory_reward_shaping import (
 from skyrl_train.metric_names import ROLLOUT_FAILURE_FRACTION_METRIC
 from skyrl_train.inference_engines.base import UNSTAMPED_POLICY_STEP
 from loguru import logger
-from skyrl_gym.metrics import aggregate_for_task
 from skyrl_gym.verification import VerificationResult, VerificationStatus, normalized_verifier_score
 
 
@@ -608,53 +607,9 @@ def get_rollout_metrics(
     env_classes: Optional[List[str]] = None,
     verification_results: Optional[List[Optional[VerificationResult]]] = None,
 ):
-    """
-    Computes rollout metrics including token statistics and optional environment-specific metrics.
-
-    Args:
-        responses: List of token ID sequences for each response
-        rewards: List of rewards (either per-trajectory or per-token)
-        env_metrics: Optional list of environment-specific metrics for each trajectory
-        env_classes: Optional list of environment class names for each trajectory
-        verification_results: Verifier verdicts that override reward-sign token statistics when present
-
-    Returns:
-        Dictionary of aggregated metrics
-    """
-    num_tokens_arr = np.array([len(response) for response in responses])
+    """Aggregate response lengths and verifier-aware successes by environment."""
     successes = rollout_successes(rewards, verification_results)
-    non_zero_rewards_arr = np.array(successes, dtype=bool)
-    zero_rewards_arr = ~non_zero_rewards_arr
-    # average tokens for non zero rewards
-    avg_tokens_non_zero_rewards = (
-        np.mean(num_tokens_arr[non_zero_rewards_arr]) if non_zero_rewards_arr.sum() > 0 else np.zeros(1)
-    )
-    # average tokens for zero rewards
-    avg_tokens_zero_rewards = np.mean(num_tokens_arr[zero_rewards_arr]) if zero_rewards_arr.sum() > 0 else np.zeros(1)
-
-    rollout_metrics = {
-        "generate/min_num_tokens": np.min(num_tokens_arr).item(),
-        "generate/max_num_tokens": np.max(num_tokens_arr).item(),
-        "generate/avg_num_tokens": np.mean(num_tokens_arr).item(),
-        "generate/std_num_tokens": np.std(num_tokens_arr).item(),
-        "generate/avg_tokens_non_zero_rewards": avg_tokens_non_zero_rewards.item(),
-        "generate/avg_tokens_zero_rewards": avg_tokens_zero_rewards.item(),
-    }
-
-    if env_metrics is not None and env_classes is not None:
-        env_to_metrics = defaultdict(list)
-        for i, metrics in enumerate(env_metrics):
-            # Skipped episodes (e.g. over-length prompts) never step the environment and
-            # report an empty dict; per-environment aggregators only see stepped episodes.
-            if metrics:
-                env_to_metrics[env_classes[i]].append(metrics)
-        for env_name, metrics in env_to_metrics.items():
-            # Aggregate metrics across all trajectories for the same environment
-            agg = aggregate_for_task(env_name, metrics)
-            for key, value in agg.items():
-                rollout_metrics[f"{ENVIRONMENT_METRIC_PREFIX}{key}"] = value
-
-    return rollout_metrics
+    return rollout_length_metrics([len(response) for response in responses], successes, env_metrics, env_classes)
 
 
 _BATCH_FAILURE_COUNT_KEYS = (
@@ -748,3 +703,10 @@ def prepare_trajectory_request(
 def _re_sentinel_rows(n: int, sentinel_row: np.ndarray) -> np.ndarray:
     """Return a compact sentinel block with the learned route geometry."""
     return np.zeros((n, *sentinel_row.shape), dtype=sentinel_row.dtype)
+
+
+def token_reward_rows(rewards, response_ids) -> List[List[float]]:
+    """Retain token rewards or credit each scalar on its final response token."""
+    if rewards and isinstance(rewards[0], list):
+        return rewards
+    return [scalar_reward_token_credit(reward, response) for reward, response in zip(rewards, response_ids)]
