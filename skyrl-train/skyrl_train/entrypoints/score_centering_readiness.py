@@ -22,6 +22,7 @@ from skyrl_train.config.objective_spec import off_policy_correction
 from skyrl_train.objective.score_centering import collate_score_centering
 from skyrl_train.trainer import RayPPOTrainer, convert_prompts_responses_to_batch_tensors, _token_staleness_metrics
 from skyrl_train.training_batch import TrainingInputBatch
+from skyrl_train.timing_observability import StepWallTime
 
 
 _device_memory_peak = 0
@@ -54,6 +55,8 @@ def memory_stats(reset=False):
             target=sample_device_memory, args=(torch.cuda.current_device(),), daemon=True
         )
         _device_memory_thread.start()
+    if not _device_memory_thread.is_alive():
+        raise RuntimeError("Device memory sampler stopped before measurement finished")
     if reset:
         torch.cuda.reset_peak_memory_stats()
     return {
@@ -441,6 +444,33 @@ class ReadinessTrainer(RayPPOTrainer):
         self.probe["qualification"]["sampled_diagnostics"] = result
         self.probe["qualification"]["stale_prefix_replay"] = await self.prefix_replay(captured)
         assert self.probe["qualification"]["stale_prefix_replay"]["policy_steps"] == [1]
+        if not short:
+            # Qualify the actual task projection, admission and training path too.
+            await self._sync_policy_for_rollouts(reason="native_qualification")
+            self.context.start()
+            await self._publish(self.global_step + 1)
+            self.global_step += 1
+            self.all_metrics, self.all_timings = {}, {}
+            wall = StepWallTime(OmegaConf.to_container(self.cfg.trainer.step_phase_budgets))
+            native_started = time.perf_counter()
+            native = await self._train_step(0, wall)
+            assert self.all_metrics["policy/policy_update_steps"] == 1
+            assert self.all_metrics["policy/skipped_steps"] == 0
+            assert (
+                math.isfinite(self.all_metrics["policy/raw_grad_norm"]) and self.all_metrics["policy/raw_grad_norm"] > 0
+            )
+            assert self.all_metrics["async/staleness_tokens_max"] == 0
+            self._readiness_applied_updates += 1
+            self.probe["qualification"]["native_training"] = {
+                "seconds": time.perf_counter() - native_started,
+                "shape": list(native["sequences"].shape),
+                "tokens": int(native["response_mask"].sum()),
+                "loss_tokens": int(native["loss_mask"].sum()),
+                "uids": native.metadata["uids"],
+                "metrics": dict(self.all_metrics),
+                "timings": dict(self.all_timings),
+                "applied_updates": 1,
+            }
         self.probe["complete"] = True
         self.probe["applied_updates"] = self._readiness_applied_updates
         self.save_probe()
