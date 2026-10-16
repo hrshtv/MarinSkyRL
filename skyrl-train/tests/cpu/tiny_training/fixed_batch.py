@@ -57,7 +57,7 @@ def fixed_training_batch(model_dir: str) -> TrainingInputBatch:
 
 class _ConcurrentPolicyWorker(CPUPolicyWorker):
     def __init__(self, cfg, **kwargs):
-        super().__init__(cfg, **kwargs)
+        super().__init__(cfg=cfg, **kwargs)
         barrier = os.open(Path(cfg.trainer.export_path).parent / "constructor-barrier", os.O_RDWR | os.O_NONBLOCK)
         try:
             if self._rank == 0:
