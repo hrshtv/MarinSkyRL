@@ -1,3 +1,6 @@
+from skyrl_train.utils.advantage_estimators import batch_advantages, apply_loop_advantages, drop_advantage_inputs
+from skyrl_train.batch_metrics import domain_metric_source_key as _domain_metric_source_key
+from skyrl_train.batch_metrics import domain_reward_metrics as _domain_reward_metrics
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
@@ -5,7 +8,6 @@ import io as stdlib_io
 import json
 import math
 import os
-import re
 import shutil
 import threading
 import time
@@ -183,45 +185,6 @@ class CheckpointSnapshot:
 _MODEL_INITIALIZATION_TIMEOUT = 60 * 60
 
 MAX_DOMAIN_REWARD_METRICS = 32
-
-
-def _domain_metric_source_key(source: str | None) -> str:
-    """Encode one source as a distinct, tracker-safe metric path segment.
-
-    Lowercase ASCII names stay readable. ``_missing`` denotes absent metadata;
-    other names use fixed-width UTF-8 byte escapes under ``_source_``.
-    """
-    if source is None:
-        return "_missing"
-    if re.fullmatch(r"[a-z_][a-z0-9_]*", source) and source != "_missing" and not source.startswith("_source_"):
-        return source
-    encoded = "".join(
-        chr(byte) if byte in b"abcdefghijklmnopqrstuvwxyz0123456789" else f"_{byte:02x}"
-        for byte in source.encode("utf-8")
-    )
-    return f"_source_{encoded}"
-
-
-def _domain_reward_metrics(data_sources: List[str | None], rewards: List[float]) -> Dict[str, float]:
-    """Return bounded per-source means with distinct, stable metric names."""
-    if len(data_sources) != len(rewards):
-        raise ValueError(
-            f"Expected one data source per reward, got {len(data_sources)} sources and {len(rewards)} rewards"
-        )
-
-    rewards_by_source: Dict[str, List[float]] = defaultdict(list)
-    for source, reward in zip(data_sources, rewards, strict=True):
-        rewards_by_source[_domain_metric_source_key(source)].append(reward)
-
-    sources = sorted(rewards_by_source)
-    metrics = {
-        f"reward/domain/{source}/avg_raw_reward": float(np.mean(rewards_by_source[source]))
-        for source in sources[:MAX_DOMAIN_REWARD_METRICS]
-    }
-    if len(sources) > MAX_DOMAIN_REWARD_METRICS:
-        overflow = [reward for source in sources[MAX_DOMAIN_REWARD_METRICS:] for reward in rewards_by_source[source]]
-        metrics["reward/domain_overflow/avg_raw_reward"] = float(np.mean(overflow))
-    return metrics
 
 
 def _active_online_eagle_results(results: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -2609,20 +2572,7 @@ class RayPPOTrainer:
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
-        """Calculate advantages and returns for the data batch.
-
-        Expects:
-            - `["sequences"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["response_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["loss_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["rewards"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `.metadata["uids"]`: List[str]
-
-        Adds:
-            - `["advantages"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["returns"]`: Float[torch.Tensor, "batch_size seqlen"]
-        """
+        """Compute masked advantages and returns with the configured estimator."""
         token_level_rewards = data["rewards"]
 
         if self.cfg.trainer.step_wise_training:
@@ -2659,27 +2609,8 @@ class RayPPOTrainer:
             advantages = last_step_advantages[traj_ids]
             returns = last_step_returns[traj_ids]
         else:
-            # For RLOO-N: pass exclude_from_baseline if present in metadata
-            exclude_from_baseline = data.metadata.get("exclude_from_baseline", None)
-            # Stage C (F6): thread the per-token PBS shaping channel into the
-            # advantage estimator when it is present. The dispatcher forwards it
-            # via **kwargs; only the rloo_n_pbs combiner consumes it (every other
-            # estimator ignores the extra kwarg), and when the key is absent
-            # (channel off) token_level_shaping is None -> byte-identical path.
-            token_level_shaping = data["token_level_shaping"] if "token_level_shaping" in data else None
-            advantages, returns = compute_advantages_and_returns(
-                token_level_rewards=token_level_rewards,
-                response_mask=data["response_mask"],
-                index=data.metadata["uids"],
-                adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
-                config=self.cfg.trainer.algorithm,
-                values=data["values"],
-                gamma=self.cfg.trainer.algorithm.gamma,
-                lambd=self.cfg.trainer.algorithm.lambd,
-                grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
-                exclude_from_baseline=exclude_from_baseline,
-                token_level_shaping=token_level_shaping,
-                group_advantage_invariant=self.group_advantage_invariant,
+            advantages, returns = batch_advantages(
+                data, self.cfg.trainer.algorithm, invariant=self.group_advantage_invariant
             )
         data["returns"] = returns
         data["advantages"] = advantages
@@ -2731,16 +2662,7 @@ class RayPPOTrainer:
         )
         return data
 
-    @staticmethod
-    def apply_loop_advantages(data: TrainingInputBatch) -> TrainingInputBatch:
-        """Add loop credit after normalization, or return unchanged when the channel is absent."""
-        loop_advantages = data.get("loop_advantages")
-        if loop_advantages is None:
-            return data
-        advantages = data["advantages"]
-        loop_advantages = loop_advantages.to(device=advantages.device, dtype=advantages.dtype)
-        data["advantages"] = advantages + loop_advantages * data["response_mask"]
-        return data
+    apply_loop_advantages = staticmethod(apply_loop_advantages)
 
     def finalize_advantages_for_training(self, data: TrainingInputBatch) -> TrainingInputBatch:
         """Normalize environment credit, add loop credit, then apply teacher credit."""
@@ -2771,11 +2693,7 @@ class RayPPOTrainer:
 
     def apply_loop_credit_and_drop_advantage_inputs(self, data: TrainingInputBatch) -> TrainingInputBatch:
         """Apply loop credit, then remove rewards, loop_advantages, and uids before worker dispatch."""
-        data = self.apply_loop_advantages(data)
-        data.pop("rewards")
-        data.pop("loop_advantages", None)
-        data.metadata.pop("uids")
-        return data
+        return drop_advantage_inputs(self.apply_loop_advantages(data))
 
     def dump_data(self, data: TrainingInputBatch, file_name: str):
         """
@@ -2836,32 +2754,8 @@ class RayPPOTrainer:
         self,
         training_input: TrainingInputBatch,
     ):
-        """
-        Calculate values from the critic, log probs from the policy and ref model, and rewards from the reward model
-        and then calculate the kl divergence between the action log probs and the base action log probs.
-
-        Expects:
-            - `["sequences"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `["attention_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
-            - `.metadata["response_length"]`: Int
-
-        Adds:
-            - `["base_action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
-            - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
-        """
-        # MoE router-replay (R3): the pre-update old-logprob / ref forward MUST
-        # replay the SAME captured routing as the training forward, otherwise the
-        # old-logprob pass uses NATIVE top-k routing while the training pass
-        # (worker.training_step -> model.forward(rollout_routed_experts=...)) uses
-        # REPLAY routing. For an MoE policy the two routings pick different experts
-        # -> divergent logprobs over the SAME tokens/weights -> a huge step-1
-        # importance ratio (log_ratio_abs_max ~ 19, policy_loss ~ 1e4,
-        # raw_grad_norm ~ 1e5) that corrupts the policy. Threading routed_experts
-        # into the forward-pass batch makes old/ref/train forwards use the
-        # identical (replay) path so step 1 is genuinely on-policy (log_ratio ~ 0).
-        # Gated on presence: flag-off (8B / no router-replay) batches keep the
-        # original forward inputs. Compact routes are carried as a side field.
+        """Attach policy scores, optional reference scores and values, and forward diagnostics."""
+        # The shared forward projection retains compact replay routes.
         fwd_keys = ["sequences", "attention_mask"]
         if training_input.routed_experts is not None:
             fwd_keys.append("rollout_routed_experts")
