@@ -70,6 +70,10 @@ nemotron_ultra:
         working_directory: /lean4/my_project
       runtime: *python_runtime
   lean_timeout: 30.0
+  # The verdict component PivotRL rows train on: one name, or a mapping from pivot agent to component
+  # (skyrl_gym.envs.nemotron_ultra.pivot_verifyit.PIVOT_COMPONENTS). Other rows ignore it; Terminus
+  # pivot rows require it.
+  pivot_reward: null
   # Kernel bounds for code_gen_simple_agent. max_memory_bytes limits the
   # interpreter address space and data size. total_timeout_seconds limits the
   # full grading attempt. A null value removes the corresponding bound.
