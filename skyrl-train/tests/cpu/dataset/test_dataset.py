@@ -15,8 +15,7 @@ from skyrl_train.entrypoints.main_base import BasePPOExp
 from skyrl_train.task_inputs import task_messages
 
 
-@pytest.mark.parametrize("num_workers", [1, 2])
-def test_native_task_filter_counts_tool_definitions(tmp_path, num_workers):
+def test_native_task_filter_counts_tool_definitions(tmp_path):
     backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
     backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     tokenizer = PreTrainedTokenizerFast(
@@ -59,7 +58,7 @@ def test_native_task_filter_counts_tool_definitions(tmp_path, num_workers):
         )
     path = tmp_path / "tools.parquet"
     write_tasks(path, tasks)
-    dataset = TaskDataset([str(path)], tokenizer, 30, num_workers=num_workers)
+    dataset = TaskDataset([str(path)], tokenizer, 30, num_workers=1)
     admitted = [row["input"].lowered.task.id for row in dataset.collate_fn(list(dataset))]
     assert admitted == ["short"]
 
@@ -180,8 +179,8 @@ def test_prompt_dataset_filtering_counts_batch_encoding_input_ids(mock_load_data
     assert len(dataset) == 2
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, reverse):
+@pytest.mark.parametrize(("reverse", "copies"), [(False, 1), (True, 1), (False, 10_000)])
+def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, reverse, copies):
     rows = [
         {
             "prompt": [
@@ -208,6 +207,7 @@ def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, reverse)
     ]
     if reverse:
         rows.reverse()
+    rows = [row for row in rows for _ in range(copies)]
     configs = OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True)
     tasks = [
         source_row_task(row, index, source_name="mixed", environment_configs=configs) for index, row in enumerate(rows)
@@ -215,10 +215,12 @@ def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, reverse)
     path = tmp_path / "mixed.parquet"
     write_tasks(path, tasks)
 
-    dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=1)
+    dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=2)
 
-    inputs = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
+    prepared = [dataset[index] for index in range(len(dataset))]
+    inputs = dataset.collate_fn(prepared)
     for index, source in enumerate(rows):
+        assert prepared[index][0] == source["prompt"]
         task = inputs[index]["input"]
         assert task.metadata.metric_class == source["env_class"]
         assert inputs[index]["uid"] == str(index)
