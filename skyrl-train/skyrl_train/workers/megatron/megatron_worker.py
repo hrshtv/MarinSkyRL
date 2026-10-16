@@ -372,6 +372,24 @@ class MegatronWorker:
 
 
 class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
+    def readiness_settings(self, width, enabled, diagnostic_tokens, temperature):
+        self.cfg.trainer.algorithm.score_centering_topk = width
+        self.cfg.trainer.algorithm.score_centering_enabled = enabled
+        self.cfg.trainer.algorithm.score_centering_diagnostic_tokens = diagnostic_tokens
+        self.cfg.generator.sampling_params.temperature = temperature
+        assert self.model.cfg is self.cfg
+        return self.readiness_memory(reset=True)
+
+    def readiness_memory(self, reset=False):
+        from skyrl_train.entrypoints.score_centering_readiness import memory_stats
+
+        return {"rank": self._rank, **memory_stats(reset)}
+
+    def readiness_reference(self, data):
+        from skyrl_train.entrypoints.score_centering_readiness import reference_forward
+
+        return reference_forward(self, data)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model: MegatronModelWrapper = None

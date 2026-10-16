@@ -328,6 +328,11 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
 
 
 class WorkerWrap:
+    def readiness_memory(self, reset=False):
+        from skyrl_train.entrypoints.score_centering_readiness import memory_stats
+
+        return memory_stats(reset)
+
     def set_numa_affinity(self):
         """Set CPU affinity to match this worker's GPU NUMA node.
 
@@ -1905,6 +1910,9 @@ class AsyncVLLMInferenceEngine(InferenceEngineInterface):
         if method == "receive_weights" and not await engine.is_paused():
             raise RuntimeError("Expert-block sync installs weights only while generation is paused")
         return list(await engine.collective_rpc("expert_block_rpc", args=(method, *args)))
+
+    async def readiness_memory(self, reset=False):
+        return await self.llm.collective_rpc("readiness_memory", args=(reset,))
 
     async def begin_weight_reload(self):
         """#1685 fix: open the layerwise-reload bracket on every engine worker so the
