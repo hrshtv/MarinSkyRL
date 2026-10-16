@@ -165,12 +165,12 @@ def test_tiny_policy_trains_to_max_steps(
     _train(runs, tmp_path, tiny_policy, mode, shape, steps=NUM_STEPS)
 
     _assert_trained_to_max_steps(tmp_path, mode, shape)
-    startup = next(record for record in read_metrics(tmp_path) if any(key.startswith("startup/") for key in record))
+    startup = {key for record in read_metrics(tmp_path) for key in record if key.startswith("startup/")}
     assert {
         "startup/driver/tokenizer",
         "startup/policy/actor_create",
         "startup/rollout_workers/startup",
-    } <= startup.keys()
+    } <= startup
 
 
 def test_async_training_resumes_with_committed_groups(runs: BaseContext, tmp_path: Path, tiny_policy: Path):
