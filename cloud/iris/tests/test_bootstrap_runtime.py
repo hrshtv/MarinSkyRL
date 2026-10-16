@@ -179,7 +179,6 @@ def test_export_bootstrap_does_not_require_rollout_or_telemetry_packages(tmp_pat
     result = _run_bootstrap(environment, process_environment, "megatron-export")
 
     assert result.returncode == 0, result.stderr
-    assert "frozen runtime ready" in result.stdout
 
 
 def test_bootstrap_uses_system_python_when_managed_pin_is_unresolvable(tmp_path: Path) -> None:
@@ -188,6 +187,7 @@ def test_bootstrap_uses_system_python_when_managed_pin_is_unresolvable(tmp_path:
     result = _run_bootstrap(environment, process_environment, "megatron")
 
     assert result.returncode == 0, result.stderr
+    assert "frozen runtime ready" in result.stdout
 
 
 def test_bootstrap_activation_exposes_runtime_commands(tmp_path: Path) -> None:
