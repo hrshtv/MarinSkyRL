@@ -31,8 +31,7 @@ from skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
 )
-from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state
-from skyrl_train.distributed.megatron.remote_prefetch import make_prefetch_hook
+from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state, make_prefetch_hook
 from skyrl_train.config.remote_read import RemoteReadMode
 from skyrl_train.distributed.utils import init_worker_process_group_with_device
 from skyrl_train.mismatch_probe.modes import TRAINER_MODES
@@ -163,7 +162,7 @@ class MegatronWorker:
             attention_backend="flash" if flash_attn else "fused",
         )
         if self.remote_hf_state is not None and remote_read_mode == RemoteReadMode.PREFETCH:
-            provider.register_pre_wrap_hook(make_prefetch_hook(bridge, self.remote_hf_state), prepend=True)
+            provider.register_pre_wrap_hook(make_prefetch_hook(bridge, self.remote_hf_state.store), prepend=True)
 
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
