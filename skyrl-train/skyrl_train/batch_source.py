@@ -3,8 +3,22 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
+import ray
+from marinskyrl.runtime_options import (
+    BatchBuilder,
+    PolicyLossType,
+    AdvantageEstimator,
+    parse_batch_builder,
+    reference_model_required,
+)
+from skyrl_train.batch_assembly import BatchPlan, fields_from_facts
+from skyrl_train.trajectory_runners.types import BatchFields
+from skyrl_train.rollouts.context import RolloutBatchMetadata, RolloutReader
+from skyrl_train.utils.advantage_estimators import OUTCOME_ADVANTAGE_ESTIMATORS
+from skyrl_train.trajectory_runners.trajectory_reward_shaping import parse_trajectory_reward_shaping_config
+from skyrl_train.utils.utils import moe_router_replay_requested
 
 from marinskyrl.distillation import DistillationRewardMode
 from skyrl_train.batch_metrics import (
@@ -26,6 +40,94 @@ if TYPE_CHECKING:
 BATCH_CLEANUP_TIMEOUT_SECONDS = 30.0
 
 
+class UnsupportedWorkerBatchError(ValueError):
+    """A requested worker or verify configuration has no equivalent assembly path."""
+
+
+def require_worker_batch_support(cfg, *, trainer_type, facts=None, policy_mesh=None, num_experts=None) -> None:
+    """Enforce every worker-specific objective, row, and mesh restriction."""
+    from skyrl_train.trainer import RayPPOTrainer
+
+    algorithm = cfg.trainer.algorithm
+    mode = parse_batch_builder(cfg.trainer.batch_builder)
+    shaping = parse_trajectory_reward_shaping_config(cfg.generator.get("trajectory_reward_shaping"))
+    megatron = cfg.trainer.policy.megatron_config
+    supported_loss = (
+        algorithm.policy_loss_type
+        in (
+            PolicyLossType.REGULAR,
+            PolicyLossType.DUAL_CLIP,
+            PolicyLossType.GSPO,
+            PolicyLossType.CISPO,
+            PolicyLossType.SAPO,
+            PolicyLossType.IMPORTANCE_SAMPLING,
+            PolicyLossType.BEHAVIOR_CLIP,
+        )
+        and algorithm.advantage_estimator in OUTCOME_ADVANTAGE_ESTIMATORS
+    )
+    supported_loss |= (
+        algorithm.policy_loss_type == PolicyLossType.SFT and algorithm.advantage_estimator == AdvantageEstimator.UNIFORM
+    )
+    restrictions = [
+        (
+            "DPO and reference-model objectives",
+            algorithm.policy_loss_type == PolicyLossType.DPO or reference_model_required(algorithm),
+        ),
+        ("the configured loss and estimator", not supported_loss),
+        ("custom trainer hooks", trainer_type is not RayPPOTrainer),
+        ("critic", cfg.trainer.critic.model.path is not None),
+        ("distillation", algorithm.get("distillation") is not None),
+        ("trajectory selection", cfg.trainer.trajectory_selector.type is not None),
+        ("step-wise training", cfg.trainer.step_wise_training),
+        ("advantage batch normalization", algorithm.advantage_batch_normalize),
+        ("loop advantage credit", shaping.enabled and shaping.loop.advantage_penalty_per_token > 0),
+        (
+            "ETP greater than one",
+            (megatron.get("expert_tensor_parallel_size") or megatron.tensor_model_parallel_size) > 1,
+        ),
+        ("dense batch dumping", mode is BatchBuilder.WORKER and cfg.trainer.dump_data_batch),
+        ("worker optimization", mode is BatchBuilder.WORKER),
+    ]
+    if facts is not None:
+        valid_facts = all(group is not None and isinstance(group.fields, BatchFields) for group in facts)
+        restrictions.append(("checkpoint metadata without row facts", not valid_facts))
+        if valid_facts:
+            restrictions.extend(
+                [
+                    ("token-valued outcome credit", any(not group.scalar_rewards for group in facts)),
+                    ("nonzero loop credit", any(group.loop_credit for group in facts)),
+                    (
+                        "teacher evidence",
+                        any(
+                            group.fields.present
+                            & {"teacher_evidence", "distillation", "student_topk_indices", "behavior_topk_logprobs"}
+                            for group in facts
+                        ),
+                    ),
+                    (
+                        "route dtype without the model expert count",
+                        moe_router_replay_requested(cfg)
+                        and num_experts is None
+                        and any("rollout_routed_experts" in group.fields.present for group in facts),
+                    ),
+                ]
+            )
+            if policy_mesh is not None:
+                dp_size = policy_mesh[0].dp_size if policy_mesh else 0
+                if dp_size < 1 or any(rank.dp_size != dp_size for rank in policy_mesh):
+                    raise UnsupportedWorkerBatchError(f"trainer.batch_builder={mode} requires a consistent policy mesh")
+                owners = [rank.dp for rank in policy_mesh if rank.is_collection_dp_rank()]
+                restrictions.extend(
+                    [
+                        ("rows requiring DP padding", sum(len(group.response_len) for group in facts) % dp_size != 0),
+                        ("an incomplete policy collection mesh", sorted(owners) != list(range(dp_size))),
+                    ]
+                )
+    for reason, unsupported in restrictions:
+        if unsupported:
+            raise UnsupportedWorkerBatchError(f"trainer.batch_builder={mode} does not support {reason}")
+
+
 @dataclass(frozen=True)
 class BatchSummary:
     work: ConsumedWork
@@ -41,6 +143,16 @@ class DriverBatchState:
     metrics: dict[str, float]
     timings: dict[str, float]
     empty: bool
+
+
+class BatchSource(Protocol):
+    async def admit(self, *, stall_timeout: float) -> dict[str, float]: ...
+    async def prepare(self, *, global_step: int, step_wall: StepWallTime | None) -> None: ...
+    async def forward(self, *, step_wall: StepWallTime | None) -> None: ...
+    async def finalize(self, *, step_wall: StepWallTime | None) -> None: ...
+    async def train(self, *, step_wall: StepWallTime | None) -> dict: ...
+    def summary(self) -> BatchSummary: ...
+    async def release(self, error: BaseException | None = None) -> None: ...
 
 
 class DriverBatchSource:
@@ -175,8 +287,101 @@ class DriverBatchSource:
         self.groups = []
 
 
+class WorkerBatchSource:
+    """Share compact admitted groups and retain assembled rows on policy actors."""
+
+    def __init__(self, trainer: RayPPOTrainer):
+        self.trainer = trainer
+        self.context, self.policy, self.cfg = trainer.context, trainer.policy_model, trainer.cfg
+        self.pad_token_id = trainer.tokenizer.pad_token_id
+        self.num_experts = trainer._resolve_num_experts() if moe_router_replay_requested(self.cfg) else None
+        self.metrics, self.timings = trainer.all_metrics, trainer.all_timings
+        self._metadata: RolloutBatchMetadata | None = None
+        self._reader: RolloutReader | None = None
+        self._plan: BatchPlan | None = None
+        self._pending = []
+        self._references = []
+
+    @property
+    def admitted_plan(self) -> BatchPlan:
+        if self._plan is None:
+            raise RuntimeError("worker batch is not prepared")
+        return self._plan
+
+    async def admit(self, *, stall_timeout: float) -> dict[str, float]:
+        self._metadata = await self.context.next_batch_metadata(stall_timeout=stall_timeout)
+        self._reader = self.context.reader(self._metadata, stall_timeout=stall_timeout)
+        return self._metadata.metrics
+
+    async def prepare(self, *, global_step: int, step_wall: StepWallTime | None) -> None:
+        if step_wall is not None:
+            step_wall.start("batch_assembly")
+        groups = self._metadata.groups
+        facts = tuple(group.row_facts for group in groups)
+        require_worker_batch_support(
+            self.cfg,
+            trainer_type=type(self.trainer),
+            facts=facts,
+            policy_mesh=tuple(actor.rank for actor in self.policy.actor_infos),
+            num_experts=self.num_experts,
+        )
+        fields = fields_from_facts(facts)
+        if not moe_router_replay_requested(self.cfg):
+            fields = fields.without_routes()
+        self._plan = BatchPlan(
+            batch_id=self._metadata.batch_id,
+            global_step=global_step,
+            uids=tuple(group.uid for group in groups for _ in group.row_facts.response_len),
+            facts=facts,
+            fields=fields,
+            rollout_staleness=tuple(
+                global_step - group.policy_step for group in groups for _ in group.row_facts.response_len
+            ),
+            num_experts=self.num_experts,
+        )
+        self._pending = self.policy.read_batch_groups(self._plan, self._reader)
+        self._references = list(await self.context.wait(asyncio.gather(*self._pending)))
+        self._pending = self.policy.load_batch(self._plan, self._reader, self._references, self.pad_token_id)
+        loaded = await self.context.wait(asyncio.gather(*self._pending))
+        self._pending = []
+        self.timings["load_worker_batch"] = max(loaded)
+
+    async def release(self, error: BaseException | None = None) -> None:
+        try:
+            async with asyncio.timeout(BATCH_CLEANUP_TIMEOUT_SECONDS):
+                if error is not None:
+                    for ref in self._pending:
+                        ray.cancel(ref, force=False)
+                if self._pending:
+                    await asyncio.gather(*self._pending, return_exceptions=error is not None)
+                if self._plan is not None:
+                    await asyncio.gather(
+                        *self.policy.async_run_ray_method("pass_through", "unload_batch", self._plan.batch_id)
+                    )
+        except Exception as cleanup_error:
+            if error is None:
+                raise
+            error.add_note(f"Loaded-batch cleanup failed: {cleanup_error}")
+        finally:
+            self._pending, self._references = [], []
+            self._plan, self._reader, self._metadata = None, None, None
+
+
+def make_batch_source(mode: BatchBuilder, *, driver: DriverBatchSource) -> BatchSource:
+    """Select the configured batch lifetime with lazy worker dependencies."""
+    if mode is BatchBuilder.DRIVER:
+        return driver
+    require_worker_batch_support(driver.trainer.cfg, trainer_type=type(driver.trainer))
+    from skyrl_train.batch_verification import VerifyBatchSource
+
+    worker = WorkerBatchSource(driver.trainer)
+    if mode is BatchBuilder.WORKER:
+        return worker
+    return VerifyBatchSource(worker, driver=driver, context=driver.context, policy=driver.trainer.policy_model)
+
+
 @asynccontextmanager
-async def batch_lifetime(source: DriverBatchSource):
+async def batch_lifetime(source: BatchSource):
     """Release a source's owned batch while retaining the initiating exception."""
     error = None
     try:
