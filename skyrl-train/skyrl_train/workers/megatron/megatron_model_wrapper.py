@@ -9,7 +9,9 @@ from omegaconf import OmegaConf
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 import megatron.core.parallel_state as mpu
+from megatron.core.distributed import DistributedDataParallel as MegatronDDP
 from megatron.core.distributed import finalize_model_grads
+from megatron.core.transformer.module import Float16Module
 
 from skyrl_train.distributed.megatron.model_utils import (
     from_parallel_logits_to_logprobs,
@@ -21,8 +23,10 @@ from skyrl_train.ftpo import FTPOTargets, FTPOInputs, boundary_values, compact_b
 from skyrl_train.distillation import TopKEvidence, student_topk_logprobs, INVALID_TOPK_INDEX
 from skyrl_train.models.megatron_router_replay import MegatronRouterReplay
 from skyrl_train.config.objective_spec import topk_loss_params, score_centering_tis_cap
-from skyrl_train.objective.score_centering import ppo_tis_score_centering_correction
+from skyrl_train.objective.score_centering import ppo_tis_score_centering_correction, score_centering_diagnostics
+from skyrl_train.config.ftpo import ftpo_config
 from skyrl_train.objective.objective import (
+    FTPOAuxiliaryBatch,
     TopKTeacherBatch,
     build_objective_micro_batch,
     compute_policy_objective,
@@ -394,12 +398,16 @@ class MegatronModelWrapper:
                 )
                 packed_seq_params = None
 
+            # Only the mixed-precision wrapper consumes the precision kwarg; a raw fp32
+            # module (equivalence experiments) already returns module-precision outputs.
+            inner = model.module if isinstance(model, MegatronDDP) else model
+            precision_kwargs = {"fp32_output": False} if isinstance(inner, Float16Module) else {}
             outputs = model(
                 model_sequences,
                 model_position_ids,
                 model_attention_mask,
                 packed_seq_params=packed_seq_params,
-                fp32_output=False,
+                **precision_kwargs,
             )
             if armed:
                 self.router_replay.end_forward()
@@ -623,19 +631,27 @@ class MegatronModelWrapper:
                     for value in (data.score_topk_indices, data.score_old_logprobs, data.score_behavior_logprobs)
                 ):
                     raise ValueError("score centering requires behavior IDs and old and behavior log probabilities")
-                score_centering = ppo_tis_score_centering_correction(
-                    response.selected_logprobs,
-                    data.score_old_logprobs,
-                    data.score_behavior_logprobs,
-                    advantages,
-                    loss_mask,
-                    tis_cap=score_centering_tis_cap(self.cfg.trainer.algorithm),
-                    eps_clip_low=self.cfg.trainer.algorithm.eps_clip_low,
-                    eps_clip_high=self.cfg.trainer.algorithm.eps_clip_high,
+                if self.cfg.trainer.algorithm.get("score_centering_enabled", False):
+                    score_centering = ppo_tis_score_centering_correction(
+                        response.selected_logprobs,
+                        data.score_old_logprobs,
+                        data.score_behavior_logprobs,
+                        advantages,
+                        loss_mask,
+                        tis_cap=score_centering_tis_cap(self.cfg.trainer.algorithm),
+                        eps_clip_low=self.cfg.trainer.algorithm.eps_clip_low,
+                        eps_clip_high=self.cfg.trainer.algorithm.eps_clip_high,
+                    )
+
+            structural = None
+            if data.ftpo is not None and data.ftpo.weights is not None:
+                params = ftpo_config(self.cfg.trainer.algorithm)
+                if params is None or params.auxiliary_weight is None or ftpo_inputs is None:
+                    raise ValueError("Separate structural weights require configured auxiliary FTPO")
+                structural = FTPOAuxiliaryBatch(
+                    ftpo_inputs, data.ftpo.weights, action_log_probs, params, params.auxiliary_weight
                 )
-                score_centering = score_centering * float(
-                    self.cfg.trainer.algorithm.get("score_centering_enabled", True)
-                )
+                ftpo_inputs = None
 
             sparse_student_logprobs = self._distillation_student_logprobs(logits, data)
 
@@ -665,6 +681,7 @@ class MegatronModelWrapper:
                 think_token_weight=self.cfg.trainer.algorithm.think_token_weight,
                 teacher=teacher,
                 ftpo=ftpo_inputs,
+                structural=structural,
                 pair_roles=data.pair_roles,
                 score_centering=score_centering,
             )
@@ -688,6 +705,20 @@ class MegatronModelWrapper:
                 "policy_kl": objective.rows.kl.detach().item(),
             }
             metrics.update(objective.metrics)
+            diagnostic_tokens = self.cfg.trainer.algorithm.get("score_centering_diagnostic_tokens", 0)
+            if centering_width and diagnostic_tokens:
+                metrics.update(
+                    score_centering_diagnostics(
+                        response.selected_logprobs,
+                        data.score_old_logprobs,
+                        data.score_behavior_logprobs,
+                        action_log_probs,
+                        rollout_action_logprobs,
+                        score_centering,
+                        loss_mask,
+                        diagnostic_tokens,
+                    )
+                )
             if completed_microbatches == len(micro_batches):
                 # Token logprobs are already reconstructed across TP/CP, so pool across data-parallel ranks only.
                 group = (

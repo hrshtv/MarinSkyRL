@@ -3,13 +3,64 @@ import json
 import pytest
 from unittest.mock import patch
 from datasets import Dataset
-from transformers import BatchEncoding
+from transformers import BatchEncoding, PreTrainedTokenizerFast
+from tokenizers import Tokenizer, models, pre_tokenizers
+from taskcompendium.models import AnswerType, FinalAction, FunctionDefinition, NoGrader
 from omegaconf import OmegaConf
-from rolloutengine.spec import LoweredTaskSpec
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset import PromptDataset
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, SourceTaskDataset
+from skyrl_train.dataset.tasks import SourceTaskDataset, TaskDataset, source_row_task, write_tasks
 from skyrl_train.entrypoints.main_base import BasePPOExp
+from skyrl_train.task_inputs import task_messages
+
+
+@pytest.mark.parametrize("num_workers", [1, 2])
+def test_native_task_filter_counts_tool_definitions(tmp_path, num_workers):
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        chat_template="{% for m in messages %}{{ m.content }} {% endfor %}"
+        "{% for tool in tools or [] %}{{ tool.function.description }} {% endfor %}",
+    )
+    configs = OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True)
+    base = source_row_task(
+        {
+            "prompt": [{"role": "user", "content": "Choose a tool"}],
+            "env_class": "gsm8k",
+            "reward_spec": {"ground_truth": "1"},
+        },
+        0,
+        source_name="tool-budget",
+        environment_configs=configs,
+    )
+    tasks = []
+    for name, description in (("short", "Find a value"), ("long", "word " * 100)):
+        task = base.task.model_copy(
+            update={
+                "id": name,
+                "answer_type": AnswerType.NATIVE_ACTION,
+                "answer_format": FinalAction(require_call=True, max_calls=1),
+                "grader": NoGrader(reason="Loader-only test"),
+                "final_tools": (
+                    FunctionDefinition(name="lookup", description=description, parameters={"type": "object"}),
+                ),
+            }
+        )
+        tasks.append(
+            base.model_copy(
+                update={
+                    "task": task,
+                    "session": base.session.model_copy(update={"task_session": "shellbox"}),
+                }
+            )
+        )
+    path = tmp_path / "tools.parquet"
+    write_tasks(path, tasks)
+    dataset = TaskDataset([str(path)], tokenizer, 30, num_workers=num_workers)
+    admitted = [row["input"].lowered.task.id for row in dataset.collate_fn(list(dataset))]
+    assert admitted == ["short"]
 
 
 class _StubTokenizer:
@@ -66,18 +117,21 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert dataset is not None
     assert len(dataset) == 2
     rows = dataset.collate_fn([dataset[0], dataset[1]])
-    assert [row["prompt"] for row in rows] == [
+    assert [task_messages(row["input"].lowered) for row in rows] == [
         [{"role": "user", "content": "short prompt"}],
         [{"role": "user", "content": "a" * 120}],
     ]
     assert [row["uid"] for row in rows] == ["0", "1"]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in rows]
+    tasks = [row["input"].lowered.task for row in rows]
     assert [task.source.row for task in tasks] == ["0", "1"]
-    assert all(row["env_class"] == "gsm8k" for row in rows)
+    assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
 
 
 @pytest.mark.parametrize("num_workers", [1, 2])
-def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, num_workers):
+@pytest.mark.parametrize(("nested_source", "expected_source"), [(None, "fixture"), ("nested-source", "nested-source")])
+def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(
+    tmp_path, num_workers, nested_source, expected_source
+):
     rows = [
         {
             "prompt": [{"role": "user", "content": content}],
@@ -85,7 +139,7 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
             "reward_spec": {"ground_truth": "PRIVATE_ANSWER"},
             "teacher_route": "math",
             "data_source": "fixture",
-            "extra_info": {"grade": index},
+            "extra_info": {"grade": index, "data_source": nested_source},
         }
         for index, content in enumerate(("First question", "x" * 200, "Last question"))
     ]
@@ -100,9 +154,10 @@ def test_source_tasks_preserve_global_row_indices_without_cache_files(tmp_path, 
         num_workers=num_workers,
     )
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [row["prompt"] for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [LoweredTaskSpec.model_validate_json(row["env_extras"][LOWERED_TASK_COLUMN]).task for row in prepared]
+    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
+    tasks = [row["input"].lowered.task for row in prepared]
     assert [task.source.row for task in tasks] == ["0", "2"]
+    assert [row["input"].metadata.data_source for row in prepared] == [expected_source, expected_source]
     assert dataset.dataframe.cache_files == []
 
 
@@ -123,6 +178,53 @@ def test_prompt_dataset_filtering_counts_batch_encoding_input_ids(mock_load_data
     )
 
     assert len(dataset) == 2
+
+
+@pytest.mark.parametrize("num_workers", [1, 2])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_native_tasks_with_different_extras_preserve_each_row(tmp_path, num_workers, reverse):
+    rows = [
+        {
+            "prompt": [
+                {"role": "user", "content": "First question"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                    ],
+                },
+                {"role": "tool", "content": "Result", "tool_call_id": "call-1"},
+            ],
+            "env_class": "gsm8k",
+            "reward_spec": {"ground_truth": "1"},
+            "prompt_token_ids": [17, 23],
+        },
+        {
+            "prompt": [{"role": "user", "content": "Second question"}],
+            "env_class": "gsm8k",
+            "reward_spec": {"ground_truth": "2"},
+            "teacher_route": "math",
+        },
+    ]
+    if reverse:
+        rows.reverse()
+    configs = OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True)
+    tasks = [
+        source_row_task(row, index, source_name="mixed", environment_configs=configs) for index, row in enumerate(rows)
+    ]
+    path = tmp_path / "mixed.parquet"
+    write_tasks(path, tasks)
+
+    dataset = TaskDataset([str(path)], _StubTokenizer(), 100, num_workers=num_workers)
+
+    inputs = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
+    for index, source in enumerate(rows):
+        task = inputs[index]["input"]
+        assert task.metadata.metric_class == source["env_class"]
+        assert inputs[index]["uid"] == str(index)
+        assert task.lowered == tasks[index]
+        assert task.metadata.teacher_route == source.get("teacher_route")
 
 
 @pytest.mark.parametrize(

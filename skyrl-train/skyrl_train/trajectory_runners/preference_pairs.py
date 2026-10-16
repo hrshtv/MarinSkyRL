@@ -11,13 +11,13 @@ from typing import Any
 
 from loguru import logger
 
-from skyrl_train.dataset.preference_pairs import completion_text
+from skyrl_train.dataset.preference_pairs import PreferencePairFormat, completion_text, tokenized_pair
 from skyrl_train.rollouts.buffer import RolloutTask, RolloutWriter, write_trajectory_batch
 from skyrl_train.rollouts.finalization import finalize_trajectory_batch
 from skyrl_train.trajectory_runners.trajectory_retention import RetentionSink
 from skyrl_train.trajectory_runners.types import (
     TrajectoryBatch,
-    TrajectoryRequestBatch,
+    PreferenceRequestBatch,
 )
 
 
@@ -39,9 +39,16 @@ class PreferencePairTrajectoryRunner:
     """Emit tokenized dataset completions without touching any inference engine."""
 
     def __init__(
-        self, tokenizer, *, max_generate_length: int, max_input_length: int, generator_config: Mapping[str, Any]
+        self,
+        tokenizer,
+        *,
+        data_format: PreferencePairFormat,
+        max_generate_length: int,
+        max_input_length: int,
+        generator_config: Mapping[str, Any],
     ):
         self.tokenizer = tokenizer
+        self.data_format = data_format
         self.max_generate_length = max_generate_length
         self.max_input_length = max_input_length
         self.generator_config = generator_config
@@ -89,15 +96,15 @@ class PreferencePairTrajectoryRunner:
             completions.append(completion_ids)
         return prompt_ids, completions
 
-    def _validate_request(self, input_batch: TrajectoryRequestBatch) -> None:
-        prompts = input_batch["prompts"]
-        env_extras = input_batch["env_extras"] or []
-        if len(prompts) % 2 or len(env_extras) != len(prompts):
+    def _validate_request(self, input_batch: PreferenceRequestBatch) -> None:
+        prompts = input_batch.prompts
+        preferences = input_batch.preferences
+        if len(prompts) % 2 or len(preferences) != len(prompts):
             raise ValueError(
                 f"preference pairs arrive as chosen/rejected row pairs; got {len(prompts)} rows "
-                f"with {len(env_extras)} extras"
+                f"with {len(preferences)} preference records"
             )
-        trajectory_ids = input_batch.get("trajectory_ids")
+        trajectory_ids = input_batch.trajectory_ids
         if trajectory_ids is None:
             return
         for pair_index in range(len(prompts) // 2):
@@ -108,10 +115,10 @@ class PreferencePairTrajectoryRunner:
             ) != (0, 1):
                 raise ValueError("preference pairs require trajectory IDs ordered as repetition 0 then 1")
 
-    async def run(self, input_batch: TrajectoryRequestBatch) -> TrajectoryBatch:
+    async def run(self, input_batch: PreferenceRequestBatch) -> TrajectoryBatch:
         self._validate_request(input_batch)
-        prompts = input_batch["prompts"]
-        env_extras = input_batch["env_extras"] or []
+        prompts = input_batch.prompts
+        preferences = input_batch.preferences
 
         prompt_token_ids: list[list[int]] = []
         response_ids: list[list[int]] = []
@@ -120,18 +127,26 @@ class PreferencePairTrajectoryRunner:
         pair_roles: list[int] = []
         for pair_index in range(len(prompts) // 2):
             prompt = prompts[2 * pair_index]
-            extras = env_extras[2 * pair_index]
-            if prompts[2 * pair_index + 1] != prompt or env_extras[2 * pair_index + 1] != extras:
-                raise ValueError("both rows of a preference pair must carry the same prompt and extras")
-            prompt_ids, completions = self._tokenize_pair(
-                prompt,
-                completion_text(extras.get("chosen"), "chosen"),
-                completion_text(extras.get("rejected"), "rejected"),
-            )
+            preference = preferences[2 * pair_index]
+            if prompts[2 * pair_index + 1] != prompt or preferences[2 * pair_index + 1] != preference:
+                raise ValueError("Chosen and rejected rows must carry the same prompt and preference record")
+            if self.data_format is PreferencePairFormat.TOKENIZED:
+                pair = tokenized_pair(preference, max_sequence_length=self.max_input_length + self.max_generate_length)
+                if pair.prompt_ids != prompt:
+                    raise ValueError("Tokenized pair's initial prompt differs from the dataset prompt")
+                prompt_ids, completions = pair.prompt_ids, pair.response_ids
+                masks = pair.loss_masks
+            else:
+                prompt_ids, completions = self._tokenize_pair(
+                    prompt,
+                    completion_text(preference.get("chosen"), "chosen"),
+                    completion_text(preference.get("rejected"), "rejected"),
+                )
+                masks = ([1] * len(completions[0]), [1] * len(completions[1]))
             prompt_token_ids.extend((prompt_ids, prompt_ids))
             response_ids.extend(completions)
             rewards.extend((1.0, 0.0))
-            loss_masks.extend(([1] * len(completions[0]), [1] * len(completions[1])))
+            loss_masks.extend(masks)
             pair_roles.extend((1, -1))
 
         batch: TrajectoryBatch = {

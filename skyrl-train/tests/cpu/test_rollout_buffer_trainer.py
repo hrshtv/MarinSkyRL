@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyrl_train.config.utils import get_default_config
-from skyrl_train.rollouts.buffer import RolloutGroup
+from skyrl_train.rollouts.buffer import BatchPolicy, RolloutBufferConfig, RolloutGroup
 from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.trajectory_runners.base import TrajectoryID
 from skyrl_train.trajectory_selection import BestOfNTrajectorySelector
@@ -28,9 +28,10 @@ def _group(uid: str, policy_step: int, *, rewards: list[float] | None = None) ->
 @pytest.mark.parametrize("offload_enabled", [False, True])
 def test_weight_sync_respects_optimizer_offload_policy(reason, offload_enabled):
     trainer = object.__new__(RayPPOTrainer)
-    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(offload_optimizer_during_rollouts=offload_enabled))
+    trainer.cfg = get_default_config()
+    trainer.cfg.trainer.offload_optimizer_during_rollouts = offload_enabled
     trainer.colocate_all = False
-    trainer.global_step = 0
+    trainer.global_step = 4
     trainer.all_startup_timings = {}
     trainer.all_timings = {}
     events = []
@@ -47,9 +48,9 @@ def test_weight_sync_respects_optimizer_offload_policy(reason, offload_enabled):
         async def pause_generation(self):
             events.append("pause")
 
-        async def resume_generation(self):
+        async def resume_generation(self, policy_step):
             assert trainer.policy_model.optimizer_on_gpu != offload_enabled
-            events.append("resume")
+            events.append(("resume", policy_step))
 
     async def sync_weights():
         events.append("sync")
@@ -61,15 +62,13 @@ def test_weight_sync_respects_optimizer_offload_policy(reason, offload_enabled):
     asyncio.run(trainer._sync_policy_for_rollouts(reason=reason))
 
     assert trainer.policy_model.optimizer_on_gpu != offload_enabled
-    paused = reason == "training_step"
-    assert events == (["pause"] if paused else []) + (["offload"] if offload_enabled else []) + ["sync"] + (
-        ["resume"] if paused else []
-    )
+    # Every sync pauses, and the resume installs the step whose leases the synced weights serve.
+    assert events == ["pause"] + (["offload"] if offload_enabled else []) + ["sync", ("resume", 5)]
 
 
 def test_rollout_batch_conversion_reports_staleness_and_stage_timings(monkeypatch):
     trainer = object.__new__(RayPPOTrainer)
-    trainer.context = SimpleNamespace(config=SimpleNamespace(batch_size=2, max_staleness_steps=2))
+    trainer.context = SimpleNamespace(config=RolloutBufferConfig(2, None, 2, BatchPolicy.FULL_BATCH, None, None))
     trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(algorithm=get_default_config().trainer.algorithm))
     trainer.cfg.trainer.algorithm.off_policy_correction = "none"
     trainer.global_step = 10
@@ -113,7 +112,7 @@ def test_rollout_batch_conversion_reports_staleness_and_stage_timings(monkeypatc
 
 def test_rollout_batch_conversion_records_domain_reward_metrics():
     trainer = object.__new__(RayPPOTrainer)
-    trainer.context = SimpleNamespace(config=SimpleNamespace(batch_size=3, max_staleness_steps=0))
+    trainer.context = SimpleNamespace(config=RolloutBufferConfig(3, None, 0, BatchPolicy.FULL_BATCH, None, None))
     trainer.cfg = get_default_config()
     trainer.cfg.trainer.algorithm.policy_loss_type = "regular"
     trainer.cfg.trainer.algorithm.off_policy_correction = "none"

@@ -3,12 +3,15 @@ from collections import defaultdict
 from enum import StrEnum
 import numpy as np
 from skyrl_train.group_admission import group_is_fully_excluded_from_training
+from skyrl_train.task_inputs import TaskInput, PreferenceInput
 from skyrl_train.trajectory_runners.types import (
     TrajectoryBatch,
     TrajectoryRequestBatch,
     TrajectoryID,
     BatchMetadata,
     TrainingPhase,
+    TaskRequestBatch,
+    PreferenceRequestBatch,
 )
 from skyrl_train.trajectory_runners.trajectory_retention import RETENTION_METRIC_PREFIX
 from skyrl_train.metric_names import (
@@ -33,6 +36,7 @@ from skyrl_train.trajectory_runners.trajectory_reward_shaping import (
     refresh_trajectory_reward_shaping_metrics,
 )
 from skyrl_train.metric_names import ROLLOUT_FAILURE_FRACTION_METRIC
+from skyrl_train.inference_engines.base import UNSTAMPED_POLICY_STEP
 from loguru import logger
 from skyrl_gym.metrics import aggregate_for_task
 from skyrl_gym.verification import VerificationResult, VerificationStatus, normalized_verifier_score
@@ -111,8 +115,8 @@ def get_outcome_rewards(trajectory_batch: TrajectoryBatch) -> List[float]:
 def normalized_verifier_scores(trajectory_batch: TrajectoryBatch) -> List[float | None] | None:
     """Return bounded task scores, or None if the batch has no verdict channel.
 
-    Entries are None for skipped or missing verdicts and zero for verifier
-    failures. A verifier may declare its native score range. This keeps
+    Entries are None whenever no verifier verdict exists, including verifier
+    errors. Verified failures retain their actual zero scores. This keeps
     GenRM's 1–5 ratings comparable with 0–1 verifiers in cross-task averages,
     while leaving the optimization rewards and raw verifier scores intact.
     """
@@ -123,10 +127,8 @@ def normalized_verifier_scores(trajectory_batch: TrajectoryBatch) -> List[float 
         raise ValueError("verification_results must have one entry per reward")
     scores: List[float | None] = []
     for result in results:
-        if result is None or result.status is VerificationStatus.SKIPPED:
+        if result is None or result.status is not VerificationStatus.VERIFIED:
             scores.append(None)
-        elif result.status is not VerificationStatus.VERIFIED:
-            scores.append(0.0)
         else:
             scores.append(normalized_verifier_score(result))
     return scores
@@ -381,6 +383,15 @@ def concatenate_trajectory_batches(
     }
     if rollout_routed_experts_concat is not None:
         result["rollout_routed_experts"] = rollout_routed_experts_concat
+    if any(output.get("rollout_policy_steps") is not None for output in trajectory_batches):
+        result["rollout_policy_steps"] = [
+            row
+            for output in trajectory_batches
+            for row in (
+                output.get("rollout_policy_steps")
+                or [np.full(len(ids), UNSTAMPED_POLICY_STEP, dtype=np.int32) for ids in output["response_ids"]]
+            )
+        ]
     if selected_topk_concat is not None:
         result["student_topk_indices"] = selected_topk_concat
         result["behavior_topk_logprobs"] = behavior_topk_concat
@@ -708,59 +719,39 @@ def get_batch_failure_metrics(
 
 
 def prepare_trajectory_request(
-    prompts: List[Any],
+    rows: List[dict],
     n_samples_per_prompt: int,
     sampling_params: Dict[str, Any],
-    default_env_class: str,
     training_phase: TrainingPhase,
     global_step: int,
 ) -> Tuple[TrajectoryRequestBatch, List[str]]:
-    """Prepare a trajectory request for training and eval
-
-    Args:
-        prompts (List[Any]): list of prompts
-        n_samples_per_prompt (int): how many samples to create per prompt
-        sampling_params (Dict[str, Any]): sampling parameters
-        default_env_class (str): env class to use if env class missing from prompts
-        training_phase (TrainingPhase): training or eval
-        global_step (int): current global step
-
-    Returns:
-        Tuple[TrajectoryRequestBatch, List[str]]: trajectory request and list of uuids
-    """
-
-    all_prompts = [prompt["prompt"] for prompt in prompts for _ in range(n_samples_per_prompt)]
-
-    all_envs = [
-        prompt["env_class"] if prompt["env_class"] is not None else default_env_class
-        for prompt in prompts
-        for _ in range(n_samples_per_prompt)
-    ]
-
-    # all the other columns are env_extras
-    env_extras = [prompt["env_extras"] for prompt in prompts for _ in range(n_samples_per_prompt)]
-
-    # Create TrajectoryID objects - one UID per row, repetition_id for multiple samples
-    trajectory_ids = []
-    uids = []
-    for _, prompt in enumerate(prompts):
-        uid: str = prompt["uid"]
-
-        # Create TrajectoryID for each repetition
-        for repetition_id in range(n_samples_per_prompt):
-            trajectory_ids.append(TrajectoryID(instance_id=uid, repetition_id=repetition_id))
-            uids.append(uid)
-
-    trajectory_request: TrajectoryRequestBatch = {
-        "prompts": all_prompts,
-        "env_classes": all_envs,
-        "env_extras": env_extras,
-        "sampling_params": sampling_params,
-        "trajectory_ids": trajectory_ids,
-        "batch_metadata": BatchMetadata(global_step=global_step, training_phase=training_phase),
-    }
-
-    return trajectory_request, uids
+    """Return repeated typed inputs with attempt IDs and one UID per repeated input."""
+    inputs = tuple(row["input"] for row in rows for _ in range(n_samples_per_prompt))
+    trajectory_ids = tuple(
+        TrajectoryID(instance_id=row["input"].metadata.uid, repetition_id=repetition)
+        for row in rows
+        for repetition in range(n_samples_per_prompt)
+    )
+    metadata = BatchMetadata(global_step=global_step, training_phase=training_phase)
+    if all(isinstance(row, TaskInput) for row in inputs):
+        request = TaskRequestBatch(
+            rows=inputs,
+            sampling_params=sampling_params,
+            trajectory_ids=trajectory_ids,
+            batch_metadata=metadata,
+        )
+    elif all(isinstance(row, PreferenceInput) for row in inputs):
+        request = PreferenceRequestBatch(
+            prompts=tuple(row.prompt for row in inputs),
+            preferences=tuple(row.preference for row in inputs),
+            metadata=tuple(row.metadata for row in inputs),
+            sampling_params=sampling_params,
+            trajectory_ids=trajectory_ids,
+            batch_metadata=metadata,
+        )
+    else:
+        raise TypeError("A request must contain TaskInput rows or static PreferenceInput rows, not a mixture")
+    return request, [item.instance_id for item in trajectory_ids]
 
 
 def _re_sentinel_rows(n: int, sentinel_row: np.ndarray) -> np.ndarray:

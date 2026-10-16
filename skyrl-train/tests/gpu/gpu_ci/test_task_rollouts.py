@@ -3,18 +3,16 @@ uv run --frozen pytest skyrl-train/tests/gpu/gpu_ci/test_task_rollouts.py
 """
 
 import os
+from dataclasses import replace
 import pytest
 import ray
-from datasets import Dataset
 from shellbox.backends.docker.machine import DockerMachineFactory
 from transformers import AutoTokenizer
 from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
-from skyrl_train.dataset.tasks import source_row_task
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
-from skyrl_train.trajectory_runners.projections import WholeTrajectoryProjection
 from skyrl_train.trajectory_runners.model_clients import DirectModelClient
 from skyrl_train.trajectory_runners.base import TrajectoryRequestBatch
 from tests.gpu.utils import Timer, get_test_trajectory_request
@@ -43,7 +41,7 @@ class ThreeTurnSession:
         self.max_turns = lowered.session.max_turns
 
     async def prepare(self):
-        return session_start(self.task)
+        return session_start(self.task, shell_tool=None, provider_tools=())
 
     async def advance(self, turn):
         self.turns += 1
@@ -55,7 +53,7 @@ class ThreeTurnSession:
             grade=GradeResult(Outcome.GRADED, 0.0),
         )
 
-    async def grade(self, messages):
+    async def grade(self, messages, *, stop_reason, outputs):
         return GradeResult(Outcome.GRADED, 0.0)
 
     async def close(self):
@@ -154,7 +152,7 @@ async def run_trajectory_runner_end_to_end(
 
     trajectory_runner = TaskRolloutWorker(
         trajectory_runner_cfg=generator_cfg,
-        projection=WholeTaskProjection(WholeTrajectoryProjection(generator_cfg, tokenizer)),
+        projection=WholeTaskProjection(generator_cfg, tokenizer),
         model_client=DirectModelClient(inference_engine_client),
         factories={"docker": DockerMachineFactory()},
         max_verifier_workers=max_verifier_workers,
@@ -164,36 +162,14 @@ async def run_trajectory_runner_end_to_end(
 
     input_batch: TrajectoryRequestBatch = get_test_trajectory_request(
         model=model,
+        environment_configs=OmegaConf.to_container(env_cfg, resolve=True),
         num_prompts=num_prompts,
         n_samples_per_prompt=n_samples_per_prompt,
         max_prompt_length=max_prompt_length,
         data_path=data_path,
         env_class=env_class,
     )
-    rows = Dataset.from_list(
-        [
-            {"prompt": prompt, "env_class": env_class, **extras}
-            for prompt, extras in zip(
-                input_batch["prompts"][::n_samples_per_prompt],
-                input_batch["env_extras"][::n_samples_per_prompt],
-                strict=True,
-            )
-        ]
-    )
-    input_batch["env_extras"] = [
-        {
-            "lowered_task_spec": source_row_task(
-                row,
-                index,
-                source_name="gpu-test",
-                environment_configs=OmegaConf.to_container(env_cfg, resolve=True),
-            ).model_dump_json()
-        }
-        for index, row in enumerate(rows)
-        for _ in range(n_samples_per_prompt)
-    ]
-    # Attach request-time sampling params into the trajectory request
-    input_batch["sampling_params"] = get_sampling_params_for_backend(
+    sampling_params = get_sampling_params_for_backend(
         "vllm",
         DictConfig(
             {
@@ -207,6 +183,8 @@ async def run_trajectory_runner_end_to_end(
             }
         ),
     )
+
+    input_batch = replace(input_batch, sampling_params=sampling_params)
 
     try:
         with Timer("generate_responses"):

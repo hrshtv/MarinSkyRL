@@ -26,7 +26,6 @@ from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
 import yaml
-from harbor_config.models.environment_type import EnvironmentType
 from iris.client.client import IrisClient, Job
 from iris.cluster.constraints import CLUSTER_CONSTRAINT_KEY, Constraint, ConstraintOp, infer_preemptible_constraint
 from iris.cluster.platforms.k8s.coreweave_topology import gpu_gang_coscheduling_level
@@ -52,6 +51,7 @@ from marinskyrl.resource_locator import (
     is_cloud_uri,
     join_resource_path,
 )
+from skyrl_train.rollouts.harbor_settings import EnvironmentType
 from cloud.iris.runtime_bundle import build_runtime_bundle
 from marinskyrl.environment_contract import (
     DEBUG_ARTIFACT_DIR_ENV,
@@ -676,7 +676,7 @@ def build_debug_launch_env(args: SimpleNamespace) -> dict[str, str]:
 
 
 def config_task_environment(config: DictConfig) -> dict[str, str]:
-    """Return task environment variables from the launch document's runtime section."""
+    """Resolve task settings and explicitly named backend secrets at submission."""
     extra = dict(config.runtime.task_env)
     skyrl_controls = sorted(str(key) for key in extra if str(key).startswith("SKYRL_"))
     if skyrl_controls:
@@ -691,6 +691,15 @@ def config_task_environment(config: DictConfig) -> dict[str, str]:
         if isinstance(v, bool):
             v = int(v)
         out[str(k)] = str(v)
+    if config.runtime.entrypoint != CHECKPOINT_EXPORT_ENTRYPOINT:
+        for backend in ("remote_judge", "daytona"):
+            key_env = OmegaConf.select(config, f"skyrl.environment.task_sessions.{backend}.api_key_env")
+            if key_env is not None:
+                out[key_env] = os.environ[key_env]
+        for callback in OmegaConf.select(config, "skyrl.trainer.callbacks", default=[]) or []:
+            if callback.get("type") == "harbor_evaluation":
+                key_env = callback["daytona_api_key_env"]
+                out[key_env] = os.environ[key_env]
     return out
 
 
@@ -805,6 +814,7 @@ def launch(args: SimpleNamespace, expected_launcher_commit: str) -> LaunchOutcom
 
     if not _is_checkpoint_export(args) and _rl_config_uses_daytona(args.config):
         daytona_api_key = _resolve_daytona_rl_api_key()
+        os.environ[DAYTONA_RL_SECRET_NAME] = daytona_api_key
         os.environ["DAYTONA_API_KEY"] = daytona_api_key
 
     command = build_config_task_command(args)
@@ -999,6 +1009,14 @@ def launch(args: SimpleNamespace, expected_launcher_commit: str) -> LaunchOutcom
         if v:
             env_vars[k] = v
     env_vars.update(wandb_launch_environment(entity=args.wandb_entity))
+    if not _is_checkpoint_export(args) and _rl_config_uses_daytona(args.config):
+        for field in ("daytona_api_key_env", "eval_daytona_api_key_env"):
+            name = OmegaConf.select(args.config, f"skyrl.terminal_bench_config.harbor.{field}")
+            if name is not None:
+                value = os.environ.get(name)
+                if not value:
+                    raise ValueError(f"Missing Daytona credential environment variable: {name}")
+                env_vars[name] = value
 
     # Load the cluster config (pydantic IrisClusterConfig) and build the provider
     # bundle, then discover + tunnel to the controller. This mirrors the marin

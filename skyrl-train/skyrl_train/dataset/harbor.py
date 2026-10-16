@@ -8,10 +8,9 @@ from itertools import batched
 from pathlib import Path
 from typing import Any
 
+import pyarrow.parquet as pq
 from loguru import logger
 from transformers import PreTrainedTokenizerBase
-from taskcompendium.importers.harbor import harbor_task
-from harbor_config.models.task.config import EnvironmentConfig, TaskConfig
 from rolloutengine.lowering import SHELLBOX_SESSION
 from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec, TaskRuntimeSpec, TaskSessionSpec
 from shellbox.machine import Backend, NetworkPolicy
@@ -20,6 +19,13 @@ from taskcompendium.models import NoGrader, ScriptGrader, Source, TaskSpec, Veri
 from marinskyrl.packed_tasks import PackedTaskMaterializer, PackedTaskReference, select_task_references
 from marinskyrl.task_sources import DirectoryDataSource, TaskTroveParquetSource, data_source
 from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TaskDataset, cache_tasks
+from skyrl_train.dataset.harbor_import import (
+    HARBOR_TRIAL_SESSION,
+    EnvironmentConfig,
+    TaskConfig,
+    harbor_task,
+    harbor_trial_task,
+)
 
 MATERIALIZATION_BATCH_SIZE = 64
 HARBOR_ID_PREFIX = "harbor-id:"
@@ -141,6 +147,13 @@ def lower_harbor_task(directory: Path, task: TaskSpec, *, session: TaskSessionSp
     """Use package machine settings and phase deadlines, with other limits from the caller."""
     config = TaskConfig.model_validate_toml((directory / "task.toml").read_text())
 
+    if session.task_session == HARBOR_TRIAL_SESSION:
+        return LoweredTaskSpec(
+            task=task,
+            runtime=TaskRuntimeSpec(task_machine=None, verifier_machine=None),
+            session=session,
+        )
+
     task_machine = harbor_machine(config.environment, config.agent.user)
     verifier_machine = (
         harbor_machine(config.verifier.environment or config.environment, config.verifier.user)
@@ -169,9 +182,10 @@ def materialize_harbor_tasks(
     session: TaskSessionSpec,
     grader_override: NoGrader | None = None,
 ) -> Path:
-    """Convert selected directory and packed tasks to portable task Parquet."""
-    sources = TerminalBenchTaskDataset(data_files)
-    if not len(sources):
+    """Combine Harbor packages and pre-lowered task Parquet for one worker pool."""
+    task_files = [source for source in data_files if isinstance(source, str) and source.endswith(".parquet")]
+    sources = TerminalBenchTaskDataset([source for source in data_files if source not in task_files])
+    if not len(sources) and not task_files:
         raise ValueError("No Harbor tasks matched the configured sources")
 
     def tasks() -> Iterator[LoweredTaskSpec]:
@@ -188,7 +202,8 @@ def materialize_harbor_tasks(
                         directory = directories[item]
                         data_source = item.stable_uri()
                         uid = item.uid()
-                    task = harbor_task(
+                    importer = harbor_trial_task if session.task_session == HARBOR_TRIAL_SESSION else harbor_task
+                    task = importer(
                         directory,
                         source=Source(
                             dataset=data_source,
@@ -198,6 +213,10 @@ def materialize_harbor_tasks(
                         ),
                     )
                     if grader_override is not None:
+                        if session.task_session == HARBOR_TRIAL_SESSION:
+                            raise ValueError(
+                                "Full Harbor trials configure verification through Harbor, not grader overrides"
+                            )
                         task = task.model_copy(
                             update={
                                 "grader": grader_override,
@@ -221,6 +240,11 @@ def materialize_harbor_tasks(
                         }
                     )
                     yield lower_harbor_task(directory, task, session=session)
+        for path in task_files:
+            with pq.ParquetFile(path) as parquet:
+                for batch in parquet.iter_batches(batch_size=MATERIALIZATION_BATCH_SIZE, columns=[LOWERED_TASK_COLUMN]):
+                    for row in batch.to_pylist():
+                        yield LoweredTaskSpec.model_validate_json(row[LOWERED_TASK_COLUMN])
 
     return cache_tasks(tasks(), cache_dir)
 

@@ -9,11 +9,12 @@ from omegaconf import OmegaConf
 from rolloutengine.contracts import GenerationLimitReached, RolloutContractError
 from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec, TaskRuntimeSpec, TaskSessionSpec
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import Command, NetworkPolicy, ShellSimBuiltins
+from shellbox.machine import Backend, Command, NetworkPolicy, PackageSpec
 from taskcompendium.grader import verifyit_package
 from taskcompendium.models import (
     AnswerType,
     ArtifactKind,
+    CommandSemantics,
     ConversationInput,
     EnvironmentRequirements,
     NoGrader,
@@ -26,12 +27,11 @@ from taskcompendium.models import (
     VerifierArtifact,
 )
 from taskcompendium.runtime.resources import inline_resource
-from taskcompendium.submission import conversation_messages
 from verifyit.spec import NumericSpec
 
 from skyrl_gym.verification import VerificationStatus
 from skyrl_train.config.utils import get_default_config
-from skyrl_train.dataset.dataset import PromptDataset
+from skyrl_train.dataset.tasks import TaskDataset
 from skyrl_train.dynamic_sampling import GroupSelectionPolicy
 from skyrl_train.group_admission import GroupAdmissionPolicy, GroupAdvantageInvariant
 from skyrl_train.rollouts.buffer import (
@@ -42,12 +42,13 @@ from skyrl_train.rollouts.buffer import (
     RolloutContentPolicy,
     RolloutTask,
 )
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN, TASKCOMPENDIUM_ENVIRONMENT
+from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN
 from skyrl_train.rollouts.task_projections import WholeTaskProjection
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
-from skyrl_train.trajectory_runners.projections import WholeTrajectoryProjection
 from skyrl_train.trajectory_runners.model_clients import ModelServerError
-from skyrl_train.trajectory_runners.types import TokenProvenance, TrajectoryID
+from skyrl_train.trajectory_runners.types import TokenProvenance, TrajectoryID, TaskRequestBatch
+from skyrl_train.trajectory_runners.trajectory_processing import prepare_trajectory_request
+from tests.cpu.task_specs import task_input
 
 FIXTURE_IMAGE = "fixture@sha256:" + "0" * 64
 pytestmark = pytest.mark.asyncio
@@ -91,6 +92,11 @@ class ReplayClient:
 
 @dataclass
 class ImageFactory:
+    backend = Backend.DOCKER
+
+    def check_environment(self, _requirements, _spec):
+        pass
+
     machines: list = field(default_factory=list)
     failure: Exception | None = None
     failure_after: int = 0
@@ -99,7 +105,7 @@ class ImageFactory:
         if self.failure is not None and len(self.machines) == self.failure_after:
             raise self.failure
         machine = await ShellSimMachineFactory().create(
-            replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+            replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
         )
         self.machines.append(machine)
         return machine
@@ -127,9 +133,15 @@ def file_task(script=b'if [ "$(cat /workspace/answer)" = 12 ]; then echo 1; else
     return answer_task().model_copy(
         update={
             "answer_type": AnswerType.FILE,
-            "environment_requirements": EnvironmentRequirements(capabilities=("shell", "filesystem")),
+            "environment_requirements": EnvironmentRequirements(
+                command_semantics=CommandSemantics.LINUX_PROCESS,
+                docker_image=FIXTURE_IMAGE,
+                capabilities=("shell", "filesystem"),
+            ),
             "grader": ScriptGrader(
-                environment=EnvironmentRequirements(docker_image=FIXTURE_IMAGE),
+                environment=EnvironmentRequirements(
+                    command_semantics=CommandSemantics.LINUX_PROCESS, docker_image=FIXTURE_IMAGE
+                ),
                 answer_path=None,
                 argv=("sh", "/tests/grade.sh"),
                 artifacts=(
@@ -169,6 +181,7 @@ def lowered(task):
             attempt_timeout=10,
             verifier_timeout=5,
             cleanup_timeout=5,
+            max_total_tokens=None,
         ),
     )
 
@@ -186,7 +199,7 @@ def runner(client, factories=None, *, error_handling=None):
     )
     return TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         client,
         factories or {},
         shutdown_timeout=30,
@@ -194,15 +207,11 @@ def runner(client, factories=None, *, error_handling=None):
 
 
 def request(record):
-    return {
-        "prompts": [conversation_messages(record.task.context.events)],
-        "env_classes": [TASKCOMPENDIUM_ENVIRONMENT],
-        "env_extras": [
-            {LOWERED_TASK_COLUMN: record.model_dump_json(), "data_source": "fixture", "teacher_route": "math"}
-        ],
-        "sampling_params": {"logprobs": True},
-        "trajectory_ids": [TrajectoryID("task", 0)],
-    }
+    return TaskRequestBatch(
+        rows=(task_input(record, teacher_route="math"),),
+        sampling_params={"logprobs": True},
+        trajectory_ids=(TrajectoryID("task", 0),),
+    )
 
 
 def shell_turn(command):
@@ -422,9 +431,7 @@ async def test_native_passthrough_without_verifier_score_is_masked():
 
 async def test_native_empty_failure_keeps_mixed_batch_evidence_aligned():
     batch = request(lowered(answer_task()))
-    for key in ("prompts", "env_classes", "env_extras", "trajectory_ids"):
-        batch[key] *= 2
-    batch["trajectory_ids"] = [TrajectoryID("task", index) for index in range(2)]
+    batch = replace(batch, rows=batch.rows * 2, trajectory_ids=tuple(TrajectoryID("task", index) for index in range(2)))
     client = ReplayClient([{"role": "assistant", "content": "12"}, ConnectionError("serving unavailable")])
     output = await runner(client).run(batch)
 
@@ -474,20 +481,15 @@ async def test_native_reconstructed_tokens_fail_the_transport_contract():
 async def test_native_dataset_group_round_trips_through_leased_buffer(tmp_path):
     record = lowered(answer_task())
     path = tmp_path / "tasks.jsonl"
-    path.write_text(
-        json.dumps(
-            {"prompt": conversation_messages(record.task.context.events), LOWERED_TASK_COLUMN: record.model_dump_json()}
-        )
+    path.write_text(json.dumps({LOWERED_TASK_COLUMN: record.model_dump_json()}))
+    dataset = TaskDataset(
+        [str(path)],
+        Tokenizer(),
+        max_prompt_length=128,
+        num_workers=1,
     )
-    dataset = PromptDataset(str(path), Tokenizer(), max_prompt_length=128, num_workers=1)
     prompt = dataset.collate_fn([dataset[0]])[0]
-    batch = {
-        "prompts": [prompt["prompt"]] * 2,
-        "env_classes": [prompt["env_class"]] * 2,
-        "env_extras": [prompt["env_extras"]] * 2,
-        "sampling_params": {"logprobs": True},
-        "trajectory_ids": [TrajectoryID(prompt["uid"], index) for index in range(2)],
-    }
+    batch, _ = prepare_trajectory_request([prompt], 2, {"logprobs": True}, "train", 1)
     buffer = RolloutBuffer(RolloutBufferConfig(1, 1, 0, BatchPolicy.FULL_BATCH, None, None))
     policy = RolloutContentPolicy(
         GroupAdmissionPolicy(

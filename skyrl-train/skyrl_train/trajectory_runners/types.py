@@ -4,13 +4,17 @@ from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, U
 
 import numpy as np
 
-from skyrl_gym.verification import RewardResult, RolloutEvidence, TrainingDisposition, VerificationResult
+from skyrl_gym.verification import VerificationResult
 from skyrl_train.distillation import PreparedTeacherInput, TeacherEvidenceBatch
 from skyrl_train.inference_engines.base import ConversationType
+from skyrl_train.task_inputs import TaskInput, TrajectoryMetadata, task_messages
 
 
 TrainingPhase = Literal["train", "eval"]
 REWARD_SHAPING_COMPONENT_NAMES = ("passthrough", "non_termination", "overlong", "successful_length")
+ROUTED_EXPERTS_KEY = "routed_experts"
+RESPONSE_POLICY_STEPS_KEY = "response_policy_steps"
+RESPONSE_SPAN_TAGS_KEY = "response_span_tags"
 
 
 class TokenProvenance(StrEnum):
@@ -18,21 +22,6 @@ class TokenProvenance(StrEnum):
 
     ENGINE = "engine"
     RECONSTRUCTED = "reconstructed"
-
-
-@dataclass
-class AgentLoopOutput:
-    """One normalized SkyRL-Gym interaction result."""
-
-    evidence: RolloutEvidence
-    verification: VerificationResult
-    reward: RewardResult
-    disposition: TrainingDisposition
-    loss_mask: List[int]
-    env_metrics: Dict[str, Any]
-    token_provenance: TokenProvenance = TokenProvenance.ENGINE
-    error_treatment: Optional[str] = None
-    response_span_tags: Optional[List[int]] = None
 
 
 @dataclass
@@ -50,13 +39,37 @@ class BatchMetadata:
     training_phase: TrainingPhase
 
 
-class TrajectoryRequestBatch(TypedDict):
-    prompts: List[ConversationType]
-    env_classes: List[str]
-    env_extras: Optional[List[Dict[str, Any]]]
-    sampling_params: Optional[Dict[str, Any]]
-    trajectory_ids: Optional[List[TrajectoryID]]
-    batch_metadata: Optional[BatchMetadata]
+@dataclass(frozen=True)
+class TaskRequestBatch:
+    rows: tuple[TaskInput, ...]
+    sampling_params: dict[str, Any] | None = None
+    trajectory_ids: tuple[TrajectoryID, ...] | None = None
+    batch_metadata: BatchMetadata | None = None
+
+    @property
+    def metadata(self) -> tuple[TrajectoryMetadata, ...]:
+        return tuple(row.metadata for row in self.rows)
+
+    @property
+    def public_prompts(self) -> tuple[ConversationType, ...]:
+        return tuple(task_messages(row.lowered) for row in self.rows)
+
+
+@dataclass(frozen=True)
+class PreferenceRequestBatch:
+    prompts: tuple[ConversationType | list[int], ...]
+    preferences: tuple[dict[str, Any], ...]
+    metadata: tuple[TrajectoryMetadata, ...]
+    sampling_params: dict[str, Any] | None = None
+    trajectory_ids: tuple[TrajectoryID, ...] | None = None
+    batch_metadata: BatchMetadata | None = None
+
+    @property
+    def public_prompts(self) -> tuple[ConversationType | list[int], ...]:
+        return self.prompts
+
+
+TrajectoryRequestBatch = TaskRequestBatch | PreferenceRequestBatch
 
 
 class RewardShapingComponents(TypedDict):
@@ -119,6 +132,7 @@ class TrajectoryBatch(TypedDict):
     student_topk_indices: Optional[List[np.ndarray]]
     behavior_topk_logprobs: Optional[List[np.ndarray]]
     rollout_routed_experts: Optional[List[np.ndarray]]
+    rollout_policy_steps: Optional[List[np.ndarray]]
     teacher_evidence: Optional[TeacherEvidenceBatch]
     distillation: Optional[PreparedTeacherInput]
     token_level_shaping: Optional[List[List[float]]]

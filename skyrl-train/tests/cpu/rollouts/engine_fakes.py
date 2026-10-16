@@ -2,7 +2,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import ShellSimBuiltins
+from shellbox.machine import Backend, PackageSpec
 from skyrl_train.rollouts.buffer import RolloutGroup, RolloutLease
 from skyrl_train.trajectory_runners.types import TokenProvenance
 
@@ -10,7 +10,7 @@ from skyrl_train.trajectory_runners.types import TokenProvenance
 class Tokenizer:
     eos_token_id = 99
 
-    def apply_chat_template(self, messages, add_generation_prompt):
+    def apply_chat_template(self, messages, add_generation_prompt, **template_options):
         return [1, 2]
 
 
@@ -37,9 +37,14 @@ class Writer:
 class FixtureImageFactory:
     """Execute fixture image commands on the built-in filesystem."""
 
+    backend = Backend.DOCKER
+
+    def check_environment(self, _requirements, _spec):
+        pass
+
     async def create(self, spec):
         return await ShellSimMachineFactory().create(
-            replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+            replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
         )
 
 

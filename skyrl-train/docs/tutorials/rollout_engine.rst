@@ -2,7 +2,7 @@ Native tasks with RolloutEngine
 ===============================
 
 The ``taskcompendium`` entrypoint executes native TaskCompendium tasks through
-Marin's ``ShellboxRolloutEngine`` and SkyRL's common task worker.
+Marin's ``RolloutEngine`` and SkyRL's common task worker.
 
 This entrypoint supports single-stage tasks and whole-rollout or step-wise training. Multiple
 model turns can occur within one task. Shell commands use the ``docker`` backend.
@@ -53,6 +53,7 @@ This example writes one machine-free arithmetic task:
            attempt_timeout=90,
            verifier_timeout=30,
            cleanup_timeout=10,
+           max_total_tokens=None,
        ),
    )
    row = {

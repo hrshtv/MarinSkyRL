@@ -1,5 +1,7 @@
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from taskcompendium.submission import conversation_messages
+
 import json
 import threading
 
@@ -11,7 +13,6 @@ from taskcompendium.grading_result import GradeResult, Outcome
 from taskcompendium.models import (
     AnswerType,
     ConversationInput,
-    EnvironmentRequirements,
     FileReward,
     NoGrader,
     PlainText,
@@ -23,15 +24,13 @@ from taskcompendium.models import (
     TextMessage,
 )
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
-from skyrl_train.trajectory_runners.projections import StepWiseTrajectoryProjection, WholeTrajectoryProjection
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.group_grader import GenRMGroupGraderParameters, GroupGraderSpec, task_group_grader
 from skyrl_train.rollouts.genrm_grading import grade_genrm_rollouts
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
 from skyrl_gym.source_task import source_task
-from rolloutengine.spec import LoweredTaskSpec
-from tests.cpu.task_specs import lowered_task
+from tests.cpu.task_specs import NATIVE_ENVIRONMENT, lowered_task, task_input
 from rolloutengine.contracts import ModelTurn, RolloutData, RolloutStep, Transition
 from skyrl_train.trajectory_runners.types import BatchMetadata, TrajectoryID
 from skyrl_train.trajectory_runners.model_clients import ModelServerError
@@ -67,7 +66,7 @@ async def test_harbor_task_worker_preserves_verdicts_and_shapes_group_rewards(
     tasks = []
     for index, verdict in enumerate(("FAILED", "PASSED")):
         verifier = ScriptGrader(
-            environment=EnvironmentRequirements(docker_image="fixture@sha256:" + "0" * 64),
+            environment=NATIVE_ENVIRONMENT,
             answer_path=None,
             argv=(
                 "sh",
@@ -81,7 +80,7 @@ async def test_harbor_task_worker_preserves_verdicts_and_shapes_group_rewards(
             TaskSpec(
                 id=f"harbor-{index}",
                 context=ConversationInput(events=(TextMessage(role="user", content="Complete the task."),)),
-                environment_requirements=EnvironmentRequirements(),
+                environment_requirements=NATIVE_ENVIRONMENT,
                 answer_type=AnswerType.WORKSPACE_STATE,
                 answer_format=PlainText(),
                 grader=verifier,
@@ -89,26 +88,15 @@ async def test_harbor_task_worker_preserves_verdicts_and_shapes_group_rewards(
                 tags=("harbor",),
             )
         )
-    request.update(
-        prompts=[[{"role": "user", "content": "Complete the task."}]] * 2,
-        env_classes=["taskcompendium"] * 2,
-        env_extras=[
-            {
-                "lowered_task_spec": lowered_task(
-                    task, "shellbox", backend="shellsim", verifier_backend="shellsim"
-                ).model_dump_json()
-            }
-            for task in tasks
-        ],
-        trajectory_ids=[TrajectoryID("harbor", index) for index in range(2)],
+    request = replace(
+        request,
+        rows=tuple(task_input(lowered_task(task, backend="shellsim", verifier_backend="shellsim")) for task in tasks),
+        trajectory_ids=tuple(TrajectoryID("harbor", index) for index in range(2)),
         batch_metadata=BatchMetadata(0, phase),
     )
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, SpanTokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, SpanTokenizer()),
         InferenceClient(),
         {"shellsim": FixtureImageFactory()},
         harbor=settings,
@@ -181,7 +169,7 @@ def genrm_judge_server():
 @pytest.mark.parametrize("valid_peers", [0, 2])
 def test_genrm_ineligible_attempts_have_no_provisional_score(task_inputs, genrm_judge_server, valid_peers):
     _, request = task_inputs
-    task = LoweredTaskSpec.model_validate_json(request["env_extras"][0]["lowered_task_spec"]).task
+    task = request.rows[0].lowered.task
     specification = GroupGraderSpec(
         name="nemotron_genrm",
         parameters_json=GenRMGroupGraderParameters(
@@ -250,7 +238,7 @@ async def test_genrm_final_grades_and_credit_reach_training_batch(
     config, request = task_inputs
     count = 3 if failed_peer else 2
     task = source_task(
-        request["prompts"][0],
+        conversation_messages(request.rows[0].lowered.task.context.events),
         extras={
             "extra_info": {
                 "nemotron_ultra": {
@@ -277,17 +265,10 @@ async def test_genrm_final_grades_and_credit_reach_training_batch(
         source=Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
     )
     group_grader = task_group_grader(lowered_task(task, "nemotron_ultra"))
-    request.update(
-        prompts=request["prompts"] * count,
-        env_classes=["nemotron_ultra"] * count,
-        env_extras=[
-            {
-                "lowered_task_spec": lowered_task(task, "nemotron_ultra").model_dump_json(),
-                "group_grader": None if group_grader is None else group_grader.model_dump_json(),
-            }
-        ]
-        * count,
-        trajectory_ids=[TrajectoryID(task.id, index) for index in range(count)],
+    request = replace(
+        request,
+        rows=(task_input(lowered_task(task, "nemotron_ultra"), group_grader=group_grader),) * count,
+        trajectory_ids=tuple(TrajectoryID(task.id, index) for index in range(count)),
         batch_metadata=BatchMetadata(global_step=0, training_phase=phase),
     )
 
@@ -300,7 +281,7 @@ async def test_genrm_final_grades_and_credit_reach_training_batch(
 
     runner = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         CohortClient(["better", "failed", "worse"] if failed_peer else ["better", "worse"]),
         {},
         shutdown_timeout=30,
@@ -358,24 +339,17 @@ async def test_genrm_final_grades_and_credit_reach_training_batch(
 @pytest.mark.asyncio
 async def test_task_group_grader_preserves_separate_samples_and_private_inputs(task_inputs):
     config, request = task_inputs
-    task = LoweredTaskSpec.model_validate_json(request["env_extras"][0]["lowered_task_spec"]).task
+    task = request.rows[0].lowered.task
     task = task.model_copy(
         update={
             "grader": NoGrader(reason="Group grading supplies the final score"),
         }
     )
     group_grader = GroupGraderSpec(name="group_total", parameters_json=json.dumps({"private_offset": 10}))
-    request.update(
-        prompts=request["prompts"] * 4,
-        env_classes=["taskcompendium"] * 4,
-        env_extras=[
-            {
-                "lowered_task_spec": lowered_task(task, "shellbox").model_dump_json(),
-                "group_grader": group_grader.model_dump_json(),
-            }
-        ]
-        * 4,
-        trajectory_ids=[TrajectoryID(group, sample) for group, sample in [("a", 0), ("b", 0), ("a", 1), ("b", 1)]],
+    request = replace(
+        request,
+        rows=(task_input(lowered_task(task), group_grader=group_grader),) * 4,
+        trajectory_ids=tuple(TrajectoryID(group, sample) for group, sample in [("a", 0), ("b", 0), ("a", 1), ("b", 1)]),
     )
 
     def group_total(task, specification, records, eligible, _phase):
@@ -396,7 +370,7 @@ async def test_task_group_grader_preserves_separate_samples_and_private_inputs(t
     model = ConversationClient(["1", "2", "3", "4"])
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         model,
         {},
         concurrent_tasks=1,

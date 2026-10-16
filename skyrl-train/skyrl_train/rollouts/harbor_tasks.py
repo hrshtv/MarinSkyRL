@@ -1,10 +1,10 @@
 """Apply Harbor launch settings to tasks executed by the common rollout engine."""
 
 from dataclasses import dataclass, replace
+from functools import partial
+import os
 
-from harbor_config.models.job.config import RetryConfig
-from harbor_config.models.environment_type import EnvironmentType
-from harbor_config.models.trial.config import EnvironmentConfig, VerifierConfig
+from daytona import AsyncDaytona, DaytonaConfig
 from omegaconf import DictConfig
 from shellbox.backends.daytona.machine import DaytonaMachineFactory, DaytonaNetworkMode, DaytonaNetworkPolicy
 from shellbox.machine import Backend, MachineFactory
@@ -13,13 +13,21 @@ from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec
 from taskcompendium.grading_result import GradingFailure, Outcome
 from rolloutengine.contracts import RolloutData, RolloutFailure
 
+from skyrl_train.rollouts.harbor_settings import (
+    HARBOR_EXCEPTION,
+    EnvironmentConfig,
+    EnvironmentType,
+    RetryConfig,
+    VerifierConfig,
+)
+
 from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
 from skyrl_train.trajectory_runners.harbor.identity_aware_reward import (
     IDENTITY_AWARE_SHAPER,
     identity_aware_pass_ratios,
 )
 from skyrl_train.trajectory_runners.harbor.truncation_penalty import apply_truncation_penalty, detect_turn_truncation
-from skyrl_train.trajectory_runners.types import TrajectoryRequestBatch
+from skyrl_train.trajectory_runners.types import RESPONSE_SPAN_TAGS_KEY, TrajectoryRequestBatch
 from skyrl_train.metric_names import IDENTITY_AWARE_REWARD_METRIC_PREFIX
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig, ErrorTreatment, classify_exception_type
 from skyrl_train.utils.pbs_shaping import compute_pbs_token_shaping
@@ -33,6 +41,7 @@ from skyrl_train.utils.reward_shaping import (
 )
 
 HARBOR_MACHINE_BACKEND = "harbor"
+HARBOR_EVAL_MACHINE_BACKEND = "harbor_eval"
 
 
 @dataclass(frozen=True)
@@ -86,11 +95,19 @@ class HarborTaskSettings:
     def grader_override(self) -> NoGrader | None:
         return NoGrader(reason="Harbor verification is disabled") if self.verifier.disable else None
 
-    def machine_factory(self) -> MachineFactory:
+    def machine_factory(self, *, phase: str = "train") -> MachineFactory:
         match self.environment.type:
             case EnvironmentType.DAYTONA:
                 policy = self.environment.kwargs.get("network_policy")
+                key_env = self.environment.kwargs.get("eval_api_key_env" if phase == "eval" else "api_key_env")
+                client_factory = AsyncDaytona
+                if key_env is not None:
+                    api_key = os.environ.get(key_env)
+                    if not api_key:
+                        raise ValueError(f"Missing Daytona credential environment variable: {key_env}")
+                    client_factory = partial(AsyncDaytona, DaytonaConfig(api_key=api_key))
                 return DaytonaMachineFactory(
+                    client_factory=client_factory,
                     ttl_minutes=self.environment.kwargs.get("ttl_minutes", 360),
                     network_policy=None
                     if policy is None
@@ -116,7 +133,11 @@ class HarborTaskSettings:
                 if (value := getattr(self.environment, f"override_{name}")) is not None
             }
             if original.backend == Backend.DOCKER:
-                updates["backend"] = HARBOR_MACHINE_BACKEND
+                updates["backend"] = (
+                    HARBOR_EVAL_MACHINE_BACKEND
+                    if phase == "eval" and self.environment.kwargs.get("eval_api_key_env")
+                    else HARBOR_MACHINE_BACKEND
+                )
             if original.startup_timeout is not None:
                 updates["startup_timeout"] = original.startup_timeout * self.timeout_multiplier
             return original.model_copy(update=updates)
@@ -166,7 +187,15 @@ _GRADING_FAILURE_TYPES = {
 
 def harbor_grading_failure(rollout: RolloutData) -> RolloutData:
     """Translate structured verifier failures to the configured Harbor error policy."""
-    if rollout.failure is not None or rollout.grade.status != Outcome.INFRA_ERROR:
+    if rollout.failure is not None:
+        return rollout
+    exception_type = rollout.grade.diagnostics.get(HARBOR_EXCEPTION)
+    if exception_type is not None:
+        return replace(
+            rollout,
+            failure=RolloutFailure(exception_type, diagnostics={"timed_out": exception_type == "AgentTimeoutError"}),
+        )
+    if rollout.grade.status != Outcome.INFRA_ERROR:
         return rollout
     return replace(
         rollout,
@@ -194,8 +223,8 @@ def shape_harbor_rollouts(
     rewards = [rollout.grade.reward if rollout.grade.status == Outcome.GRADED else 0.0 for rollout in rollouts]
     components = [{} for _ in rollouts]
     collections = [None for _ in rollouts]
-    identifiers = request.get("trajectory_ids")
-    metadata = request.get("batch_metadata")
+    identifiers = request.trajectory_ids
+    metadata = request.batch_metadata
     eligible = [
         harbor and rollout.grade.status == Outcome.GRADED and rollout.failure is None
         for harbor, rollout in zip(harbor_tasks, rollouts, strict=True)
@@ -331,7 +360,7 @@ def shape_harbor_rollouts(
                 turn = step.turn
                 if config["enable_span_tagging"]:
                     turn = replace(
-                        turn, metadata={**turn.metadata, "response_span_tags": tags[start : step.response_end + 1]}
+                        turn, metadata={**turn.metadata, RESPONSE_SPAN_TAGS_KEY: tags[start : step.response_end + 1]}
                     )
                 annotated.append(
                     replace(

@@ -330,6 +330,11 @@ def validate_objective(cfg: DictConfig, *, loss_spec: LossSpec | None = None) ->
     centering_width = algorithm.get("score_centering_topk", 0)
     if isinstance(centering_width, bool) or not isinstance(centering_width, int) or centering_width < 0:
         raise ValueError("trainer.algorithm.score_centering_topk must be a nonnegative integer")
+    diagnostic_tokens = algorithm.get("score_centering_diagnostic_tokens", 0)
+    if isinstance(diagnostic_tokens, bool) or not isinstance(diagnostic_tokens, int) or diagnostic_tokens < 0:
+        raise ValueError("trainer.algorithm.score_centering_diagnostic_tokens must be a nonnegative integer")
+    if not centering_width and (algorithm.get("score_centering_enabled", False) or diagnostic_tokens):
+        raise ValueError("score centering and its sampled diagnostics require score_centering_topk > 0")
     if centering_width:
         score_centering_tis_cap(algorithm)
         if algorithm.policy_loss_type != PolicyLossType.REGULAR or plan is not None:

@@ -1,4 +1,7 @@
+from taskcompendium.submission import conversation_messages
+
 import asyncio
+import pickle
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
@@ -11,12 +14,11 @@ from omegaconf import OmegaConf
 from skyrl_gym.task_sessions import AnswerTaskSession
 from taskcompendium.grading_result import GradeResult, Outcome
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import Backend, Command, MachineSpec, ShellSimBuiltins
+from shellbox.machine import Backend, Command, MachineSpec, PackageSpec
 from taskcompendium.models import (
     AnswerType,
     ArtifactKind,
     ConversationInput,
-    EnvironmentRequirements,
     ExitCodeReward,
     PlainText,
     ScriptGrader,
@@ -26,15 +28,13 @@ from taskcompendium.models import (
     VerifierArtifact,
 )
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
-from skyrl_train.trajectory_runners.projections import StepWiseTrajectoryProjection, WholeTrajectoryProjection
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
 from skyrl_train.rollouts.task_worker import TaskRolloutWorker
 from skyrl_train.rollouts.group_grader import GroupGraderSpec
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
 from skyrl_train.rollouts.machines import OwnedMachineFactory, TaskMachineError
 from skyrl_gym.source_task import source_task
-from rolloutengine.spec import LoweredTaskSpec
-from tests.cpu.task_specs import lowered_task
+from tests.cpu.task_specs import NATIVE_ENVIRONMENT, SHELL_ENVIRONMENT, lowered_task, task_input
 from rolloutengine.contracts import ModelTurn, Transition
 from skyrl_train.trajectory_runners.types import BatchMetadata, TrajectoryID
 from tests.cpu.rollouts.engine_fakes import InferenceClient, Tokenizer, Writer
@@ -62,6 +62,9 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
     class Factory:
         backend = Backend.SHELLSIM
 
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             if operation == "create":
                 raise error_type("Provider operation failed")
@@ -70,7 +73,7 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
     factory = OwnedMachineFactory(Factory(), "fixture")
     try:
         with pytest.raises(expected_type) as failure:
-            machine = await factory.create(MachineSpec(ShellSimBuiltins()))
+            machine = await factory.create(MachineSpec(PackageSpec()))
             if operation == "run":
                 await machine.run(Command(("true",)))
             elif operation == "upload":
@@ -79,6 +82,10 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
                 await machine.download("/artifact", tmp_path / "artifact")
         if error_type is OSError:
             assert isinstance(failure.value.__cause__, OSError)
+            assert failure.value.operation == operation
+            restored = pickle.loads(pickle.dumps(failure.value))
+            assert restored.operation == operation
+            assert str(restored) == str(failure.value)
     finally:
         await factory.close(asyncio.get_running_loop().time() + 5)
 
@@ -87,15 +94,13 @@ async def test_owned_machine_preserves_fault_categories(tmp_path, operation, err
 @pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
 async def test_one_machine_cleanup_failure_does_not_abort_the_buffer_group(task_inputs, projection_type):
     config, original = task_inputs
-    task = LoweredTaskSpec.model_validate_json(original["env_extras"][0]["lowered_task_spec"]).task
-    task = task.model_copy()
-    request = {
-        **original,
-        "prompts": original["prompts"] * 2,
-        "env_classes": original["env_classes"] * 2,
-        "env_extras": [{"lowered_task_spec": lowered_task(task, "shellbox", backend="shellsim").model_dump_json()}] * 2,
-        "trajectory_ids": [TrajectoryID("arithmetic", 0), TrajectoryID("arithmetic", 1)],
-    }
+    task = original.rows[0].lowered.task
+    task = task.model_copy(update={"environment_requirements": SHELL_ENVIRONMENT})
+    request = replace(
+        original,
+        rows=(task_input(lowered_task(task, backend="shellsim")),) * 2,
+        trajectory_ids=(TrajectoryID("arithmetic", 0), TrajectoryID("arithmetic", 1)),
+    )
     machines = []
 
     class Machine:
@@ -116,19 +121,21 @@ async def test_one_machine_cleanup_failure_does_not_abort_the_buffer_group(task_
             raise OSError("Remote cleanup response failed")
 
     class Factory:
+        backend = Backend.SHELLSIM
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             return Machine(machine) if len(machines) == 1 else machine
 
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         InferenceClient(),
         {"shellsim": Factory()},
         shutdown_timeout=30,
@@ -177,8 +184,9 @@ class DeletionMachine:
 @pytest.mark.asyncio
 async def test_worker_shutdown_cancels_model_and_deletes_its_machine(task_inputs):
     config, request = task_inputs
-    lowered = LoweredTaskSpec.model_validate_json(request["env_extras"][0]["lowered_task_spec"])
-    request["env_extras"][0]["lowered_task_spec"] = lowered_task(lowered.task, backend="fixture").model_dump_json()
+    lowered = request.rows[0].lowered
+    task = lowered.task.model_copy(update={"environment_requirements": SHELL_ENVIRONMENT})
+    request = replace(request, rows=(task_input(lowered_task(task, backend="fixture")),))
     started = asyncio.Event()
     deleted = asyncio.Event()
     deletions = []
@@ -189,13 +197,18 @@ async def test_worker_shutdown_cancels_model_and_deletes_its_machine(task_inputs
             await asyncio.Event().wait()
 
     class Factory:
+        backend = Backend.SHELLSIM
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(spec)
             return DeletionMachine(machine, deletions, deleted)
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         Client(),
         {"fixture": Factory()},
         shutdown_timeout=30,
@@ -215,10 +228,9 @@ async def test_worker_shutdown_cancels_model_and_deletes_its_machine(task_inputs
 @pytest.mark.parametrize("complete_during_shutdown", [True, False])
 async def test_worker_shutdown_owns_late_creation_and_bounds_a_blocked_provider(task_inputs, complete_during_shutdown):
     config, request = task_inputs
-    lowered = LoweredTaskSpec.model_validate_json(request["env_extras"][0]["lowered_task_spec"])
-    request["env_extras"][0]["lowered_task_spec"] = lowered_task(
-        lowered.task, backend="fixture-provider"
-    ).model_dump_json()
+    lowered = request.rows[0].lowered
+    task = lowered.task.model_copy(update={"environment_requirements": SHELL_ENVIRONMENT})
+    request = replace(request, rows=(task_input(lowered_task(task, backend="fixture-provider")),))
     started = asyncio.Event()
     release = asyncio.Event()
     deleted = asyncio.Event()
@@ -226,6 +238,11 @@ async def test_worker_shutdown_owns_late_creation_and_bounds_a_blocked_provider(
     diagnostics = []
 
     class Factory:
+        backend = Backend.SHELLSIM
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             started.set()
             await release.wait()
@@ -234,7 +251,7 @@ async def test_worker_shutdown_owns_late_creation_and_bounds_a_blocked_provider(
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {"fixture-provider": Factory()},
         shutdown_timeout=0.05 if not complete_during_shutdown else 5,
@@ -281,11 +298,11 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
     task = TaskSpec(
         id="deadline",
         context=ConversationInput(events=(TextMessage(role="user", content="Write the answer file."),)),
-        environment_requirements=EnvironmentRequirements(),
+        environment_requirements=NATIVE_ENVIRONMENT.model_copy(update={"capabilities": ("shell", "filesystem")}),
         answer_type=AnswerType.FILE,
         answer_format=PlainText(),
         grader=ScriptGrader(
-            environment=EnvironmentRequirements(docker_image="fixture@sha256:" + "0" * 64),
+            environment=NATIVE_ENVIRONMENT,
             answer_path=None,
             argv=("test", "-f", "/workspace/answer"),
             reward=ExitCodeReward(),
@@ -311,14 +328,11 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
                 }
             )
         )
-        request["batch_metadata"] = BatchMetadata(0, "eval" if deadline_source == "eval" else "train")
-    request["env_extras"] = [
-        {
-            "lowered_task_spec": lowered_task(
-                task, backend="shellsim", verifier_backend="shellsim", total_turn_timeout=1
-            ).model_dump_json()
-        }
-    ]
+        request = replace(request, batch_metadata=BatchMetadata(0, "eval" if deadline_source == "eval" else "train"))
+    request = replace(
+        request,
+        rows=(task_input(lowered_task(task, backend="docker", verifier_backend="docker", total_turn_timeout=1)),),
+    )
     machines = []
 
     class Machine:
@@ -327,7 +341,7 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
 
         async def run(self, command):
             result = await self.machine.run(command)
-            if timeout_phase == "advance" and command.argv == ("sh", "-c", "echo 12 > /workspace/answer"):
+            if timeout_phase == "advance" and command.argv == ("bash", "-c", "echo 12 > /workspace/answer"):
                 await asyncio.Future()
             return result
 
@@ -341,9 +355,14 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
             await self.machine.close()
 
     class Factory:
+        backend = Backend.DOCKER
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(
-                replace(spec, source=ShellSimBuiltins(), workdir=spec.workdir or "/workspace")
+                replace(spec, source=PackageSpec(), workdir=spec.workdir or "/workspace")
             )
             machines.append(machine)
             return Machine(machine)
@@ -371,14 +390,11 @@ async def test_agent_deadlines_grade_the_workspace_and_commit_training_tokens(
             ]
             return output
 
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         Client(),
-        {"shellsim": Factory()},
+        {"docker": Factory(), "harbor": Factory()},
         harbor=settings,
         shutdown_timeout=30,
     )
@@ -486,14 +502,16 @@ async def test_blocking_grader_cannot_extend_attempt_or_cleanup_deadlines(task_i
         return Transition(done=True, reward=1.0, grade=GradeResult(Outcome.GRADED, 1.0))
 
     task = source_task(
-        request["prompts"][0], {}, {}, Source(dataset="deadline", revision="1", row="0", importer_revision="1")
+        conversation_messages(request.rows[0].lowered.task.context.events),
+        {},
+        {},
+        Source(dataset="deadline", revision="1", row="0", importer_revision="1"),
     )
     selected = lowered_task(task, "blocking", cleanup_timeout=0.01, **{deadline: 0.25})
-    request["env_extras"] = [{"lowered_task_spec": selected.model_dump_json()}]
-    request["env_classes"] = ["blocking"]
+    request = replace(request, rows=(task_input(selected),))
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {},
         sessions={"blocking": partial(AnswerTaskSession, grader=grade)},
@@ -543,12 +561,13 @@ async def test_worker_shutdown_cancels_the_whole_request_before_buffer_commit(ta
             await super().write_rollout(lease, group)
 
     if phase == "group_grade":
-        request["env_extras"][0]["group_grader"] = GroupGraderSpec(
-            name="fixture", parameters_json="{}"
-        ).model_dump_json()
+        request = replace(
+            request,
+            rows=(replace(request.rows[0], group_grader=GroupGraderSpec(name="fixture", parameters_json="{}")),),
+        )
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {},
         group_graders={"fixture": blocking_grader},
@@ -575,10 +594,9 @@ async def test_worker_shutdown_cancels_the_whole_request_before_buffer_commit(ta
 @pytest.mark.parametrize("provider_error", [OSError, asyncio.CancelledError])
 async def test_worker_shutdown_reports_late_provider_close_failure_without_unhandled_task(task_inputs, provider_error):
     config, request = task_inputs
-    lowered = LoweredTaskSpec.model_validate_json(request["env_extras"][0]["lowered_task_spec"])
-    request["env_extras"][0]["lowered_task_spec"] = lowered_task(
-        lowered.task, backend="fixture-provider"
-    ).model_dump_json()
+    lowered = request.rows[0].lowered
+    task = lowered.task.model_copy(update={"environment_requirements": SHELL_ENVIRONMENT})
+    request = replace(request, rows=(task_input(lowered_task(task, backend="fixture-provider")),))
     started = asyncio.Event()
     release = asyncio.Event()
     deleted = asyncio.Event()
@@ -598,13 +616,18 @@ async def test_worker_shutdown_reports_late_provider_close_failure_without_unhan
             raise provider_error("Provider deletion failed after the shutdown deadline")
 
     class Factory:
+        backend = Backend.SHELLSIM
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             machine = await ShellSimMachineFactory().create(spec)
             return DelayedFailureMachine(machine, deletions, deleted)
 
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         InferenceClient(),
         {"fixture-provider": Factory()},
         shutdown_timeout=0.02,

@@ -13,12 +13,7 @@ from skyrl_train.utils.harbor_errors import (
     retry_excluded_exception_types,
 )
 
-from harbor_config.models.trial.config import (
-    EnvironmentConfig,
-    VerifierConfig,
-)
-from harbor_config.models.job.config import RetryConfig
-from harbor_config.models.environment_type import EnvironmentType
+from skyrl_train.rollouts.harbor_settings import EnvironmentConfig, EnvironmentType, RetryConfig, VerifierConfig
 
 
 @dataclass
@@ -61,6 +56,8 @@ ENVIRONMENT_SCHEMA = SectionSchema(
         "environment_type": FieldMapping("type", default=EnvironmentType.DAYTONA.value),
         "env_network_policy": FieldMapping("network_policy", field_type="kwargs"),
         "ttl_minutes": FieldMapping("ttl_minutes", field_type="kwargs"),
+        "daytona_api_key_env": FieldMapping("api_key_env", field_type="kwargs"),
+        "eval_daytona_api_key_env": FieldMapping("eval_api_key_env", field_type="kwargs"),
     }
 )
 
@@ -183,7 +180,7 @@ REWARD_SHAPING_SCHEMA = SectionSchema(
 # - "mask" exceptions: Excluded from baseline (neutral - infrastructure failures)
 # - "zero" exceptions: Included in baseline with reward=0 (agent failures)
 #
-# Default classification comes from the pinned harbor-config taxonomy. Lists
+# Default classification comes from SkyRL's Harbor error taxonomy. Lists
 # here are explicit campaign overrides and therefore default empty.
 ERROR_HANDLING_SCHEMA = SectionSchema(
     fields={
@@ -254,7 +251,7 @@ class HarborConfigBuilder:
     """Read task resources, deadlines, retries, and reward settings from SkyRL config."""
 
     def __init__(self, terminal_bench_cfg: DictConfig):
-        unknown = set(terminal_bench_cfg) - {"harbor"}
+        unknown = set(terminal_bench_cfg) - {"harbor", "installed_agent"}
         if unknown:
             raise ValueError(f"Unknown terminal task settings: {sorted(unknown)}")
         self._harbor_cfg = OmegaConf.to_container(terminal_bench_cfg.get("harbor", OmegaConf.create({})), resolve=True)
@@ -497,19 +494,7 @@ class HarborConfigBuilder:
 
         return ErrorHandlingConfig.from_mapping(config)
 
-    def get_eval_timeout_override_sec(self, default: int = 900) -> int:
-        """
-        Get the timeout override for evaluation runs.
-
-        Args:
-            default: Default timeout if not specified in config.
-
-        Returns:
-            Timeout in seconds for eval runs.
-        """
-        mapping = EVAL_SCHEMA.fields.get("eval_timeout_override_sec")
-        if mapping:
-            value = self._get_field_value("eval_timeout_override_sec", mapping)
-            if value is not None:
-                return int(value)
-        return default
+    def get_eval_timeout_override_sec(self) -> int | None:
+        """Return the eval override, preserving explicit null as no override."""
+        value = self._get_field_value("eval_timeout_override_sec", EVAL_SCHEMA.fields["eval_timeout_override_sec"])
+        return None if value is None else int(value)

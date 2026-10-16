@@ -6,7 +6,6 @@ import ray
 import torch
 from finestore.rl import mismatch_probe as mismatch
 from omegaconf import OmegaConf
-from skyrl_train.metric_names import TOKEN_PROVENANCE_RECONSTRUCTED_FRACTION_METRIC
 from tokenizers import Tokenizer, models
 from transformers import PreTrainedTokenizerFast
 
@@ -118,6 +117,7 @@ async def test_reuse_reads_completed_frozen_tokens_and_generation_scores(tmp_pat
     trainer.critic_model = trainer.ref_model = None
     trainer.all_metrics = {}
     trainer._num_experts_cache = 8
+    trainer.global_step = 7
     routes = np.asarray([[[1, 2]], [[0, 0]], [[1, 2]], [[0, 0]]], dtype=np.int32)
     trajectory = {
         "prompt_token_ids": [[3, 4], [5], [6, 7, 8]],
@@ -126,6 +126,8 @@ async def test_reuse_reads_completed_frozen_tokens_and_generation_scores(tmp_pat
         "loss_masks": [[1] * 4 for _ in range(3)],
         "rollout_logprobs": [np.asarray([-0.125, -2.75, -1.5, -0.5], dtype=np.float32) for _ in range(3)],
         "rollout_routed_experts": [routes.copy() for _ in range(3)],
+        # The probe samples after the initial sync installs the next step, ahead of the trainer's step.
+        "rollout_policy_steps": [np.full(4, 8, dtype=np.int32) for _ in range(3)],
     }
     prompt_ids = [f"prompt-{i}" for i in range(3)]
     sample_ids = [f"sample-{i}" for i in range(3)]
@@ -193,7 +195,6 @@ async def test_reuse_reads_completed_frozen_tokens_and_generation_scores(tmp_pat
     cfg.trainer.mismatch_probe.archive_uri = str(tmp_path / "reused")
     cfg.trainer.mismatch_probe.updates = 2
     trainer.total_training_steps = 9
-    trainer.global_step = 7
     trainer.colocate_all = False
     trainer.all_timings = {}
     cfg.trainer.mismatch_probe.enabled = True
@@ -224,30 +225,3 @@ async def test_reuse_reads_completed_frozen_tokens_and_generation_scores(tmp_pat
     rejected = CallbackHandler(create_default_callbacks(cfg))
     with pytest.raises(ValueError, match="starting checkpoint, step or runtime differs"):
         await rejected.call_event_async("on_train_begin", TrainerState(7, 0, 9, 9), TrainerControl(), trainer=trainer)
-
-    class ValidationPrompts:
-        def __len__(self):
-            return 3
-
-        def __getitem__(self, index):
-            return {"uid": f"prompt-{index}", "prompt": [], "env_class": None, "env_extras": {}}
-
-        def collate_fn(self, prompts):
-            return prompts
-
-    class Runner:
-        async def start_eval_session(self, **kwargs):
-            pass
-
-        async def stop_eval_session(self):
-            pass
-
-        async def run(self, request):
-            batch = {key: value[:1] for key, value in trajectory.items()}
-            batch["rollout_metrics"] = {TOKEN_PROVENANCE_RECONSTRUCTED_FRACTION_METRIC: 1.0}
-            return batch
-
-    trainer.eval_dataset = ValidationPrompts()
-    trainer.trajectory_runner = Runner()
-    with pytest.raises(ValueError, match="rejects re-tokenized responses"):
-        await collector._generate(trainer)

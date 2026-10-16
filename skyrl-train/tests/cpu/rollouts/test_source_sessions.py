@@ -1,65 +1,145 @@
 from dataclasses import replace
+from taskcompendium.submission import conversation_messages
+
 import json
 import shutil
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
+import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from daytona import AsyncDaytona, CreateSandboxFromSnapshotParams, DaytonaConfig, DaytonaRateLimitError
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from omegaconf import OmegaConf
 from skyrl_gym.verification import VerificationStatus
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
-from shellbox.machine import ExitReason, Result, ShellSimBuiltins, UnsupportedMachineSpec
+from shellbox.machine import Backend, ExitReason, Result, PackageSpec, UnsupportedMachineSpec
 from taskcompendium.models import Source
+from taskcompendium.grader import verifyit_package
+from verifyit.spec import JudgeSpec
 from skyrl_train.rollouts.task_projections import StepTaskProjection, WholeTaskProjection
 from skyrl_train.dataset.tasks import SourceTaskDataset, source_row_task
 from skyrl_train.dataset.nemotron_ultra import NemotronTaskDataset
-from skyrl_train.trajectory_runners.projections import StepWiseTrajectoryProjection, WholeTrajectoryProjection
 from skyrl_train.rollouts.buffer import RolloutLease, RolloutTask
-from skyrl_train.rollouts.task_worker import TaskRolloutWorker
+from skyrl_train.rollouts.task_worker import RemoteJudgeSettings, TaskRolloutWorker, TaskRolloutWorkerSpec
+from skyrl_train.rollouts.workers import WorkerShard
 from skyrl_train.rollouts.harbor_tasks import HarborTaskSettings
 from skyrl_gym.source_task import source_task
 from skyrl_train.config.utils import get_default_config
-from tests.cpu.task_specs import lowered_task, machine_runtime, session_spec
+from skyrl_train.curriculum import dataset_bins
+from tests.cpu.task_specs import NATIVE_ENVIRONMENT, lowered_task, machine_runtime, session_spec, task_input
 from skyrl_train.trajectory_runners.types import TrajectoryID
+from skyrl_train.trajectory_runners.trajectory_processing import prepare_trajectory_request, validate_trajectory_batch
 from skyrl_train.trajectory_runners.model_clients import DirectModelClient, ModelServerError
 from skyrl_train.rollout_observability import observe_rollout_call
-from tests.cpu.rollouts.engine_fakes import ConversationClient, InferenceClient, Tokenizer, Writer
+from tests.cpu.rollouts.engine_fakes import ConversationClient, FixtureImageFactory, InferenceClient, Tokenizer, Writer
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "projection_type,expected_rewards",
-    [(WholeTaskProjection, [[0.0, 0.0], [0.0, 1.0]]), (StepTaskProjection, [[0.0, 0.0], 1.0])],
-)
+async def test_native_daytona_worker_uses_explicit_account_at_http_boundary(monkeypatch):
+    received = []
+
+    async def inventory(request):
+        received.append(request.headers["Authorization"])
+        return web.json_response({"items": [], "nextCursor": None})
+
+    app = web.Application()
+    app.router.add_get("/{path:.*}", inventory)
+    monkeypatch.setenv("TEST_NATIVE_DAYTONA_KEY", "native-training-key")
+    monkeypatch.setenv("DAYTONA_API_KEY", "wrong-ambient-key")
+    config = get_default_config()
+    config.environment.task_sessions.daytona = {"api_key_env": "TEST_NATIVE_DAYTONA_KEY", "ttl_minutes": 60}
+    async with TestServer(app) as server:
+        monkeypatch.setenv("DAYTONA_API_URL", str(server.make_url("")).rstrip("/"))
+        worker = TaskRolloutWorkerSpec.from_config(config, []).build(Tokenizer(), WorkerShard(0, 1))
+        try:
+            async with worker.factories[Backend.DAYTONA].factory.client_factory() as client:
+                assert [sandbox async for sandbox in client.list()] == []
+        finally:
+            await worker.shutdown()
+    assert received == ["Bearer native-training-key"]
+    assert "native-training-key" not in OmegaConf.to_yaml(config)
+
+
+@pytest.mark.asyncio
+async def test_worker_remote_judge_uses_runtime_secret_and_emits_training_reward(task_inputs, monkeypatch):
+    config, request = task_inputs
+    task = request.rows[0].lowered
+    grader = verifyit_package(
+        JudgeSpec(
+            rubric="labels",
+            model="fixture-judge",
+            references=("12",),
+            system_prompt="Grade the answer",
+            prompt_template="{reference}\n{candidate}",
+            label_scores={"PASS": 1.0, "FAIL": 0.0},
+        ),
+        environment=NATIVE_ENVIRONMENT,
+    ).grader
+    task = lowered_task(task.task.model_copy(update={"grader": grader}), verifier_backend="docker")
+    request = replace(request, rows=(replace(request.rows[0], lowered=task),))
+    monkeypatch.setenv("TEST_ROLLOUT_JUDGE_KEY", "worker-only-secret")
+    settings = RemoteJudgeSettings("https://judge.invalid/v1", "TEST_ROLLOUT_JUDGE_KEY")
+    observed = []
+
+    def send(client, outbound, **kwargs):
+        observed.append(outbound)
+        return httpx.Response(
+            200,
+            request=outbound,
+            json={
+                "id": "judge",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "fixture-judge",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "PASS"}, "finish_reason": "stop"}],
+            },
+        )
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    worker = TaskRolloutWorker(
+        config,
+        WholeTaskProjection(config, Tokenizer()),
+        InferenceClient(),
+        {"docker": FixtureImageFactory()},
+        shutdown_timeout=30,
+        judge_connection=settings.connection(),
+    )
+    writer = Writer()
+    try:
+        await worker.run_task(RolloutTask(RolloutLease("judge", 0, 1), {"uid": task.task.id}, request), writer)
+    finally:
+        await worker.shutdown()
+    batch = writer.groups[0][1].trajectory_batch
+    assert batch["rewards"] == [1.0]
+    assert batch["loss_masks"] == [[1, 1]]
+    assert observed[0].headers["authorization"] == "Bearer worker-only-secret"
+    assert "worker-only-secret" not in repr(request)
+    assert "worker-only-secret" not in repr(settings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
 @pytest.mark.parametrize("session", ["nupa", "reasoning_gym"])
-async def test_corrupt_source_task_is_masked_without_losing_its_graded_peer(
-    task_inputs, projection_type, expected_rewards, session
-):
+async def test_corrupt_source_task_is_masked_without_losing_its_graded_peer(task_inputs, projection_type, session):
     config, original = task_inputs
     failed = source_task(
-        original["prompts"][0],
+        conversation_messages(original.rows[0].lowered.task.context.events),
         {"reward_spec": {"ground_truth": "not JSON"}, "reward_model": {"ground_truth": "not JSON"}},
         {},
         Source(dataset="corrupt", revision="1", row="0", importer_revision="1"),
     )
-    request = {
-        **original,
-        "prompts": original["prompts"] * 2,
-        "env_classes": [session, "taskcompendium"],
-        "env_extras": [
-            {"lowered_task_spec": lowered_task(failed, session).model_dump_json(), "teacher_route": "corrupt"},
-            original["env_extras"][0],
-        ],
-        "trajectory_ids": [TrajectoryID("corrupt", 0), TrajectoryID("arithmetic", 0)],
-    }
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
+    request = replace(
+        original,
+        rows=(task_input(lowered_task(failed, session), teacher_route="corrupt"), original.rows[0]),
+        trajectory_ids=(TrajectoryID("corrupt", 0), TrajectoryID("arithmetic", 0)),
+    )
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         InferenceClient(),
         {},
         shutdown_timeout=30,
@@ -70,11 +150,12 @@ async def test_corrupt_source_task_is_masked_without_losing_its_graded_peer(
     finally:
         await worker.shutdown()
     batch = writer.groups[0][1].trajectory_batch
+    validate_trajectory_batch(2, batch)
     assert len(writer.groups) == 1
     assert batch["response_ids"] == [[3, 4], [3, 4]]
     assert batch["loss_masks"] == [[0, 0], [1, 1]]
     assert batch["exclude_from_baseline"] == [True, False]
-    assert batch["rewards"] == expected_rewards
+    assert batch["rewards"] == [[0.0, 0.0], [0.0, 1.0]]
     assert batch["exception_types"] == ["VerifierRuntimeError", None]
     assert [result.status for result in batch["verification_results"]] == [
         VerificationStatus.ERROR,
@@ -163,8 +244,13 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
             return output
 
     class ImageFactory:
+        backend = Backend.DOCKER
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
-            return await ShellSimMachineFactory().create(replace(spec, source=ShellSimBuiltins(), cpus=None))
+            return await ShellSimMachineFactory().create(replace(spec, source=PackageSpec(), cpus=None))
 
     settings = HarborTaskSettings.from_config(
         OmegaConf.create(
@@ -185,18 +271,14 @@ async def test_mixed_nemotron_tasks_run_without_the_original_sources(
     )
     config, request = task_inputs
     config.error_handling = {"enable_error_classification": True, "default_error_treatment": "mask"}
-    request.update(
-        prompts=list(prompts),
-        env_classes=list(environments),
-        env_extras=list(extras),
-        trajectory_ids=[TrajectoryID(uid, 0) for uid in uids],
+    request = replace(
+        request,
+        rows=tuple(row["input"] for row in prepared.collate_fn(list(prepared))),
+        trajectory_ids=tuple(TrajectoryID(uid, 0) for uid in uids),
     )
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
     worker = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         MixedClient(),
         {"harbor": ImageFactory()},
         harbor=settings,
@@ -241,7 +323,7 @@ async def test_source_tasks_run_without_the_original_dataset(tmp_path, task_inpu
                     "reward_spec": {"ground_truth": "12"},
                     "teacher_route": "math",
                     "data_source": "arithmetic",
-                    "extra_info": {"grade": 3},
+                    "extra_info": {"data_source": "arithmetic", "grade": 3},
                 }
             ]
         ),
@@ -258,31 +340,27 @@ async def test_source_tasks_run_without_the_original_dataset(tmp_path, task_inpu
         num_workers=1,
     )
     source.unlink()
-    prompt, env, extras, uid = prepared[0]
+    bins = dataset_bins(prepared)
+    assert bins.names == ["arithmetic"]
+    np.testing.assert_array_equal(bins.grades, [3])
+    row = prepared.collate_fn([prepared[0]])[0]
+    uid = row["uid"]
     config, _ = task_inputs
     client = ConversationClient(["#### 12"])
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         client,
         {},
         shutdown_timeout=30,
     )
-    request = {
-        "prompts": [prompt],
-        "env_classes": [env],
-        "env_extras": [extras],
-        "trajectory_ids": [TrajectoryID(uid, 0)],
-        "sampling_params": None,
-        "batch_metadata": None,
-    }
+    request, _ = prepare_trajectory_request([row], 1, {}, "train", 0)
     writer = Writer()
     await worker.run_task(RolloutTask(RolloutLease("lease", 0, 1), {"uid": uid}, request), writer)
     batch = writer.groups[0][1].trajectory_batch
     assert batch["unshaped_rewards"] == [1.0]
     assert batch["teacher_route_keys"] == ["math"]
     assert batch["data_sources"] == ["arithmetic"]
-    assert extras["extra_info"] == {"grade": 3}
     assert "ground_truth" not in json.dumps(client.requests[0]["prompts"])
     assert batch["response_ids"] == [[3, 4]]
     np.testing.assert_allclose(batch["rollout_logprobs"], [[-0.1, -0.2]])
@@ -307,7 +385,11 @@ async def test_source_tasks_run_without_the_original_dataset(tmp_path, task_inpu
 async def test_unified_gym_tasks_preserve_grading_and_turn_credit(task_inputs, environment, extras, responses, rewards):
     config, request = task_inputs
     task = source_row_task(
-        {"prompt": request["prompts"][0], "env_class": environment, **extras},
+        {
+            "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
+            "env_class": environment,
+            **extras,
+        },
         0,
         source_name="fixture",
         environment_configs={
@@ -315,12 +397,11 @@ async def test_unified_gym_tasks_preserve_grading_and_turn_credit(task_inputs, e
             "session": session_spec().model_dump(exclude={"task_session"}),
         },
     )
-    request["env_extras"] = [{"lowered_task_spec": task.model_dump_json()}]
-    request["env_classes"] = [environment]
+    request = replace(request, rows=(task_input(task),))
     model = ConversationClient(responses)
     runner = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         model,
         {},
         shutdown_timeout=30,
@@ -358,7 +439,7 @@ async def test_source_row_turn_limit_controls_correction_and_terminal_grade(
     config, request = task_inputs
     task = source_row_task(
         {
-            "prompt": request["prompts"][0],
+            "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
             "env_class": "gsm8k_multi_turn",
             "reward_spec": {"ground_truth": "12"},
             **row_limits,
@@ -370,12 +451,9 @@ async def test_source_row_turn_limit_controls_correction_and_terminal_grade(
             "gsm8k_multi_turn": session_config,
         },
     )
-    request["env_extras"] = [{"lowered_task_spec": task.model_dump_json()}]
-    request["env_classes"] = ["gsm8k_multi_turn"]
+    request = replace(request, rows=(task_input(task),))
     model = ConversationClient(["#### 13", "#### 12"])
-    worker = TaskRolloutWorker(
-        config, WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())), model, {}, shutdown_timeout=30
-    )
+    worker = TaskRolloutWorker(config, WholeTaskProjection(config, Tokenizer()), model, {}, shutdown_timeout=30)
     batch = await worker.run(request)
     assert len(model.requests) == turns
     assert batch["unshaped_rewards"] == [float(turns == 2)]
@@ -387,17 +465,14 @@ async def test_source_row_turn_limit_controls_correction_and_terminal_grade(
 async def test_materialized_turn_limit_precedes_source_row_metadata(task_inputs):
     config, request = task_inputs
     task = source_task(
-        request["prompts"][0],
+        conversation_messages(request.rows[0].lowered.task.context.events),
         {"reward_spec": {"ground_truth": "12"}, "max_turns": 1},
         {},
         Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
     )
-    request["env_extras"] = [{"lowered_task_spec": lowered_task(task, "gsm8k_multi_turn").model_dump_json()}]
-    request["env_classes"] = ["gsm8k_multi_turn"]
+    request = replace(request, rows=(task_input(lowered_task(task, "gsm8k_multi_turn")),))
     model = ConversationClient(["#### 13", "#### 12"])
-    worker = TaskRolloutWorker(
-        config, WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())), model, {}, shutdown_timeout=30
-    )
+    worker = TaskRolloutWorker(config, WholeTaskProjection(config, Tokenizer()), model, {}, shutdown_timeout=30)
     batch = await worker.run(request)
     assert len(model.requests) == 2
     assert batch["unshaped_rewards"] == [1.0]
@@ -413,14 +488,13 @@ async def test_aime_rollout_preserves_length_reward_and_phase_metrics(
     config, request = task_inputs
     config.chat_template_kwargs = {"enable_thinking": enable_thinking}
     task = source_task(
-        request["prompts"][0],
+        conversation_messages(request.rows[0].lowered.task.context.events),
         extras={reward_key: {"ground_truth": "12"}},
         config={"length_penalty_weight": 1.0, "min_response_length": 0, "evaluation_token_budget": 1},
         source=Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
     )
-    request["env_extras"] = [{"lowered_task_spec": lowered_task(task, "aime").model_dump_json()}]
-    request["sampling_params"] = {"max_tokens": 4, "logprobs": 0}
-    request["env_classes"] = ["aime"]
+    request = replace(request, rows=(task_input(lowered_task(task, "aime")),))
+    request = replace(request, sampling_params={"max_tokens": 4, "logprobs": 0})
     engine = AsyncMock()
     engine.model_name = "fixture"
     engine.tokenizer = MagicMock()
@@ -449,7 +523,7 @@ async def test_aime_rollout_preserves_length_reward_and_phase_metrics(
     engine.chat_completion.side_effect = serve
     runner = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         DirectModelClient(engine),
         {},
         max_verifier_workers=1,
@@ -503,15 +577,14 @@ async def test_context_limits_preserve_only_completed_gym_turns(
     config.max_input_length = max_input_length
     config.engine_init_kwargs = {"max_model_len": max_model_len}
     config.sampling_params.logprobs = 0
-    request["sampling_params"] = None if output_limit is None else {"max_tokens": output_limit}
+    request = replace(request, sampling_params=None if output_limit is None else {"max_tokens": output_limit})
     task = source_task(
-        request["prompts"][0],
+        conversation_messages(request.rows[0].lowered.task.context.events),
         {"reward_spec": {"ground_truth": "12"}},
         {},
         Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
     )
-    request["env_extras"] = [{"lowered_task_spec": lowered_task(task, "gsm8k_multi_turn").model_dump_json()}]
-    request["env_classes"] = ["gsm8k_multi_turn"]
+    request = replace(request, rows=(task_input(lowered_task(task, "gsm8k_multi_turn")),))
     engine = AsyncMock()
     engine.model_name = "fixture"
     engine.tokenizer = MagicMock()
@@ -542,10 +615,9 @@ async def test_context_limits_preserve_only_completed_gym_turns(
 
     engine.tokenize.side_effect = tokenize
     engine.chat_completion.side_effect = serve
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
-    worker = TaskRolloutWorker(config, projection_type(projection), DirectModelClient(engine), {}, shutdown_timeout=30)
+    worker = TaskRolloutWorker(
+        config, projection_type(config, Tokenizer()), DirectModelClient(engine), {}, shutdown_timeout=30
+    )
     writer = Writer()
     await worker.run_task(RolloutTask(RolloutLease("lease", 0, 1), {"uid": task.id}, request), writer)
     batch = writer.groups[0][1].trajectory_batch
@@ -581,21 +653,19 @@ async def test_lean_refinement_discards_the_failed_attempt(task_inputs, task_mac
         }
     }
     task = source_task(
-        request["prompts"][0],
+        conversation_messages(request.rows[0].lowered.task.context.events),
         extras,
         {},
         Source(dataset="fixture", revision="1", row="0", importer_revision="1"),
+        environment=NATIVE_ENVIRONMENT,
     )
-    request["env_extras"] = [
-        {"lowered_task_spec": lowered_task(task, "nemotron_ultra", backend="shellsim").model_dump_json()}
-    ]
-    request["env_classes"] = ["nemotron_ultra"]
+    request = replace(request, rows=(task_input(lowered_task(task, "nemotron_ultra", backend="docker")),))
     client = ConversationClient(["", "by rfl"])
     runner = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         client,
-        {"shellsim": task_machine},
+        {"docker": task_machine},
         shutdown_timeout=30,
     )
     batch = await runner.run(request)
@@ -611,8 +681,12 @@ def task_machine():
     """Supply compiler and interpreter I/O for the training-projection tests."""
 
     class Machine:
+        backend = Backend.DOCKER
         closed = False
         output = "4"
+
+        def check_environment(self, _requirements, _spec):
+            pass
 
         async def create(self, spec):
             self.output = spec.env.get("PYTHON_OUTPUT", "4")
@@ -657,13 +731,13 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
     config, request = task_inputs
     environment = {
         "machine": {
-            "requirements": {"environment_variables": {"PYTHON_OUTPUT": "4"}},
-            "runtime": machine_runtime("shellsim").model_dump(),
+            "requirements": {**NATIVE_ENVIRONMENT.model_dump(), "environment_variables": {"PYTHON_OUTPUT": "4"}},
+            "runtime": machine_runtime("docker").model_dump(),
         },
         "machines": {
             "ns_tools_simple_agent": {
-                "requirements": {"environment_variables": {"PYTHON_OUTPUT": "7"}},
-                "runtime": machine_runtime("shellsim").model_dump(),
+                "requirements": {**NATIVE_ENVIRONMENT.model_dump(), "environment_variables": {"PYTHON_OUTPUT": "7"}},
+                "runtime": machine_runtime("docker").model_dump(),
             }
         }
         if per_agent
@@ -671,7 +745,7 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
     }
     expected = "7" if per_agent else "4"
     row = {
-        "prompt": request["prompts"][0],
+        "prompt": conversation_messages(request.rows[0].lowered.task.context.events),
         "env_class": "nemotron_ultra",
         "extra_info": {
             "nemotron_ultra": {
@@ -691,8 +765,7 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
             "nemotron_ultra": environment,
         },
     )
-    request["env_extras"] = [{"lowered_task_spec": task.model_dump_json()}]
-    request["env_classes"] = ["nemotron_ultra"]
+    request = replace(request, rows=(task_input(task),))
     message = {
         "role": "assistant",
         "tool_calls": [
@@ -702,9 +775,9 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
     model = ConversationClient(["", expected], messages=[message, {"role": "assistant", "content": expected}])
     worker = TaskRolloutWorker(
         config,
-        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        WholeTaskProjection(config, Tokenizer()),
         model,
-        {"shellsim": task_machine},
+        {"docker": task_machine},
         shutdown_timeout=30,
     )
     try:
@@ -725,20 +798,73 @@ async def test_source_machine_selection_controls_tool_results(task_inputs, task_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
 @pytest.mark.parametrize(
-    "session,operation,cause_type",
+    "session,operation,cause_type,provider_call",
     [
-        ("searchcode", "prepare", "RuntimeError"),
-        ("nemotron_ultra", "prepare", "RuntimeError"),
-        ("searchcode", "start", "UnsupportedMachineSpec"),
-        ("searchcode", "start", "RuntimeError"),
+        ("searchcode", "prepare", "RuntimeError", None),
+        ("nemotron_ultra", "prepare", "RuntimeError", None),
+        ("searchcode", "start", "UnsupportedMachineSpec", None),
+        ("searchcode", "start", "RuntimeError", None),
+        ("searchcode", "start", "DaytonaRateLimitError", "snapshot"),
+        ("searchcode", "start", "DaytonaRateLimitError", "create_sandbox"),
+        ("searchcode", "start", "DaytonaRateLimitError", "get_toolbox_proxy_url"),
     ],
 )
 async def test_python_startup_failure_is_masked_without_losing_its_graded_peer(
-    task_inputs, task_machine, projection_type, session, operation, cause_type
+    task_inputs, task_machine, projection_type, session, operation, cause_type, provider_call
 ):
     if operation == "start":
-        startup_error = UnsupportedMachineSpec if cause_type == "UnsupportedMachineSpec" else RuntimeError
-        task_machine.create = AsyncMock(side_effect=startup_error("The task provider did not start the machine"))
+        if cause_type == "DaytonaRateLimitError":
+
+            async def rate_limit(request):
+                if request.method == "POST" and provider_call == "get_toolbox_proxy_url":
+                    return web.json_response(
+                        {
+                            "id": "fixture",
+                            "organizationId": "fixture",
+                            "name": "fixture",
+                            "user": "root",
+                            "env": {},
+                            "labels": {},
+                            "public": False,
+                            "networkBlockAll": False,
+                            "target": "us",
+                            "cpu": 2,
+                            "gpu": 0,
+                            "memory": 4,
+                            "disk": 10,
+                            "state": "started",
+                            "toolboxProxyUrl": "",
+                        }
+                    )
+                return web.json_response(
+                    {"message": "secret response body", "code": "secret-code"},
+                    status=429,
+                    headers={
+                        "X-Private-Header": "secret-key",
+                        "X-RateLimit-Limit-sandbox-create": "300",
+                        "X-RateLimit-Remaining-sandbox-create": "0",
+                        "Retry-After-sandbox-create": "17",
+                        "X-RateLimit-Reset-sandbox-create": "secret-key",
+                        "Retry-After-authenticated": "-1",
+                    },
+                )
+
+            app = web.Application()
+            app.router.add_route("*", "/{path:.*}", rate_limit)
+            async with TestServer(app) as server:
+                async with AsyncDaytona(
+                    DaytonaConfig(api_key="secret-key", api_url=str(server.make_url("")).rstrip("/"))
+                ) as client:
+                    with pytest.raises(DaytonaRateLimitError) as provider_failure:
+                        if provider_call == "snapshot":
+                            await client.snapshot.get("fixture")
+                        else:
+                            await client.create(CreateSandboxFromSnapshotParams(snapshot="fixture"))
+            startup_error = provider_failure.value
+        else:
+            startup_error_type = UnsupportedMachineSpec if cause_type == "UnsupportedMachineSpec" else RuntimeError
+            startup_error = startup_error_type("The task provider did not start the machine")
+        task_machine.create = AsyncMock(side_effect=startup_error)
     task_machine.run = AsyncMock(
         return_value=Result(1, b"", b"ModuleNotFoundError: No module named 'IPython'", False, False, ExitReason.EXITED)
     )
@@ -759,29 +885,22 @@ async def test_python_startup_failure_is_masked_without_losing_its_graded_peer(
         }
     )
     failed = source_task(
-        original["prompts"][0],
+        conversation_messages(original.rows[0].lowered.task.context.events),
         extras,
         {},
         Source(dataset="python-startup", revision="1", row="0", importer_revision="1"),
+        environment=NATIVE_ENVIRONMENT,
     )
-    request = {
-        **original,
-        "prompts": original["prompts"] * 2,
-        "env_classes": [session, "taskcompendium"],
-        "env_extras": [
-            {
-                "lowered_task_spec": lowered_task(failed, session, backend="shellsim").model_dump_json(),
-                "teacher_route": "python-startup",
-            },
-            original["env_extras"][0],
-        ],
-        "trajectory_ids": [TrajectoryID(failed.id, 0), TrajectoryID("arithmetic", 0)],
-    }
-    projection = (
-        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
-    )(config, Tokenizer())
+    request = replace(
+        original,
+        rows=(
+            task_input(lowered_task(failed, session, backend="docker"), teacher_route="python-startup"),
+            original.rows[0],
+        ),
+        trajectory_ids=(TrajectoryID(failed.id, 0), TrajectoryID("arithmetic", 0)),
+    )
     worker = TaskRolloutWorker(
-        config, projection_type(projection), InferenceClient(), {"shellsim": task_machine}, shutdown_timeout=30
+        config, projection_type(config, Tokenizer()), InferenceClient(), {"docker": task_machine}, shutdown_timeout=30
     )
     writer = Writer()
     try:
@@ -793,7 +912,9 @@ async def test_python_startup_failure_is_masked_without_losing_its_graded_peer(
     assert batch["loss_masks"] == [[0], [1, 1]]
     assert batch["exclude_from_baseline"] == [True, False]
     assert batch["exception_types"] == [
-        "TaskMachineError" if operation == "start" and cause_type == "RuntimeError" else "VerifierRuntimeError",
+        "TaskMachineError"
+        if operation == "start" and cause_type in {"RuntimeError", "DaytonaRateLimitError"}
+        else "VerifierRuntimeError",
         None,
     ]
     assert batch["error_treatments"] == ["mask", None]
@@ -802,6 +923,21 @@ async def test_python_startup_failure_is_masked_without_losing_its_graded_peer(
     assert failed_result.status is VerificationStatus.ERROR
     assert failed_result.diagnostics["operation"] == operation
     assert failed_result.diagnostics["cause_error_type"] == cause_type
+    if cause_type == "DaytonaRateLimitError":
+        assert failed_result.diagnostics["machine_operation"] == "create"
+        assert failed_result.diagnostics["provider_status_code"] == 429
+        expected_call = (
+            "daytona._async.snapshot.get"
+            if provider_call == "snapshot"
+            else f"daytona_api_client_async.api.sandbox_api.{provider_call}"
+        )
+        assert failed_result.diagnostics["provider_sdk_call"] == expected_call
+        assert failed_result.diagnostics["provider_rate_limits"] == {
+            "x-ratelimit-limit-sandbox-create": 300,
+            "x-ratelimit-remaining-sandbox-create": 0,
+            "retry-after-sandbox-create": 17,
+        }
+        assert "secret" not in json.dumps(failed_result.diagnostics)
     assert peer_result.status is VerificationStatus.VERIFIED
     assert peer_result.score == 1.0
     if operation == "prepare":
@@ -814,18 +950,14 @@ async def test_python_tool_observations_preserve_training_and_release_session(
     python_tool_task, task_inputs, task_machine, projection_type
 ):
     config, request = task_inputs
-    _, message = python_tool_task
+    task, message = python_tool_task
+    request = replace(request, rows=(task_input(task),))
     model = ConversationClient(["", "4"], messages=[message, {"role": "assistant", "content": "4"}])
-    projection = (
-        WholeTrajectoryProjection(config, Tokenizer())
-        if projection_type is WholeTaskProjection
-        else StepWiseTrajectoryProjection(config, Tokenizer())
-    )
     runner = TaskRolloutWorker(
         config,
-        projection_type(projection),
+        projection_type(config, Tokenizer()),
         model,
-        {"shellsim": task_machine},
+        {"docker": task_machine},
         shutdown_timeout=30,
     )
     batch = await runner.run(request)

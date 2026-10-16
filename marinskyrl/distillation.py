@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from omegaconf import DictConfig, OmegaConf
 from rigging.secrets import is_secret_reference
 
-from marinskyrl.runtime_options import PolicyLossType
+from marinskyrl.runtime_options import ftpo_requested
 
 
 class DistillationObjectiveKind(StrEnum):
@@ -731,7 +731,7 @@ def validate_generation_logprobs(cfg: DictConfig) -> None:
     centering_width = algorithm.get("score_centering_topk", 0)
     if centering_width and logprobs != centering_width:
         raise ValueError("score centering requires sampling_params.logprobs matching score_centering_topk")
-    if logprobs > 0 and not centering_width and algorithm.get("policy_loss_type") != PolicyLossType.FTPO:
+    if logprobs > 0 and not centering_width and not ftpo_requested(algorithm):
         plan = compile_distillation_plan_from_config(cfg)
         widths = {teacher.top_k for teacher in plan.teachers} if plan is not None else set()
         if (

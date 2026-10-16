@@ -1,5 +1,7 @@
 # @package environment.task_sessions
 max_verifier_workers: 32 # verifier threads in each rollout worker
+remote_judge: null # Set base_url and api_key_env to grade judge tasks on the rollout host.
+daytona: null # Set api_key_env and ttl_minutes for tasks with the daytona backend.
 
 session:
   max_turns: ${generator.max_turns}
@@ -10,10 +12,12 @@ session:
   attempt_timeout: null
   verifier_timeout: null
   cleanup_timeout: ${trajectory_runner.cleanup_timeout}
+  max_total_tokens: null
 
 lcb:
   machine: &python_machine
     requirements:
+      command_semantics: linux_process
       docker_image: us-east1-docker.pkg.dev/hai-gcp-models/marin/nemo-skills-sandbox@sha256:280e0871b02f5dc935c1b3fdfbf75c394cceb087a0a284b13918aeb22e10b104
       working_directory: /workspace
     runtime: &python_runtime
@@ -64,6 +68,7 @@ nemotron_ultra:
     nvarc_inductive_simple_agent: *python_machine
     math_formal_lean_refinement_agent:
       requirements:
+        command_semantics: linux_process
         docker_image: us-east1-docker.pkg.dev/hai-gcp-models/marin/nemo-skills-sandbox@sha256:280e0871b02f5dc935c1b3fdfbf75c394cceb087a0a284b13918aeb22e10b104
         working_directory: /lean4/my_project
       runtime: *python_runtime

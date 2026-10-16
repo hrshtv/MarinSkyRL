@@ -10,7 +10,7 @@ from pathlib import Path
 import psutil
 import pytest
 import pytest_asyncio
-from rolloutengine.engine import ShellboxRolloutEngine
+from rolloutengine.engine import RolloutEngine
 from rolloutengine.spec import LoweredTaskSpec
 from skyrl_gym.source_task import source_task
 from taskcompendium.models import Source
@@ -118,7 +118,7 @@ async def test_openenv_actions_retain_server_state_and_turn_rewards(openenv_sess
     assert "counter: 1" in first.observations[0]["content"]
     final = await session.advance(model_turn(f"<action>{action}</action>"))
     assert final.done and final.reward == 0.75
-    assert (await session.grade(())).reward == 0.5
+    assert (await session.grade((), stop_reason="stop", outputs={})).reward == 0.5
     requests = [json.loads(line) for line in case.log.read_text().splitlines()]
     assert requests[0] == {"path": "/reset", "body": {}}
     assert requests[1] == {"path": "/step", "body": {"action": payload, "timeout_s": 30}}
@@ -153,7 +153,7 @@ async def test_openenv_server_failure_is_not_a_candidate_penalty(openenv_session
     await session.prepare()
     with pytest.raises(RuntimeError):
         await session.advance(model_turn(f"<action>{response}</action>"))
-    assert (await session.grade(())).reward is None
+    assert (await session.grade((), stop_reason="stop", outputs={})).reward is None
 
 
 @pytest.mark.asyncio
@@ -161,16 +161,21 @@ async def test_openenv_engine_preserves_tokens_and_releases_server(openenv_sessi
     case = openenv_session()
 
     class Factory:
+        backend = "docker"
+
+        def check_environment(self, _requirements, _spec):
+            pass
+
         async def create(self, spec):
             return machine
 
     async def model(request):
         return model_turn("<action>done</action>")
 
-    engine = ShellboxRolloutEngine(
+    engine = RolloutEngine(
         factories={"local": Factory()},
         model=model,
-        sessions={"openenv": lambda task, machine: case.session},
+        sessions={"openenv": lambda _context: case.session},
     )
     rollout = await engine.run(case.task)
     assert rollout.grade.reward == 0.25
@@ -196,7 +201,12 @@ async def test_openenv_cancellation_releases_server_and_http_command(openenv_ses
         await pending
     assert machine.closed
     async with asyncio.timeout(5.0):
-        while psutil.pid_exists(server_pid) and psutil.Process(server_pid).status() != psutil.STATUS_ZOMBIE:
+        while True:
+            try:
+                if psutil.Process(server_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
             await asyncio.sleep(0)
     await session.close()
 
@@ -206,4 +216,4 @@ async def test_openenv_failed_server_startup_releases_process(openenv_session):
     session = openenv_session(command=[sys.executable, "-c", "raise SystemExit(3)"]).session
     with pytest.raises(RuntimeError):
         await session.prepare()
-    assert (await session.grade(())).reward is None
+    assert (await session.grade((), stop_reason="stop", outputs={})).reward is None

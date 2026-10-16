@@ -2,16 +2,32 @@
 
 import asyncio
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 from loguru import logger
-from shellbox.machine import Backend, Command, Machine, MachineFactory, MachineSpec, Result
+from shellbox.machine import Backend, Command, ExecutionRequirements, Machine, MachineFactory, MachineSpec, Result
 
 _PASSTHROUGH_ERRORS = (TypeError, ValueError, AttributeError, LookupError, AssertionError)
 
 
+class MachineOperation(StrEnum):
+    CREATE = "create"
+    RUN = "run"
+    UPLOAD = "upload"
+    DOWNLOAD = "download"
+    CLOSE = "close"
+
+
 class TaskMachineError(RuntimeError):
     """A task-machine provider operation failed."""
+
+    def __init__(self, message: str, operation: MachineOperation):
+        super().__init__(message, operation)
+        self.operation = operation
+
+    def __str__(self) -> str:
+        return self.args[0]
 
 
 @dataclass(eq=False)
@@ -26,7 +42,7 @@ class _OwnedMachine:
         except _PASSTHROUGH_ERRORS:
             raise
         except Exception as error:
-            raise TaskMachineError("Task-machine command failed") from error
+            raise TaskMachineError("Task-machine command failed", MachineOperation.RUN) from error
 
     async def upload(self, source: Path, target: str) -> None:
         try:
@@ -34,7 +50,7 @@ class _OwnedMachine:
         except _PASSTHROUGH_ERRORS:
             raise
         except Exception as error:
-            raise TaskMachineError("Task-machine upload failed") from error
+            raise TaskMachineError("Task-machine upload failed", MachineOperation.UPLOAD) from error
 
     async def download(self, source: str, target: Path) -> None:
         try:
@@ -42,7 +58,7 @@ class _OwnedMachine:
         except _PASSTHROUGH_ERRORS:
             raise
         except Exception as error:
-            raise TaskMachineError("Task-machine download failed") from error
+            raise TaskMachineError("Task-machine download failed", MachineOperation.DOWNLOAD) from error
 
     def begin_close(self) -> asyncio.Task[None]:
         if self.closing is None:
@@ -80,12 +96,15 @@ class OwnedMachineFactory:
     def backend(self) -> Backend:
         return self.factory.backend
 
+    def check_environment(self, requirements: ExecutionRequirements, spec: MachineSpec) -> None:
+        self.factory.check_environment(requirements, spec)
+
     def stop_creating(self) -> None:
         self.closing = True
 
     async def create(self, spec: MachineSpec) -> Machine:
         if self.closing:
-            raise TaskMachineError("The task-machine factory is closed")
+            raise TaskMachineError("The task-machine factory is closed", MachineOperation.CREATE)
         creation = asyncio.current_task()
         assert creation is not None
         self.creating.add(creation)
@@ -95,7 +114,7 @@ class OwnedMachineFactory:
             except (TimeoutError, *_PASSTHROUGH_ERRORS):
                 raise
             except Exception as error:
-                raise TaskMachineError("Task-machine creation failed") from error
+                raise TaskMachineError("Task-machine creation failed", MachineOperation.CREATE) from error
             owned = _OwnedMachine(machine, self)
             self.machines.add(owned)
             if self.closing:
@@ -117,7 +136,7 @@ class OwnedMachineFactory:
             if not task.done():
                 continue
             if task.cancelled():
-                failures.append(TaskMachineError("Task-machine provider close was cancelled"))
+                failures.append(TaskMachineError("Task-machine provider close was cancelled", MachineOperation.CLOSE))
             elif (error := task.exception()) is not None:
                 failures.append(error)
         if pending:

@@ -12,6 +12,7 @@ import numpy as np
 from skyrl_gym.envs.nemotron_ultra.answer_extraction import REASONING_DELIMITERS, final_answer_text
 
 from skyrl_train.inference_engines.base import (
+    CHOICE_POLICY_STEPS_KEY,
     SESSION_ID_HEADER,
     ChatContinuation,
     InferenceEngineInput,
@@ -87,6 +88,7 @@ class _ChatResult:
     assistant_message: dict[str, Any]
     generation_token_budget: int | None
     routed_experts: np.ndarray | None = None
+    policy_steps: list[int] | None = None
 
 
 def _choice_routed_experts(choice: dict[str, Any], prompt_ids: list[int], response_ids: list[int]) -> np.ndarray | None:
@@ -117,6 +119,8 @@ def _assemble_chat_results(results: list[_ChatResult]) -> ModelClientOutput:
         output["behavior_topk_logprobs"] = selected_scores
     if any(result.routed_experts is not None for result in results):
         output["routed_experts"] = [result.routed_experts for result in results]
+    if all(result.policy_steps is not None for result in results):
+        output["response_policy_steps"] = [result.policy_steps for result in results]
     return output
 
 
@@ -183,22 +187,10 @@ class DirectModelClient:
         return ModelClientOutput(**output, token_provenance=TokenProvenance.ENGINE)
 
     @staticmethod
-    def _chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        converted = []
-        for tool in tools:
-            if tool.get("type") != "function":
-                raise ValueError(f"Only function tools are supported, got {tool.get('type')!r}")
-            function = {key: value for key, value in tool.items() if key != "type"}
-            converted.append({"type": "function", "function": function})
-        return converted
-
-    @classmethod
-    def _chat_options(cls, options: dict[str, Any], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    def _chat_options(options: dict[str, Any], sampling_params: dict[str, Any]) -> dict[str, Any]:
         result = dict(options)
         result.pop("input", None)
-        if result.get("tools"):
-            result["tools"] = cls._chat_tools(result["tools"])
-        else:
+        if not result.get("tools"):
             result.pop("tools", None)
         if "max_output_tokens" in result:
             result["max_completion_tokens"] = result.pop("max_output_tokens")
@@ -258,7 +250,6 @@ class DirectModelClient:
                 "session_id": session_id,
                 **{key: value for key, value in sampling_params.items() if key not in _CHAT_SAMPLING_EXCLUSIONS},
                 **chat_options,
-                "return_token_ids": True,
                 "include_stop_str_in_output": True,
             }
             body[EXACT_PROMPT_TOKEN_IDS_KEY] = prompt_ids
@@ -307,6 +298,8 @@ class DirectModelClient:
             decoded = tokenizer.decode(semantic_ids, skip_special_tokens=False)
             if any(marker in decoded for pair in REASONING_DELIMITERS for marker in pair):
                 text = final_answer_text(decoded)
+                if not message.get("tool_calls"):
+                    message = {**message, "content": text}
             logprob_items = (choice.get("logprobs") or {}).get("content")
             response_logprobs = (
                 [float(item["logprob"]) for item in logprob_items] if logprob_items is not None else None
@@ -340,6 +333,7 @@ class DirectModelClient:
                 message,
                 token_budget,
                 _choice_routed_experts(choice, prompt_ids, response_ids),
+                choice.get(CHOICE_POLICY_STEPS_KEY),
             )
 
         results = await asyncio.gather(

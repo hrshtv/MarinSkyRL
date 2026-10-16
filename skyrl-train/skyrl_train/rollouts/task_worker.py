@@ -1,24 +1,29 @@
 """TaskCompendium execution and projection into SkyRL training batches."""
 
 import asyncio
+import math
+import os
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
-from pathlib import Path
-from typing import Any
+from functools import partial
+from typing import Any, Protocol
 from uuid import uuid4
 
 from jinja2 import TemplateError
-from harbor_config.models.environment_type import EnvironmentType
+from daytona import AsyncDaytona, DaytonaConfig, DaytonaError
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from shellbox.backends.docker.machine import DockerMachineFactory
+from shellbox.backends.daytona.machine import DaytonaMachineFactory
 from shellbox.backends.shellsim.machine import ShellSimMachineFactory
 from shellbox.machine import Backend, Machine, MachineFactory
 from taskcompendium.grading_result import Outcome
 from taskcompendium.models import NoGrader
+from verifyit.modes.grade_judge import JudgeConnection
+from rolloutengine.agent_session import AgentTaskSession
 from rolloutengine.contracts import (
     GenerationLimitReached,
     ModelRequest,
@@ -29,13 +34,16 @@ from rolloutengine.contracts import (
     RolloutInterrupted,
     RolloutOperation,
     TaskSession,
+    TaskSessionContext,
+    TaskSessionFactory,
+    SessionStart,
 )
-from rolloutengine.engine import ShellboxRolloutEngine
+from rolloutengine.engine import RolloutEngine
 from rolloutengine.spec import LoweredTaskSpec
 from rolloutengine.lowering import SHELLBOX_SESSION, validate_lowered_task
-from skyrl_train.dataset.tasks import LOWERED_TASK_COLUMN
 from skyrl_train.config.utils import generation_context_limit
-from skyrl_gym.task_factories import session_factories
+from skyrl_train.dataset.harbor_import import HARBOR_TRIAL_SESSION
+from skyrl_gym.task_factories import adapt_self_grading_session, session_factories
 from skyrl_gym.task_records import fold_grades, skipped_grade
 from skyrl_gym.verification import VERIFIER_RUNTIME_ERROR
 
@@ -43,14 +51,15 @@ from skyrl_train.inference_engines.base import ChatContinuation, InferenceEngine
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from skyrl_train.rollouts.buffer import RolloutTask, RolloutWriter, write_trajectory_batch
-from skyrl_train.rollouts.group_grader import GroupGraderSpec
 from skyrl_train.rollouts.group_grading import GROUP_GRADERS, GroupGrader, grade_groups
 from skyrl_train.rollouts.harbor_tasks import (
     HARBOR_MACHINE_BACKEND,
+    HARBOR_EVAL_MACHINE_BACKEND,
     HarborTaskSettings,
     harbor_grading_failure,
     shape_harbor_rollouts,
 )
+from skyrl_train.rollouts.harbor_settings import EnvironmentType
 from skyrl_train.rollouts.machines import OwnedMachineFactory, TaskMachineError
 from skyrl_train.rollouts.workers import WorkerShard, detached_config
 from skyrl_train.rollouts.finalization import finalize_trajectory_batch, propagate_data_sources
@@ -62,21 +71,72 @@ from skyrl_train.trajectory_runners.model_clients import (
     ModelClient,
     ModelServerError,
 )
-from skyrl_train.trajectory_runners.projections import (
-    StepWiseTrajectoryProjection,
-    WholeTrajectoryProjection,
-    logprobs_requested,
-)
 from skyrl_train.rollouts.task_projections import (
     StepTaskProjection,
     WholeTaskProjection,
+    logprobs_requested,
 )
 from skyrl_train.utils.harbor_errors import ErrorHandlingConfig
 from skyrl_train.trajectory_runners.types import (
+    RESPONSE_POLICY_STEPS_KEY,
+    ROUTED_EXPERTS_KEY,
     TokenProvenance,
     TrajectoryBatch,
-    TrajectoryRequestBatch,
+    TaskRequestBatch,
 )
+
+DAYTONA_DIAGNOSTIC_CALLS = frozenset(
+    {
+        ("daytona._async.daytona", "create"),
+        ("daytona._async.daytona", "_create"),
+        ("daytona._async.daytona", "delete"),
+        ("daytona._async.snapshot", "get"),
+        ("daytona._async.snapshot", "create"),
+        ("daytona._async.sandbox", "wait_for_sandbox_start"),
+        ("daytona._async.process", "exec"),
+        ("daytona._async.filesystem", "upload_file_stream"),
+        ("daytona._async.filesystem", "download_file"),
+        ("daytona_api_client_async.api.sandbox_api", "create_sandbox"),
+        ("daytona_api_client_async.api.sandbox_api", "get_toolbox_proxy_url"),
+        ("daytona_api_client_async.api.sandbox_api", "get_sandbox"),
+    }
+)
+DAYTONA_RATE_LIMIT_HEADERS = frozenset(
+    f"{prefix}-{throttler}"
+    for prefix in ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "retry-after")
+    for throttler in ("anonymous", "authenticated", "sandbox-create", "sandbox-lifecycle")
+) | {"retry-after"}
+
+
+class InstalledAgentWorker(Protocol):
+    async def startup(self) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
+    def original_session(
+        self, lowered: LoweredTaskSpec, session_id: str, settings: HarborTaskSettings, phase: str
+    ) -> TaskSession: ...
+
+    async def run(
+        self,
+        machine: Machine | None,
+        complete: Callable[[SessionStart], Awaitable[ModelTurn]],
+        *,
+        lowered: LoweredTaskSpec,
+        session_id: str,
+    ) -> None: ...
+
+
+SKYRL_AGENT_SESSION = "skyrl_agent"
+
+
+def _agent_session_factory(
+    runtime: InstalledAgentWorker,
+    session_id: str,
+    context: TaskSessionContext,
+) -> TaskSession:
+    runner = partial(runtime.run, context.machine, lowered=context.lowered, session_id=session_id)
+    return AgentTaskSession(runner, context.require_task_grader())
 
 
 async def _model_turn(
@@ -92,7 +152,7 @@ async def _model_turn(
     """Convert an inference response to the common exact-token record."""
     options = dict(request.options)
     template_kwargs = {**chat_template_kwargs, **options.get("chat_template_kwargs", {})}
-    if template_kwargs:
+    if template_kwargs and request.prompt_token_ids is None:
         options["chat_template_kwargs"] = template_kwargs
     continuation = None
     if request.assistant_message_index is not None:
@@ -102,8 +162,20 @@ async def _model_turn(
         )
     try:
         with rollout_wait("model_client_await"):
-            output = await client.generate(
-                InferenceEngineInput(
+            if request.prompt_token_ids is not None:
+                prompt_ids = list(request.prompt_token_ids)
+                remaining = max_context_length - len(prompt_ids)
+                if remaining <= 0 or (max_prompt_length is not None and len(prompt_ids) > max_prompt_length):
+                    raise GenerationLimitReached(tuple(prompt_ids))
+                raw_sampling = {**sampling_params, **options}
+                raw_sampling["max_tokens"] = min(int(raw_sampling.get("max_tokens", remaining)), remaining)
+                model_input = InferenceEngineInput(
+                    prompt_token_ids=[prompt_ids],
+                    session_ids=[session_id],
+                    sampling_params=raw_sampling,
+                )
+            else:
+                model_input = InferenceEngineInput(
                     prompts=[list(request.messages)],
                     chat_completion_params=[options],
                     chat_continuations=[continuation],
@@ -112,23 +184,37 @@ async def _model_turn(
                     max_context_length=max_context_length,
                     max_prompt_length=max_prompt_length,
                 )
-            )
+            output = await client.generate(model_input)
     except GenerationBudgetExceededError as limit:
         raise GenerationLimitReached(limit.prompt_token_ids) from limit
     if output["token_provenance"] != TokenProvenance.ENGINE:
         raise RolloutContractError("The canonical rollout engine requires exact model tokens")
     logprobs = output.get("response_logprobs")
+    if logprobs is not None and any(not math.isfinite(value) for value in logprobs[0]):
+        raise RolloutContractError("Behavior logprobs must be finite")
+    message = (
+        {"role": "assistant", "content": output["responses"][0]}
+        if request.prompt_token_ids is not None
+        else output["assistant_messages"][0]
+    )
     return ModelTurn(
-        message=output["assistant_messages"][0],
-        prompt_token_ids=tuple(output["prompt_ids"][0]),
+        message=message,
+        prompt_token_ids=request.prompt_token_ids
+        if request.prompt_token_ids is not None
+        else tuple(output["prompt_ids"][0]),
         response_token_ids=tuple(output["response_ids"][0]),
         logprobs=None if logprobs is None else tuple(logprobs[0]),
         stop_reason=output["stop_reasons"][0],
-        text=output.get("responses", [output["assistant_messages"][0].get("content") or ""])[0],
+        text=output.get("responses", [message.get("content") or ""])[0],
         metadata={
             **{
                 name: output[name][0]
-                for name in ("student_topk_indices", "behavior_topk_logprobs", "routed_experts")
+                for name in (
+                    "student_topk_indices",
+                    "behavior_topk_logprobs",
+                    ROUTED_EXPERTS_KEY,
+                    RESPONSE_POLICY_STEPS_KEY,
+                )
                 if output.get(name) is not None
             },
             "generation_token_budget": (output.get("generation_token_budgets") or [None])[0],
@@ -154,6 +240,37 @@ def _failed_rollout(
     diagnostics = {"operation": interruption.operation.value, "timed_out": isinstance(error, TimeoutError)}
     if isinstance(error, TaskMachineError) and error.__cause__ is not None:
         diagnostics["cause_error_type"] = type(error.__cause__).__name__
+        diagnostics["machine_operation"] = error.operation.value
+        provider_error = error.__cause__
+        if isinstance(provider_error, DaytonaError):
+            if type(provider_error.status_code) is int and 100 <= provider_error.status_code <= 599:
+                diagnostics["provider_status_code"] = provider_error.status_code
+            rate_limits = {
+                name.lower(): int(value)
+                for name, value in (provider_error.headers or {}).items()
+                if name.lower() in DAYTONA_RATE_LIMIT_HEADERS
+                and isinstance(value, str)
+                and value.isascii()
+                and value.isdecimal()
+                and len(value) <= 12
+            }
+            if rate_limits:
+                diagnostics["provider_rate_limits"] = rate_limits
+            # This identifies an SDK call, not the HTTP phase of a compound operation.
+            diagnostics["provider_sdk_call"] = "unknown"
+            nested_error: BaseException | None = provider_error
+            seen = set()
+            while nested_error is not None and id(nested_error) not in seen:
+                seen.add(id(nested_error))
+                traceback = nested_error.__traceback__
+                while traceback is not None:
+                    frame = traceback.tb_frame
+                    call = (frame.f_globals.get("__name__"), frame.f_code.co_name)
+                    if call in DAYTONA_DIAGNOSTIC_CALLS:
+                        diagnostics["provider_sdk_call"] = ".".join(call)
+                    traceback = traceback.tb_next
+                # The SDK translates HTTP errors with `raise ... from None`.
+                nested_error = nested_error.__cause__ or nested_error.__context__
     if isinstance(error, TimeoutError):
         exception_type = {
             RolloutOperation.ATTEMPT: "TrialTimeoutError",
@@ -206,6 +323,16 @@ def _failed_rollout(
     )
 
 
+@dataclass(frozen=True)
+class RemoteJudgeSettings:
+    base_url: str
+    api_key_env: str
+
+    def connection(self) -> JudgeConnection:
+        """Resolve the judge credential on the rollout worker, outside task data."""
+        return JudgeConnection(self.base_url, os.environ[self.api_key_env])
+
+
 class TaskRolloutWorker:
     """Run canonical task rollouts and submit complete groups to the buffer."""
 
@@ -224,15 +351,19 @@ class TaskRolloutWorker:
         sessions: Mapping[str, Callable[[LoweredTaskSpec, Machine | None], TaskSession]] | None = None,
         *,
         shutdown_timeout: float,
+        installed_agents: InstalledAgentWorker | None = None,
+        judge_connection: JudgeConnection | None = None,
     ):
         self.trajectory_runner_cfg = trajectory_runner_cfg
         self.model_client = model_client
+        self.judge_connection = judge_connection
         self.factories = {name: OwnedMachineFactory(factory, name) for name, factory in factories.items()}
         self.active_requests: set[asyncio.Task] = set()
         self.closing = False
         self.shutdown_timeout = shutdown_timeout
         self.chat_template_kwargs = dict(trajectory_runner_cfg.get("chat_template_kwargs", {}))
         self.harbor = harbor
+        self.installed_agents = installed_agents
         self.retry_wait = retry_wait
         self.group_graders = group_graders
         self.task_slots = asyncio.Semaphore(concurrent_tasks) if concurrent_tasks is not None else nullcontext()
@@ -257,7 +388,7 @@ class TaskRolloutWorker:
         )
         self.sessions = session_factories(executor=self.verifier_executor)
         if sessions is not None:
-            self.sessions.update(sessions)
+            self.sessions.update({name: adapt_self_grading_session(factory) for name, factory in sessions.items()})
         self.trajectory_sink: RetentionSink | None = None
 
     @contextmanager
@@ -275,20 +406,40 @@ class TaskRolloutWorker:
         finally:
             self.active_requests.discard(task)
 
-    async def generate(self, request: TrajectoryRequestBatch) -> list[RolloutData]:
+    def _configured_task_and_sessions(
+        self, lowered: LoweredTaskSpec, harbor: HarborTaskSettings | None, session_id: str, phase: str
+    ) -> tuple[LoweredTaskSpec, Mapping[str, TaskSessionFactory]]:
+        sessions = self.sessions
+        if lowered.session.task_session == HARBOR_TRIAL_SESSION:
+            if harbor is None or self.installed_agents is None:
+                raise ValueError("Full Harbor trials require Harbor and installed-agent settings")
+            sessions = {
+                **self.sessions,
+                HARBOR_TRIAL_SESSION: lambda context: self.installed_agents.original_session(
+                    context.lowered, session_id, harbor, phase
+                ),
+            }
+        elif harbor is not None and self.installed_agents is not None:
+            if lowered.session.task_session != SHELLBOX_SESSION:
+                raise ValueError("SkyRL agents require a Shellbox task grader")
+            lowered = lowered.model_copy(
+                update={"session": lowered.session.model_copy(update={"task_session": SKYRL_AGENT_SESSION})}
+            )
+            sessions = {
+                **self.sessions,
+                SKYRL_AGENT_SESSION: partial(_agent_session_factory, self.installed_agents, session_id),
+            }
+        validate_lowered_task(lowered, factories=self.factories, sessions=sessions, providers={})
+        return lowered, sessions
+
+    async def generate(self, request: TaskRequestBatch) -> list[RolloutData]:
         with self._active_request():
             return await self._generate(request)
 
-    async def _generate(self, request: TrajectoryRequestBatch) -> list[RolloutData]:
-        extras = request.get("env_extras")
-        if extras is None or len(extras) != len(request["prompts"]):
-            raise ValueError("Each rollout request must contain one lowered task per prompt")
-        lowered_tasks = [LoweredTaskSpec.model_validate_json(row[LOWERED_TASK_COLUMN]) for row in extras]
-        group_graders = [
-            GroupGraderSpec.model_validate_json(row["group_grader"]) if row.get("group_grader") is not None else None
-            for row in extras
-        ]
-        metadata = request.get("batch_metadata")
+    async def _generate(self, request: TaskRequestBatch) -> list[RolloutData]:
+        lowered_tasks = [row.lowered for row in request.rows]
+        group_graders = [row.group_grader for row in request.rows]
+        metadata = request.batch_metadata
         phase = "train" if metadata is None else metadata.training_phase
         harbor_settings = [self.harbor if "harbor" in item.task.tags else None for item in lowered_tasks]
         policies = [self.error_handling if harbor is None else harbor.error_handling for harbor in harbor_settings]
@@ -296,23 +447,31 @@ class TaskRolloutWorker:
             item if harbor is None else harbor.lowered(item, phase=phase)
             for item, harbor in zip(lowered_tasks, harbor_settings, strict=True)
         ]
-        for lowered in lowered_tasks:
-            validate_lowered_task(lowered, factories=self.factories, sessions=self.sessions)
+        trajectory_ids = request.trajectory_ids
+        session_ids = [
+            trajectory_ids[index].to_string() if trajectory_ids is not None else uuid4().hex
+            for index in range(len(lowered_tasks))
+        ]
+        selected_sessions: list[Mapping[str, TaskSessionFactory]] = []
+        for index, lowered in enumerate(lowered_tasks):
+            lowered, sessions = self._configured_task_and_sessions(
+                lowered, harbor_settings[index], session_ids[index], phase
+            )
+            lowered_tasks[index] = lowered
+            selected_sessions.append(sessions)
         tasks = [item.task for item in lowered_tasks]
         sampling = get_sampling_params_for_backend(
             self.trajectory_runner_cfg.backend, self.trajectory_runner_cfg.sampling_params
         )
-        sampling.update(request.get("sampling_params") or {})
+        sampling.update(request.sampling_params or {})
         require_logprobs = logprobs_requested(request, self.trajectory_runner_cfg)
         max_input_length = int(self.trajectory_runner_cfg.max_input_length)
         max_context_length = generation_context_limit(self.trajectory_runner_cfg)
 
-        trajectory_ids = request.get("trajectory_ids")
-
         async def run(index, lowered):
             task = lowered.task
             harbor = harbor_settings[index]
-            session_id = trajectory_ids[index].to_string() if trajectory_ids is not None else uuid4().hex
+            session_id = session_ids[index]
 
             async def model(request):
                 return await _model_turn(
@@ -325,7 +484,12 @@ class TaskRolloutWorker:
                     session_id=session_id,
                 )
 
-            engine = ShellboxRolloutEngine(model, self.factories, sessions=self.sessions)
+            engine = RolloutEngine(
+                model,
+                self.factories,
+                sessions=selected_sessions[index],
+                judge_connection=self.judge_connection,
+            )
             harbor_slots = (
                 nullcontext()
                 if harbor is None
@@ -381,17 +545,17 @@ class TaskRolloutWorker:
                     request,
                     self.harbor,
                     int(self.trajectory_runner_cfg.sampling_params.max_generate_length),
-                    self.projection.projection.tokenizer,
+                    self.projection.tokenizer,
                     harbor_tasks=[harbor is not None for harbor in harbor_settings],
                 )
         return rollouts
 
-    async def run(self, input_batch: TrajectoryRequestBatch) -> TrajectoryBatch:
+    async def run(self, input_batch: TaskRequestBatch) -> TrajectoryBatch:
         with self._active_request():
             outputs = await self.generate(input_batch)
             return await self.training_batch(input_batch, outputs)
 
-    async def training_batch(self, request: TrajectoryRequestBatch, outputs: Sequence[RolloutData]) -> TrajectoryBatch:
+    async def training_batch(self, request: TaskRequestBatch, outputs: Sequence[RolloutData]) -> TrajectoryBatch:
         with rollout_phase("assemble"):
             batch = self.projection.project(outputs, request)
             propagate_data_sources(request, batch)
@@ -402,7 +566,8 @@ class TaskRolloutWorker:
         self.trajectory_sink = sink
 
     async def startup(self) -> None:
-        pass
+        if self.installed_agents is not None:
+            await self.installed_agents.startup()
 
     async def shutdown(self) -> None:
         """Cancel rollouts and release their machines before actor termination."""
@@ -427,6 +592,8 @@ class TaskRolloutWorker:
         finally:
             if self.verifier_executor is not None:
                 self.verifier_executor.shutdown(wait=False, cancel_futures=True)
+            if self.installed_agents is not None:
+                await self.installed_agents.shutdown()
         if failures:
             raise ExceptionGroup("Task worker shutdown failed", failures)
 
@@ -467,28 +634,51 @@ class TaskRolloutWorkerSpec:
         )
 
     def build(self, tokenizer, shard: WorkerShard) -> TaskRolloutWorker:
+        judge_config = self.config.environment.task_sessions.get("remote_judge")
+        judge = None if judge_config is None else RemoteJudgeSettings(**dict(judge_config)).connection()
         harbor = None if self.harbor_config is None else HarborTaskSettings.from_config(self.harbor_config)
         runner_config = self.config.generator
         client_config = OmegaConf.merge(self.config, {"generator": {"enable_http_endpoint": False}})
-        client = DirectModelClient(InferenceEngineClient(self.engines, tokenizer, client_config))
-        factories: dict[str, MachineFactory] = {"shellsim": ShellSimMachineFactory()}
-        skopeo = shutil.which(str(Path(self.config.trajectory_runner.skopeo).expanduser()))
-        if shutil.which("docker") is not None and skopeo is not None:
-            factories[Backend.DOCKER] = DockerMachineFactory(
-                skopeo=Path(skopeo),
-                image_cache=Path(self.config.trajectory_runner.image_cache).expanduser(),
+        inference = InferenceEngineClient(self.engines, tokenizer, client_config)
+        client = DirectModelClient(inference)
+        installed_agents = None
+        if self.harbor_config is not None and self.harbor_config.get("installed_agent") is not None:
+            # Full Harbor is an optional dependency for installed-agent runs.
+            from skyrl_train.rollouts.agent_runtime import InstalledAgentRuntime, InstalledAgentSettings
+            from skyrl_train.rollouts.agent_backend import AgentInferenceBackend
+
+            settings = InstalledAgentSettings.model_validate(
+                OmegaConf.to_container(self.harbor_config.installed_agent, resolve=True)
             )
+            installed_agents = InstalledAgentRuntime(
+                settings,
+                AgentInferenceBackend(
+                    inference.model_name, generation_context_limit(runner_config), inference.tokenize, tokenizer
+                ),
+                int(runner_config.sampling_params.max_generate_length),
+            )
+        factories: dict[str, MachineFactory] = {"shellsim": ShellSimMachineFactory()}
+        daytona = self.config.environment.task_sessions.get("daytona")
+        if daytona is not None:
+            factories[Backend.DAYTONA] = DaytonaMachineFactory(
+                client_factory=partial(AsyncDaytona, DaytonaConfig(api_key=os.environ[daytona.api_key_env])),
+                ttl_minutes=int(daytona.ttl_minutes),
+            )
+        if shutil.which("docker") is not None:
+            factories[Backend.DOCKER] = DockerMachineFactory()
         if harbor is not None:
             if harbor.environment.type != EnvironmentType.DOCKER:
                 factories[HARBOR_MACHINE_BACKEND] = harbor.machine_factory()
+                if harbor.environment.kwargs.get("eval_api_key_env"):
+                    factories[HARBOR_EVAL_MACHINE_BACKEND] = harbor.machine_factory(phase="eval")
             elif Backend.DOCKER in factories:
                 factories[HARBOR_MACHINE_BACKEND] = factories[Backend.DOCKER]
         return TaskRolloutWorker(
             runner_config,
             (
-                StepTaskProjection(StepWiseTrajectoryProjection(runner_config, tokenizer))
+                StepTaskProjection(runner_config, tokenizer)
                 if self.config.trainer.step_wise_training
-                else WholeTaskProjection(WholeTrajectoryProjection(runner_config, tokenizer))
+                else WholeTaskProjection(runner_config, tokenizer)
             ),
             client,
             factories,
@@ -498,4 +688,6 @@ class TaskRolloutWorkerSpec:
             concurrent_harbor_tasks=None if harbor is None else max(1, harbor.concurrent_trials // shard.count),
             sessions=self.sessions,
             shutdown_timeout=float(self.config.trajectory_runner.shutdown_timeout),
+            installed_agents=installed_agents,
+            judge_connection=judge,
         )

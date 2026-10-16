@@ -1,11 +1,11 @@
 Canonical task rollouts
 =======================
 
-``TaskRolloutWorker`` runs TaskCompendium tasks through Marin's ``ShellboxRolloutEngine``.
+``TaskRolloutWorker`` runs TaskCompendium tasks through Marin's ``RolloutEngine``.
 The engine owns model calls, conversation and exact-token accumulation, deadlines, and resource cleanup.
 The worker controls concurrency, retries, group grading, and training projections.
 
-``ShellboxRolloutEngine.run(lowered)`` asynchronously executes one task. The worker
+``RolloutEngine.run(lowered)`` asynchronously executes one task. The worker
 starts one coroutine for each task, and inference runs on the worker's event
 loop. Synchronous graders use a separate executor. Shellbox commands use asynchronous machine operations.
 ``trajectory_runner.max_concurrent_tasks`` limits active task coroutines.
@@ -47,6 +47,8 @@ teacher routes, and source labels. A teacher route identifies the configured tea
 
 The worker supplies explicit factories from ``skyrl_gym/task_factories.py``.
 Each factory creates a direct implementation of Marin's ``TaskSession`` protocol.
+The engine passes a ``TaskSessionContext`` to each factory. ``skyrl-gym`` sessions grade
+themselves; the installed Harbor-agent session uses the context's task grader.
 The session prepares the task, executes model actions, returns observations, and grades the result.
 The engine creates its Shellbox machine and closes the session before the machine.
 Pure answer graders use ``runtime.task_machine=None`` and do not create a machine.
@@ -82,6 +84,45 @@ Harbor machine preparation executes commands with ``user="0"`` (root).
 The Shellbox Iris backend rejects per-command user overrides, so imported Harbor tasks cannot use that backend.
 Disabling Harbor verification removes private grader resources and selects skipped grading before runtime lowering.
 
+Installed Harbor agents
+-----------------------
+
+Set ``terminal_bench_config.installed_agent`` to run an installed Harbor agent
+for Harbor-tagged tasks. Without this block, the worker uses the generic shell
+session. The worker selects its ``skyrl_agent`` session when this block is set.
+The agent session controls its prompts and tool loop. RolloutEngine retains
+model calls, sampled token IDs and log probabilities, grading, and machine ownership.
+The runtime requires the full Harbor package and an Iris worker with a
+controller-reachable advertised address. The Iris controller must issue capability
+URLs that the Daytona container can reach.
+Select Daytona through ``terminal_bench_config.harbor.environment_type``.
+
+The installed-agent block requires ``agent`` (a Harbor ``AgentConfig``),
+``output_path``, ``setup_timeout``, ``run_timeout``, ``cleanup_timeout``,
+``service_startup_timeout``, and ``service_shutdown_timeout``. Timeouts are in
+seconds. The task's total-turn timeout replaces ``run_timeout`` when set.
+The task context must contain exactly one user message with string content.
+``LoweredTaskSpec.runtime.task_machine`` must select a task machine.
+Private verifier files remain on the separate verifier machine.
+
+The worker creates a per-attempt protocol proxy and a leased Iris HTTP route.
+It supplies the agent's model alias, API address, and context limits from the
+active inference backend. Container commands use the selected Shellbox machine;
+this path does not use Iris container-exec RPCs. Streaming responses are buffered
+until the engine returns a complete model turn.
+
+Each attempt gets a unique directory under ``output_path``. It contains the
+serialized task with private grading data and execution settings, attempt identity,
+downloaded agent logs, and an ``engine``
+directory. ``engine/turns.jsonl`` records requests before generation and exact
+model turns after generation. It retains earlier turns even when an agent
+replaces its conversation and the training data retains only the new conversation.
+``engine/literal.jsonl`` records
+protocol traffic. Treat these artifacts as private: they can include reference
+inputs and tool outputs. Failed and cancelled attempts also attempt publication
+to ``output_path``. A publication failure is raised to the caller and preserves
+local staging for recovery; the original trial exception remains in the exception context.
+
 Exact tokens
 ------------
 
@@ -93,7 +134,9 @@ next prompt to start with ``[1, 2, 3, 4]``.
 The engine gives model tokens a loss mask of ``1``. It gives observation and
 chat-boundary tokens a mask of ``0`` and a log probability of ``0``.
 It does not reconstruct sampled responses from text or add sampled EOS tokens.
-Sessions cannot replace sampled actions with different text.
+The engine records the sampled assistant message before calling the session's
+``advance`` method. Sessions can parse it and choose the next prompt, but cannot
+replace that recorded message with different text.
 Token-contract violations abort the prompt group.
 
 One transition follows each model response, including the final response.
@@ -112,9 +155,11 @@ response or grade and does not enter loss or baseline calculations.
 Training data and failures
 --------------------------
 
-``WholeTaskProjection`` emits one row per rollout. ``StepTaskProjection`` emits
-one row per retained model turn. Select step projection with
-``trainer.step_wise_training=true``. The two projections preserve exact tokens,
+``WholeTaskProjection`` emits one row with the full token sequence per rollout.
+``StepTaskProjection`` emits one row per retained model turn, with that turn's
+exact served prompt and sampled response.
+Select step projection with ``trainer.step_wise_training=true``.
+The two projections preserve exact tokens,
 behavior log probabilities, token rewards, expert routes, and teacher routes.
 
 Sessions can supply per-turn optimization rewards. The whole-task projection sums these rewards.
@@ -140,6 +185,8 @@ Ineligible attempts receive no comparison score.
 Evaluation exports contain public prompts, responses, labels, scores, and failure fields.
 Private task records and grading configuration remain outside these exports.
 Retained trajectory files omit private task records, grader parameters, and references.
+Trajectory record schema 7 stores only ``data_source`` and ``teacher_route`` in ``environment_extras``.
+Other source-row extras do not enter retained traces.
 They also omit source metadata that contains grader inputs.
 They retain public source labels, teacher routes, prompts, responses, and verifier results.
 

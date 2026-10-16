@@ -2,14 +2,32 @@
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 
 from omegaconf import DictConfig, OmegaConf
 
-from marinskyrl.runtime_options import PolicyLossType
+from marinskyrl.runtime_options import PolicyLossType, ftpo_requested
+
+
+class FTPOBoundary(StrEnum):
+    TAIL_LOOP = "tail_loop"
+    REPEATED_TOOL_OPENER = "repeated_tool_opener"
+    VERIFIED_CLOSURE = "verified_closure"
+    VERIFIED_CLOSURE_AND_CONTINUATION = "verified_closure_and_continuation"
+    MIXED = "mixed"
+
+    @property
+    def uses_verified_boundaries(self) -> bool:
+        return self in (
+            FTPOBoundary.VERIFIED_CLOSURE,
+            FTPOBoundary.VERIFIED_CLOSURE_AND_CONTINUATION,
+            FTPOBoundary.MIXED,
+        )
 
 
 @dataclass(frozen=True)
 class FTPOConfig:
+    boundary: FTPOBoundary = FTPOBoundary.TAIL_LOOP
     margin: float = 2.0
     lambda_mse: float = 0.4
     lambda_mse_target: float = 0.05
@@ -21,13 +39,23 @@ class FTPOConfig:
     rejected_balance_strength: float = 0.3
     chosen_balance_strength: float = 0.5
     early_stopping_chosen_win: float | None = None
+    repair_sft_weight: float | None = None
+    auxiliary_weight: float | None = None
 
 
 def ftpo_config(algorithm: DictConfig) -> FTPOConfig | None:
-    """Resolve the FTPO parameters only for an FTPO policy objective."""
-    if algorithm.get("policy_loss_type") != PolicyLossType.FTPO:
+    """Resolve standalone or explicitly weighted auxiliary FTPO parameters."""
+    values = dict(algorithm.get("ftpo", {}))
+    if not ftpo_requested(algorithm):
         return None
-    config = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(FTPOConfig), algorithm.get("ftpo", {})))
+    if "boundary" in values:
+        values["boundary"] = FTPOBoundary(values["boundary"])
+    config = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(FTPOConfig), values))
+    if config.auxiliary_weight is not None:
+        if not math.isfinite(config.auxiliary_weight) or config.auxiliary_weight <= 0:
+            raise ValueError("FTPO auxiliary_weight must be finite and positive")
+        if algorithm.get("policy_loss_type") == PolicyLossType.FTPO:
+            raise ValueError("Choose standalone FTPO or auxiliary FTPO, not both")
     for value in (
         config.margin,
         config.lambda_mse,
@@ -45,6 +73,10 @@ def ftpo_config(algorithm: DictConfig) -> FTPOConfig | None:
         )
     if config.early_stopping_chosen_win is not None and not 0 < config.early_stopping_chosen_win <= 1:
         raise ValueError("FTPO early_stopping_chosen_win must be in (0, 1]")
+    if config.repair_sft_weight is not None and (
+        not math.isfinite(config.repair_sft_weight) or config.repair_sft_weight <= 0
+    ):
+        raise ValueError("FTPO repair_sft_weight must be finite and positive")
     return config
 
 
@@ -53,6 +85,8 @@ def validate_ftpo(cfg: DictConfig) -> None:
     config = ftpo_config(cfg.trainer.algorithm)
     if config is None:
         return
+    if config.boundary.uses_verified_boundaries and config.repair_sft_weight is None:
+        raise ValueError("Verified closure training requires an explicit repair_sft_weight")
     algorithm = cfg.trainer.algorithm
     if cfg.trainer.strategy != "megatron":
         raise ValueError("FTPO requires the Megatron trainer")
@@ -68,8 +102,21 @@ def validate_ftpo(cfg: DictConfig) -> None:
             raise ValueError("FTPO requires TP=1, CP=1, and sequence_parallel_size=1; sharded scoring is future work")
     if algorithm.loss_reduction != "token_mean" or algorithm.think_token_weight != 1:
         raise ValueError("FTPO requires token_mean reduction and think_token_weight=1")
-    if algorithm.advantage_estimator != "uniform" or algorithm.advantage_batch_normalize:
+    if config.auxiliary_weight is None and (
+        algorithm.advantage_estimator != "uniform" or algorithm.advantage_batch_normalize
+    ):
         raise ValueError("FTPO requires uniform advantages without advantage normalization")
+    if config.auxiliary_weight is not None:
+        if algorithm.policy_loss_type not in (
+            PolicyLossType.REGULAR,
+            PolicyLossType.IMPORTANCE_SAMPLING,
+            PolicyLossType.BEHAVIOR_CLIP,
+        ):
+            raise ValueError("Auxiliary FTPO requires a task-reward policy objective")
+        if cfg.generator.sampling_params.temperature != 1.0:
+            raise ValueError("Auxiliary FTPO requires temperature 1 for shared policy and raw-logit scoring")
+        if config.early_stopping_chosen_win is not None:
+            raise ValueError("Auxiliary FTPO cannot stop task learning by structural chosen-win rate")
     if (
         algorithm.use_kl_loss
         or algorithm.use_kl_in_reward
@@ -77,7 +124,9 @@ def validate_ftpo(cfg: DictConfig) -> None:
         or algorithm.get("distillation")
     ):
         raise ValueError("FTPO supplies its own reference regularization; other objectives must be disabled")
-    if algorithm.off_policy_correction not in (None, "none") or algorithm.dynamic_sampling.type is not None:
+    if (
+        config.auxiliary_weight is None and algorithm.off_policy_correction not in (None, "none")
+    ) or algorithm.dynamic_sampling.type is not None:
         raise ValueError("FTPO requires off_policy_correction=none and no reward-based dynamic sampling")
     if cfg.trainer.critic.model.path is not None or cfg.trainer.get("update_ref_every_epoch", False):
         raise ValueError("FTPO requires a frozen reference and no critic")

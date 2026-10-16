@@ -26,6 +26,18 @@ from skyrl_train.dataset import PromptDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 BasicType = Union[int, float, str, bool, type(None)]
+EVAL_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "exception_type",
+        "cause_error_type",
+        "operation",
+        "timed_out",
+        "machine_operation",
+        "provider_status_code",
+        "provider_sdk_call",
+        "provider_rate_limits",
+    }
+)
 
 
 class ResumeMode(Enum):
@@ -323,6 +335,7 @@ def dump_per_dataset_eval_results(
     concat_data_sources: List[str],
     concat_all_envs: List[str],
     eval_metrics: Dict[str, float],
+    uids: List[str],
 ):
     """Dump evaluation results per dataset and overall aggregated results."""
 
@@ -346,7 +359,11 @@ def dump_per_dataset_eval_results(
 
         with io.open_file(filename, "w") as f:
             for i in indices:
+                verification = (trajectory_batch.get("verification_results") or [None] * len(input_prompts))[i]
                 entry = {
+                    "uid": uids[i],
+                    "prompt_token_ids": trajectory_batch["prompt_token_ids"][i],
+                    "response_token_ids": trajectory_batch["response_ids"][i],
                     "input_prompt": input_prompts[i],
                     "output_response": output_responses[i],
                     "score": trajectory_batch["rewards"][i],
@@ -356,6 +373,23 @@ def dump_per_dataset_eval_results(
                     "server_error": (trajectory_batch.get("server_errors") or [None] * len(input_prompts))[i],
                     "env_class": concat_all_envs[i],
                     "data_source": data_source,
+                    "env_metrics": (trajectory_batch.get("env_metrics") or [{}] * len(input_prompts))[i],
+                    # Keep operational categories, not arbitrary verifier references or credentials.
+                    "verification": None
+                    if verification is None
+                    else {
+                        "status": verification.status.value,
+                        "reason": verification.reason,
+                        "score": verification.score,
+                        "passed": verification.passed,
+                        "score_min": verification.score_min,
+                        "score_max": verification.score_max,
+                        "diagnostics": {
+                            key: value
+                            for key, value in verification.diagnostics.items()
+                            if key in EVAL_DIAGNOSTIC_FIELDS
+                        },
+                    },
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

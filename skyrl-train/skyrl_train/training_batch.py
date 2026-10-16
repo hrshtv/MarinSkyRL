@@ -356,8 +356,8 @@ class TrainingInput(TypedDict, total=False):
     score_topk_indices: Optional[Integer[torch.Tensor, "batch_size seq_len top_k"]]
     score_old_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len top_k"]]
     score_behavior_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len top_k"]]
-    # Policy versions this row is behind at consumption; one entry per row.
-    rollout_staleness: Optional[Integer[torch.Tensor, "batch_size"]]  # noqa: F821
+    # Policy steps each response token is behind at consumption.
+    rollout_staleness: Optional[Integer[torch.Tensor, "batch_size seq_len"]]
     teacher_action_log_probs: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     teacher_topk_indices: Optional[Integer[torch.Tensor, "batch_size seq_len top_k"]]
     teacher_topk_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len top_k"]]
@@ -367,6 +367,7 @@ class TrainingInput(TypedDict, total=False):
     teacher_on_student_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len top_k"]]
     ftpo_chosen_mask: Optional[Integer[torch.Tensor, "batch_size seq_len top_k"]]
     ftpo_reference_logits: Optional[Float[torch.Tensor, "batch_size vocab"]]
+    ftpo_repair_mask: Optional[Integer[torch.Tensor, "batch_size seq_len"]]
     teacher_valid_mask: Optional[Integer[torch.Tensor, "batch_size seq_len"]]
     distillation_loss_weights: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     # Dense replay targets are used by diagnostic input batches. Generated compact
@@ -545,8 +546,10 @@ class TrainingBatchIterator(Iterator[Experience]):
             ),
             ftpo=FTPOTargets(
                 batch["student_topk_indices"],
-                batch["ftpo_chosen_mask"] & (batch["loss_mask"] > 0).unsqueeze(-1),
+                batch["ftpo_chosen_mask"] & (batch.get("ftpo_weights", batch["loss_mask"]) > 0).unsqueeze(-1),
                 batch["ftpo_reference_logits"],
+                batch.get("ftpo_repair_mask"),
+                batch.get("ftpo_weights"),
             )
             if "ftpo_chosen_mask" in batch
             else None,
