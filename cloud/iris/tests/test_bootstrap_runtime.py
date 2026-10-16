@@ -179,6 +179,7 @@ def test_export_bootstrap_does_not_require_rollout_or_telemetry_packages(tmp_pat
     result = _run_bootstrap(environment, process_environment, "megatron-export")
 
     assert result.returncode == 0, result.stderr
+    assert "frozen runtime ready" in result.stdout
 
 
 def test_bootstrap_uses_system_python_when_managed_pin_is_unresolvable(tmp_path: Path) -> None:
@@ -281,3 +282,4 @@ def test_parallel_bootstrap_waits_for_every_check_and_reports_failure(tmp_path):
     assert result.returncode != 0, result.output
     assert "memray import failed" in result.output
     assert "vllm import failed" in result.output
+    assert "frozen runtime ready" not in result.output
