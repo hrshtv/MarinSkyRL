@@ -7,6 +7,7 @@ from marinskyrl.runtime_options import AdvantageEstimator
 from skyrl_train.config.objective_spec import off_policy_correction
 from skyrl_train.objective.correction import compute_correction
 from skyrl_train.training_batch import TrainingInputBatch
+from skyrl_train.telemetry import ConsumedWork
 from skyrl_train.utils.advantage_estimators import GRPO_FLAT_REWARD_STD_TOLERANCE
 from skyrl_train.utils.importance_ratio_diagnostics import LocalReduction, mismatch_ratio_metrics
 from collections import defaultdict
@@ -391,6 +392,16 @@ def token_staleness_metrics(
         "async/staleness_tokens_stamped": sum(sum(group.stamped_loss_tokens) for group in facts) / count,
         "async/staleness_tokens_spanning": torch.tensor(spanning).float().mean().item() if spanning else 0.0,
     }
+
+
+def consumed_work(training_input: TrainingInputBatch) -> ConsumedWork:
+    """Count the rows and tokens an optimizer step consumed, excluding data-parallel padding."""
+    real_rows = training_input.batch_size - training_input.metadata.get("pad_size", 0)
+    return ConsumedWork(
+        sequences=real_rows,
+        response_tokens=int(training_input["response_mask"][:real_rows].sum().item()),
+        loss_tokens=int(training_input["loss_mask"][:real_rows].sum().item()),
+    )
 
 
 def consumed_stop_metrics(stop_reasons: Sequence[str | None] | None, sequence_count: int) -> dict[str, float]:
