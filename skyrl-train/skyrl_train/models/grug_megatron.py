@@ -353,9 +353,8 @@ class GrugGPTModel(GPTModel):
         if not apply_embed_norm:
             return outputs
         decoder_input, *rest = outputs
-        # Decoder recomputation leaves this first-stage norm outside its boundary.
-        # A grad-bearing input is required by Megatron's reentrant checkpoint;
-        # frozen embeddings must still produce gradients for the norm weights.
+        # The decoder checkpoint excludes this norm. Reentrant checkpoints need a
+        # grad-bearing input; frozen embeddings must still allow norm-weight gradients.
         if (
             self.config.recompute_granularity == "full"
             and self.training

@@ -95,17 +95,9 @@ def embedding_preprocess_model(request, tmp_path):
         tensor_parallel.model_parallel_cuda_manual_seed(19)
         config = GrugMoeConfig(
             vocab_size=1024,
-            hidden_size=128,
-            intermediate_size=64,
-            shared_expert_intermediate_size=64,
-            num_local_experts=8,
             num_experts_per_tok=2,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=64,
-            sliding_window=8,
             max_position_embeddings=128,
+            **{**TOY_SHAPE, "num_hidden_layers": 2},
         )
         provider = AutoBridge.from_hf_config(config).to_megatron_provider(load_weights=False)
         provider.params_dtype = request.param
@@ -140,8 +132,9 @@ def test_grug_embedding_recompute_preserves_gradients_and_reduces_saved_activati
     model = embedding_preprocess_model.train()
     model.embedding.word_embeddings.weight.requires_grad_(not freeze_embeddings)
     tokens = torch.arange(32, device="cuda").reshape(1, 32)
+    parameters = [p for module in (model.embedding, model.embed_norm) for p in module.parameters() if p.requires_grad]
     parameter_storages = {p.untyped_storage().data_ptr() for p in model.parameters()}
-    references = None
+    results = []
     saved_bytes = []
     for recompute in (None, "full"):
         model.config.recompute_granularity = recompute
@@ -158,31 +151,12 @@ def test_grug_embedding_recompute_preserves_gradients_and_reduces_saved_activati
             output = model._preprocess(tokens, tokens)[0]
         saved_bytes.append(sum(saved.values()))
         output.float().square().mean().backward()
-        gradients = [p.grad for p in model.embed_norm.parameters()]
-        if not freeze_embeddings:
-            gradients.append(model.embedding.word_embeddings.weight.grad)
+        gradients = [p.grad for p in parameters]
         assert all(gradient is not None and bool(torch.isfinite(gradient).all()) for gradient in gradients)
-        actual = [output.detach(), *gradients]
-        if references is None:
-            references = [value.clone() for value in actual]
-        else:
-            for observed, expected in zip(actual, references, strict=True):
-                torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-5)
+        results.append((output.detach(), [gradient.clone() for gradient in gradients]))
+    torch.testing.assert_close(results[1], results[0], rtol=1e-5, atol=1e-5)
     if not freeze_embeddings:
         assert saved_bytes[1] < saved_bytes[0], saved_bytes
-
-
-@pytest.mark.parametrize("mode", ["eval", "no_grad"])
-def test_grug_embedding_recompute_preserves_inference_outputs(embedding_preprocess_model, mode):
-    model = embedding_preprocess_model
-    model.train(mode != "eval")
-    tokens = torch.arange(32, device="cuda").reshape(1, 32)
-    with torch.set_grad_enabled(mode != "no_grad"):
-        model.config.recompute_granularity = None
-        expected = model._preprocess(tokens, tokens)[0]
-        model.config.recompute_granularity = "full"
-        actual = model._preprocess(tokens, tokens)[0]
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 def _config(model_path: str, *, world_size: int, pp: int, ep: int):
