@@ -42,7 +42,6 @@ from megatron.core.dist_checkpointing.serialization import (
     get_default_save_sharded_strategy,
 )
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
-    FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
 from transformers import PreTrainedTokenizer
@@ -449,11 +448,9 @@ class MegatronStrategy(DistributedStrategy):
                 )
                 if muonh:
                     _muonh_fp32_groups_as_mapping(sharded_state_dict["optimizer"])
-            # Load the checkpoint in parallel.
-            if not muonh:
-                load_strategy = FullyParallelLoadStrategyWrapper(
-                    load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
-                )
+            # Each rank reads its requested records directly from S3. The fully parallel
+            # wrapper broadcasts unwanted GPU shards, whose discarded asynchronous
+            # receive handles can retain their tensor storage after loading finishes.
             state_dict = dist_checkpointing.load(
                 sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
             )
