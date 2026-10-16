@@ -332,6 +332,21 @@ async def test_unified_gym_tasks_preserve_grading_and_turn_credit(task_inputs, e
     assert all("ground_truth" not in str(item["prompts"]) for item in model.requests)
 
 
+def test_source_rows_read_from_parquet_ignore_fields_their_messages_lack():
+    configs = {
+        **OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
+        "session": session_spec().model_dump(exclude={"task_session"}),
+    }
+    message = {"role": "user", "content": "What is 6 + 6?"}
+    row = {"env_class": "gsm8k", "reward_spec": {"ground_truth": "12"}}
+    parquet_message = {**message, "tool_calls": None, "tool_call_id": None, "reasoning_content": None}
+
+    read = source_row_task({**row, "prompt": [parquet_message]}, 0, source_name="fixture", environment_configs=configs)
+    written = source_row_task({**row, "prompt": [message]}, 0, source_name="fixture", environment_configs=configs)
+
+    assert read.task.context == written.task.context
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "row_limits,session_config,turns",
