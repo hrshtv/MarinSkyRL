@@ -296,6 +296,8 @@ SWE_PIVOT_RECORD = {
         ({}, 0.0),
         ({"pivot_reward": "nemo"}, 1.0),
         ({"pivot_reward": "exact"}, 0.0),
+        ({"pivot_reward": {SWE_PIVOT_AGENT: "nemo", TERMINUS_AGENT: "string_90"}}, 1.0),
+        ({"pivot_reward": {TERMINUS_AGENT: "string_90"}}, 0.0),
     ],
 )
 async def test_swe_pivot_rows_train_on_the_configured_verdict_component(nemotron_session, model_turn, config, reward):
@@ -317,6 +319,19 @@ async def test_terminus_pivot_rows_reward_keystroke_similarity(nemotron_session,
 
     assert result.reward == 1.0
     assert result.metrics["pivot_schema_completion"] == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pivot_reward", "error"),
+    [
+        ({SWE_PIVOT_AGENT: "string_90"}, "no pivot component"),
+        ({"math_with_judge_simple_agent": "nemo"}, "without pivot components"),
+    ],
+)
+async def test_per_agent_pivot_reward_rejects_components_the_agent_lacks(nemotron_session, pivot_reward, error):
+    with pytest.raises(ValueError, match=error):
+        await nemotron_session(SWE_PIVOT_AGENT, SWE_PIVOT_RECORD, {"pivot_reward": pivot_reward})
 
 
 def test_tool_call_reward_accepts_any_text_when_a_message_is_expected():

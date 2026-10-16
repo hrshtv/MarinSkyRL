@@ -4,6 +4,7 @@ PivotRL selects pivots by how often a frozen policy passes them under one compon
 verdicts, so training rewards that same component. Every component is reported in the metrics.
 """
 
+from collections.abc import Mapping
 from typing import Any
 
 from verifyit.adapters.nemotron_pivot import grade_terminus, grade_tool_call
@@ -15,6 +16,22 @@ PIVOT_COMPONENTS = {
     SWE_PIVOT_AGENT: frozenset({"tool_name", "nemo", "exact"}),
     TERMINUS_AGENT: frozenset({"schema_completion", "exact_commands", "string_90"}),
 }
+
+
+def pivot_component(setting: str | Mapping[str, str] | None, agent: str) -> str | None:
+    """The component ``agent``'s pivot rows train on.
+
+    ``setting`` is one component name, or one per agent for a blend with SWE and Terminus rows, whose
+    components are disjoint. Rows of other agents ignore it.
+    """
+    if isinstance(setting, Mapping):
+        unknown = set(setting) - set(PIVOT_COMPONENTS)
+        if unknown:
+            raise ValueError(f"pivot_reward names agents without pivot components: {sorted(unknown)}")
+        setting = setting.get(agent)
+    if agent in PIVOT_COMPONENTS and setting not in {None, *PIVOT_COMPONENTS[agent]}:
+        raise ValueError(f"{agent} has no pivot component {setting!r}")
+    return setting
 
 
 def _pivot_verdict(agent: str, record: dict[str, Any], action: str, message: dict[str, Any]) -> Reward:

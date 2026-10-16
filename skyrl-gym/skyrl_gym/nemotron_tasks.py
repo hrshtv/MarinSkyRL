@@ -46,6 +46,7 @@ from skyrl_gym.envs.nemotron_ultra.pivot_verifyit import (
     SWE_PIVOT_AGENT,
     TERMINUS_AGENT,
     grade_pivot,
+    pivot_component,
 )
 from skyrl_gym.envs.nemotron_ultra.lean_feedback import build_correction_prompt, format_error_feedback
 from skyrl_gym.envs.nemotron_ultra.lean_proof import build_lean4_proof, determine_proof_status
@@ -115,11 +116,9 @@ class NemotronTaskSession:
         if self.agent not in NEMOTRON_ULTRA_MOPD_AGENTS | {TERMINUS_AGENT}:
             raise ValueError(f"Unsupported Nemotron source agent: {self.agent!r}")
         # The verdict component a PivotRL run trains on; other rows in the blend ignore it.
-        self.pivot_reward = self.config.get("pivot_reward")
+        self.pivot_reward = pivot_component(self.config.get("pivot_reward"), self.agent)
         if self.agent == TERMINUS_AGENT and self.pivot_reward is None:
             raise ValueError("Terminus pivot rows need pivot_reward")
-        if self.agent in PIVOT_COMPONENTS and self.pivot_reward not in {None, *PIVOT_COMPONENTS[self.agent]}:
-            raise ValueError(f"{self.agent} has no pivot component {self.pivot_reward!r}")
         self.record = json.loads(ultra["record_json"])
         self.request = json.loads(ultra["request_json"])
         self.ipi_session = create_session(self.record) if self.agent == IPI_AGENT else None
