@@ -11,7 +11,7 @@ version = "0.1.0"
 description = "Marin's typed launcher and RL training runtime"
 requires-python = "==3.12.*"
 dependencies = [
-    "marin-verifyit[math,schema,reasoning-gym,judge]>=0.2.171.dev38477406391",
+    "marin-verifyit[math,schema,reasoning-gym,judge] @ git+https://github.com/marin-community/marin.git@23a7a6c2fd95841f9daf7a36f3a22f5350c60a94#subdirectory=lib/verifyit",
     "aiohttp>=3.13.3",
     "boto3",
     "datasets>=4.0.0",
@@ -35,8 +35,8 @@ dependencies = [
     "marin-iris>=0.2.144.dev37540375919",
     "marin-iris-native",
     "marin-rigging[secrets]>=0.2.144.dev37540375919",
-    "marin-rolloutengine>=0.2.171.dev38477406391",
-    "marin-shellbox[daytona,shellsim]",
+    "marin-rolloutengine @ git+https://github.com/marin-community/marin.git@23a7a6c2fd95841f9daf7a36f3a22f5350c60a94#subdirectory=lib/rolloutengine",
+    "marin-shellbox[daytona,shellsim] @ git+https://github.com/marin-community/marin.git@23a7a6c2fd95841f9daf7a36f3a22f5350c60a94#subdirectory=lib/shellbox",
     "ninja",
     "nvidia-ml-py",
     "omegaconf",
@@ -53,7 +53,7 @@ dependencies = [
     "s3fs",
     "smart_open",
     "tensorboard",
-    "marin-taskcompendium",
+    "marin-taskcompendium @ git+https://github.com/marin-community/marin.git@23a7a6c2fd95841f9daf7a36f3a22f5350c60a94#subdirectory=lib/taskcompendium",
     "tqdm>=4.66",
     "tokenizers==0.22.2",
     "transformers==5.12.1",
@@ -190,7 +190,9 @@ no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
 ]
-override-dependencies = []
+override-dependencies = [
+    "marin-rigging[secrets,prometheus]==0.2.191.dev38826191626",
+]
 constraint-dependencies = [
     "opentelemetry-api==1.43.0",
     "opentelemetry-sdk==1.43.0",
@@ -218,7 +220,7 @@ flash-attn = [
     { url = "https://github.com/marin-community/MarinSkyRL/releases/download/trainer-native-cu132-torch2141-20261004-db1a32ca/flash_attn-2.8.3.post1+marin.cu132torch2141.1-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
     { url = "https://github.com/marin-community/MarinSkyRL/releases/download/trainer-native-cu132-torch2141-20261004-db1a32ca/flash_attn-2.8.3.post1+marin.cu132torch2141.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
-harbor = { git = "https://github.com/marin-community/harbor.git", rev = "aee476676983dfa62f5d824538193302ef46e3f9" }
+harbor = { git = "https://github.com/marin-community/harbor.git", rev = "69a4ad674a2d101146db7fbbfce0f7149c6abc9e" }
 hs-connectors = { git = "https://github.com/marin-community/speculators.git", rev = "ecac1b16278063e9640004135153882c02de5801", subdirectory = "hs_connectors" }
 speculators = { url = "https://github.com/marin-community/MarinSkyRL/releases/download/trainer-trimmed-candidate-20261007-604f2c14/speculators-0.9.0a16.post1-py3-none-any.whl" }
 torch = [
