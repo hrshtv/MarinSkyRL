@@ -5,7 +5,6 @@ import hashlib
 import importlib.metadata
 import json
 import math
-import os
 import threading
 import time
 from pathlib import Path
@@ -15,6 +14,7 @@ import fsspec
 import ray
 import torch
 from omegaconf import OmegaConf
+from rigging.filesystem.s3_compat import configure_coreweave_s3
 
 from skyrl_train.entrypoints.main_base import BasePPOExp
 from skyrl_train.objective.correction import compute_correction
@@ -115,9 +115,19 @@ class ReadinessTrainer(RayPPOTrainer):
         path = Path(self.cfg.trainer.export_path) / "readiness.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.probe, indent=2, allow_nan=False) + "\n")
-        with fsspec.open(os.environ["SC_READINESS_OUTPUT_URI"], "wt") as output:
+        with fsspec.open(self.cfg.trainer.score_centering_readiness.output_uri, "wt") as output:
             json.dump(self.probe, output, allow_nan=False)
-        print("READINESS " + json.dumps(self.probe, allow_nan=False), flush=True)
+        print(
+            "READINESS "
+            + json.dumps(
+                {
+                    "complete": self.probe.get("complete", False),
+                    "windows": len(self.probe["windows"]),
+                    "qualification": list(self.probe["qualification"]),
+                }
+            ),
+            flush=True,
+        )
 
     async def settings(self, width, enabled, telemetry=True, diagnostic_tokens=0, temperature=1.0):
         self.cfg.trainer.algorithm.score_centering_topk = width
@@ -326,18 +336,19 @@ class ReadinessTrainer(RayPPOTrainer):
         }
 
     async def _train_loop(self):
-        short = os.environ["SC_READINESS_WORKLOAD"] == "qwen"
+        configure_coreweave_s3()
+        short = self.cfg.trainer.score_centering_readiness.workload == "qwen"
         self._readiness_applied_updates = 0
         self.probe = {
             "schema": 1,
             "workload": "qwen" if short else "snowball",
-            "candidate": os.environ["SC_READINESS_CANDIDATE_SHA"],
+            "candidate": self.cfg.trainer.score_centering_readiness.candidate,
             "windows": [],
             "qualification": {},
             "setup_timings": self.all_startup_timings,
         }
         self.probe["runtime"] = {
-            "lock_sha256": hashlib.sha256((Path(os.environ["SKYRL_HOME"]) / "uv.lock").read_bytes()).hexdigest(),
+            "lock_sha256": hashlib.sha256((Path(__file__).resolve().parents[3] / "uv.lock").read_bytes()).hexdigest(),
             "versions": {
                 name: importlib.metadata.version(name)
                 for name in ("torch", "vllm", "megatron-core", "transformers", "marin-iris")
