@@ -353,8 +353,10 @@ class GrugGPTModel(GPTModel):
         if not apply_embed_norm:
             return outputs
         decoder_input, *rest = outputs
-        # The decoder checkpoint excludes this norm. Reentrant checkpoints need a
-        # grad-bearing input; frozen embeddings must still allow norm-weight gradients.
+        # The decoder's checkpoint does not cover this normalization. Checkpoint it
+        # separately to save memory by recomputing it during the backward pass.
+        # With frozen embeddings, run it normally so its weights still get gradients:
+        # this checkpoint needs an input with requires_grad=True.
         if (
             self.config.recompute_granularity == "full"
             and self.training
