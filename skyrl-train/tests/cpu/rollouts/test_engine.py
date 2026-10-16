@@ -160,6 +160,61 @@ async def test_task_grade_and_exact_tokens_reach_the_leased_buffer(task_inputs, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("projection_type", [WholeTaskProjection, StepTaskProjection])
+async def test_native_numeric_parser_failure_is_masked_without_losing_graded_peer(task_inputs, projection_type):
+    config, original = task_inputs
+    failed = source_task(
+        original["prompts"][0],
+        {"reward_model": {"ground_truth": "1"}},
+        {"allow_general_math_reference": True},
+        Source(dataset="numeric-parser-failure", revision="1", row="0", importer_revision="1"),
+    )
+    request = {
+        **original,
+        "prompts": original["prompts"] * 2,
+        "env_classes": ["aime", original["env_classes"][0]],
+        "env_extras": [
+            {"lowered_task_spec": lowered_task(failed, "aime").model_dump_json(), "teacher_route": "numeric-parser"},
+            original["env_extras"][0],
+        ],
+        "trajectory_ids": [TrajectoryID(failed.id, 0), TrajectoryID("arithmetic", 0)],
+    }
+
+    class NumericFailureClient(InferenceClient):
+        async def generate(self, request):
+            response = await super().generate(request)
+            if request["session_ids"][0].startswith(failed.id):
+                # The candidate comes from a native parser error; the response wrapper and reference are synthetic.
+                candidate = "0." + "0" * 10_716
+                response["assistant_messages"] = [{"role": "assistant", "content": f"Answer: \\boxed{{{candidate}}}"}]
+            return response
+
+    projection = (
+        WholeTrajectoryProjection if projection_type is WholeTaskProjection else StepWiseTrajectoryProjection
+    )(config, Tokenizer())
+    worker = TaskRolloutWorker(config, projection_type(projection), NumericFailureClient(), {}, shutdown_timeout=30)
+    writer = Writer()
+    try:
+        await worker.run_task(RolloutTask(RolloutLease("lease", 0, 1), {"uid": failed.id}, request), writer)
+    finally:
+        await worker.shutdown()
+
+    batch = writer.groups[0][1].trajectory_batch
+    assert batch["response_ids"] == [[0], [3, 4]]
+    assert batch["loss_masks"] == [[0], [1, 1]]
+    assert batch["exclude_from_baseline"] == [True, False]
+    assert batch["exception_types"] == ["NumericCandidateError", None]
+    assert batch["error_treatments"] == ["mask", None]
+    assert batch["unshaped_rewards"] == [0.0, 1.0]
+    failed_result, peer_result = batch["verification_results"]
+    assert failed_result.status is VerificationStatus.ERROR
+    assert failed_result.passed is None and failed_result.score is None
+    assert failed_result.diagnostics["cause_error_type"] == "TypeError"
+    assert peer_result.status is VerificationStatus.VERIFIED
+    assert peer_result.score == 1.0
+
+
+@pytest.mark.asyncio
 async def test_model_programming_failure_does_not_commit_a_partial_group(task_inputs):
     first_response = asyncio.Event()
 

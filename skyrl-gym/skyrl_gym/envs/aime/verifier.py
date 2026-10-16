@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from verifyit.numeric import NumericCandidateError
 
 from skyrl_gym.envs.aime.utils import compute_length_penalty, verify
 from skyrl_gym.verification import RewardResult, RolloutEvidence, VerificationResult
+
+SYMPY_INVALID_INPUT_PREFIX = "invalid input: "
 
 
 @dataclass(frozen=True)
@@ -21,12 +24,18 @@ class AIMEVerifier:
 
     def verify(self, evidence: RolloutEvidence) -> VerificationResult:
         response = evidence.response or ""
-        correct, prediction = verify(
-            response if self.allow_general_math_reference else response[-300:],
-            self.ground_truth,
-            self.strict_box_verify,
-            allow_general_math_reference=self.allow_general_math_reference,
-        )
+        try:
+            correct, prediction = verify(
+                response if self.allow_general_math_reference else response[-300:],
+                self.ground_truth,
+                self.strict_box_verify,
+                allow_general_math_reference=self.allow_general_math_reference,
+            )
+        except TypeError as error:
+            if not str(error).startswith(SYMPY_INVALID_INPUT_PREFIX):
+                raise
+            # SymPy can reject an oversized decimal through its TypeError input path.
+            raise NumericCandidateError(str(error)) from error
         generated_tokens = evidence.generated_token_count
         over_budget = generated_tokens is not None and generated_tokens > self.evaluation_token_budget
         parseable_answer = prediction is not None and str(prediction).strip() not in {"", "[INVALID]"}
