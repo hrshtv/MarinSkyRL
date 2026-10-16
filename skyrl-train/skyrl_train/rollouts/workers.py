@@ -182,8 +182,8 @@ class RolloutWorkerPool:
             if index:
                 await asyncio.sleep(interval)
             actor = self._launch_worker(index)
-            await actor.startup.remote()
             self._actors.append(actor)
+            await actor.startup.remote()
             logger.info("Rollout worker {}/{} started", index + 1, count)
 
     def _launch_worker(self, index: int) -> ActorHandle:
