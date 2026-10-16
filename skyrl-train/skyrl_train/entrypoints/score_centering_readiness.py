@@ -265,7 +265,7 @@ class ReadinessTrainer(RayPPOTrainer):
         await self._init_weight_sync()
         await self._sync_policy_for_rollouts(reason="initial")
         self.probe["setup_timings"] = dict(self.all_startup_timings)
-        count = 16 if short else 128
+        count = 32 if short else 128
         self.prompts = []
         for index in range(count):
             messages, _, extra, _ = self.train_dataset[index // 4]
