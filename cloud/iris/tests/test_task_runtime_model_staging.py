@@ -144,8 +144,7 @@ def test_requested_local_policy_tokenizer_uses_own_or_fallback_config(
     policy_config.write_text('{"model_type": "llama"}')
     if tokenizer_has_config:
         (tokenizer_source / "config.json").write_text('{"model_type": "qwen2"}')
-    destination = tmp_path / "prepared-tokenizer"
-    monkeypatch.setattr(task_runtime, "_metadata_path", lambda _uri, _revision: str(destination))
+    monkeypatch.setattr(task_runtime.tempfile, "gettempdir", lambda: str(tmp_path))
 
     prepared = prepare_policy_tokenizer(
         Namespace(policy_tokenizer=str(tokenizer_source), policy_tokenizer_revision="tokenizer-commit"),
@@ -153,7 +152,8 @@ def test_requested_local_policy_tokenizer_uses_own_or_fallback_config(
     )
 
     assert prepared is not None
-    assert prepared.local_path == str(destination)
+    destination = Path(prepared.local_path)
+    assert destination.is_relative_to(tmp_path)
     assert (destination / "tokenizer.json").read_text() == '{"identity": "requested"}'
     assert (destination / "tokenizer_config.json").read_text() == '{"chat_template": "requested"}'
     expected_model_type = "qwen2" if tokenizer_has_config else "llama"

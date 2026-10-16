@@ -110,7 +110,10 @@ class RemoteSafetensorsTensorStore:
         source = self._handles.get(shard)
         if source is None:
             started = time.monotonic()
-            source = io.open_file(join_resource_path(self.source_uri, shard), "rb", cache_type="none")
+            uri = join_resource_path(self.source_uri, shard)
+            filesystem, path = io.filesystem_and_path(uri)
+            options = {"cache_type": "none"} if io.is_cloud_path(uri) else {}
+            source = filesystem.open(path, "rb", **options)
             self._handles[shard] = source
             self._opens += 1
             self._read_seconds += time.monotonic() - started

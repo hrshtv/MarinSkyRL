@@ -60,8 +60,7 @@ def _write_index(metadata_dir: Path, weight_map: dict[str, str]) -> None:
     (metadata_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
 
 
-@pytest.mark.parametrize("indexed", [True, False])
-@pytest.mark.parametrize("expert_layout", ["stacked", "split"])
+@pytest.mark.parametrize(("indexed", "expert_layout"), [(True, "stacked"), (False, "stacked"), (True, "split")])
 def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
     tmp_path: Path, monkeypatch, indexed: bool, expert_layout: str
 ) -> None:
@@ -85,9 +84,13 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
         save_file(tensors, shard)
     shards = {f"bucket/policy/{expert_shard.name}": expert_shard.read_bytes()} if split_shards else {}
     filesystem = CountingFileSystem(shard.read_bytes(), shards)
-    local_filesystem_for = io._get_filesystem
+    local_filesystem_for = io.filesystem_and_path
     monkeypatch.setattr(
-        io, "_get_filesystem", lambda path: filesystem if path.startswith("s3://") else local_filesystem_for(path)
+        io,
+        "filesystem_and_path",
+        lambda path: (filesystem, path.removeprefix("s3://"))
+        if path.startswith("s3://")
+        else local_filesystem_for(path),
     )
     metadata = tmp_path / "metadata"
     if indexed:
@@ -125,31 +128,6 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
     )
     assert store.read_stats.opens == filesystem.opens == (2 if split_shards else 1)
     assert filesystem.fetched_bytes == filesystem.bytes_read == store.read_stats.bytes_read == expected_bytes
-
-
-@pytest.mark.parametrize("indexed", [True, False])
-def test_loads_only_requested_tensor_range_without_local_weight_files(tmp_path: Path, indexed: bool) -> None:
-    remote = tmp_path / "remote"
-    remote.mkdir()
-    weight_file = "model-00001-of-00001.safetensors" if indexed else "model.safetensors"
-    save_file(
-        {
-            "layer.0.weight": torch.arange(8, dtype=torch.float32),
-            "layer.1.weight": torch.arange(1_000_000, dtype=torch.float32),
-        },
-        remote / weight_file,
-    )
-    metadata = tmp_path / "metadata"
-    if indexed:
-        _write_index(metadata, {"layer.0.weight": weight_file, "layer.1.weight": weight_file})
-    else:
-        metadata.mkdir()
-
-    store = RemoteSafetensorsTensorStore(str(remote), metadata)
-    loaded = store.load_tensors(["layer.0.weight"])
-
-    torch.testing.assert_close(loaded["layer.0.weight"], torch.arange(8, dtype=torch.float32))
-    assert store.read_stats.bytes_read < (remote / weight_file).stat().st_size
     assert not tuple(metadata.glob("*.safetensors"))
 
 

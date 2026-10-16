@@ -128,34 +128,37 @@ def test_eval_dataset_filtering(mock_tokenizer, sample_dataset, tmp_path, probe_
     assert all(row["input"].metadata.metric_class == "gsm8k" for row in rows)
 
 
-@pytest.mark.parametrize(("nested_source", "expected_source"), [(None, "fixture"), ("nested-source", "nested-source")])
-def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(tmp_path, nested_source, expected_source):
+@pytest.mark.parametrize(("nested_source", "row_count"), [(None, 3), ("nested-source", 3), ("nested-source", 20_000)])
+def test_source_tasks_preserve_row_indices_and_source_labels_after_filtering(
+    tmp_path, fork_records, nested_source, row_count
+):
     rows = [
         {
-            "prompt": [{"role": "user", "content": content}],
+            "prompt": [{"role": "user", "content": "x" * 200 if index % 3 == 1 else f"Question {index}"}],
             "env_class": "gsm8k",
             "reward_spec": {"ground_truth": "PRIVATE_ANSWER"},
             "teacher_route": "math",
             "data_source": "fixture",
             "extra_info": {"grade": index, "data_source": nested_source},
         }
-        for index, content in enumerate(("First question", "x" * 200, "Last question"))
+        for index in range(row_count)
     ]
     source = tmp_path / "source.jsonl"
     source.write_text("\n".join(json.dumps(row) for row in rows))
-
     dataset = SourceTaskDataset(
         [str(source)],
         _StubTokenizer(),
         100,
         environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
-        num_workers=1,
+        num_workers=2,
     )
+    indices = [index for index in range(row_count) if index % 3 != 1]
     prepared = dataset.collate_fn([dataset[index] for index in range(len(dataset))])
-    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[0]["prompt"], rows[2]["prompt"]]
-    tasks = [row["input"].lowered.task for row in prepared]
-    assert [task.source.row for task in tasks] == ["0", "2"]
-    assert [row["input"].metadata.data_source for row in prepared] == [expected_source, expected_source]
+    assert [task_messages(row["input"].lowered) for row in prepared] == [rows[index]["prompt"] for index in indices]
+    assert [row["input"].lowered.task.source.row for row in prepared] == [str(index) for index in indices]
+    assert [row["input"].metadata.data_source for row in prepared] == [nested_source or "fixture"] * len(indices)
+    assert dataset.dataframe.cache_files == []
+    assert bool(tuple(fork_records.iterdir())) == (row_count == 20_000)
 
 
 @patch("datasets.load_dataset")
@@ -294,32 +297,3 @@ def fork_records(tmp_path):
         yield records
     finally:
         enabled = False
-
-
-@pytest.mark.parametrize(("row_count", "uses_process_pool"), [(22, False), (20_000, True)])
-def test_source_tasks_keep_global_row_indices_without_cache_files_and_fork_only_large_inputs(
-    tmp_path, fork_records, row_count, uses_process_pool
-):
-    rows = [
-        {
-            "prompt": [{"role": "user", "content": "x" * 200 if index % 10 == 0 else f"Question {index}"}],
-            "env_class": "gsm8k",
-            "reward_spec": {"ground_truth": "1"},
-        }
-        for index in range(row_count)
-    ]
-    source = tmp_path / "source.parquet"
-    Dataset.from_list(rows).to_parquet(source)
-    dataset = SourceTaskDataset(
-        [str(source)],
-        _StubTokenizer(),
-        100,
-        environment_configs=OmegaConf.to_container(get_default_config().environment.task_sessions, resolve=True),
-        num_workers=2,
-    )
-    expected = [row["prompt"] for index, row in enumerate(rows) if index % 10 != 0]
-    assert list(dataset.dataframe["prompt"]) == expected
-    last = dataset.collate_fn([dataset[len(dataset) - 1]])[0]["input"].lowered.task
-    assert last.source.row == str(row_count - 1)
-    assert dataset.dataframe.cache_files == []
-    assert bool(tuple(fork_records.iterdir())) == uses_process_pool

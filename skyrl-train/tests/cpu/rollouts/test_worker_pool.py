@@ -412,7 +412,7 @@ async def test_shutdown_kills_every_worker_after_parallel_constructor_failure(ra
         ),
     )
     # The caller can retain the startup error while shutting down its worker pool.
-    with pytest.raises(ray.exceptions.RayActorError, match="runner build failed"):
+    with pytest.raises(ray.exceptions.RayActorError, match="runner build failed") as failure:
         await asyncio.wait_for(pool.startup(), timeout=120)
     async with asyncio.timeout(30):
         while len(list(records.glob("worker-*.json"))) < 3:
@@ -427,3 +427,4 @@ async def test_shutdown_kills_every_worker_after_parallel_constructor_failure(ra
         except psutil.NoSuchProcess:
             pass
         assert not psutil.pid_exists(pid)
+    del failure
