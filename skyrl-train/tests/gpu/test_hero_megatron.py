@@ -100,7 +100,7 @@ def write_tiny_hero_checkpoint(path: Path):
 @pytest.mark.parametrize(
     "tp,pp,ep,cp,packing,optimizer_offload,muonh,remote_read_mode",
     [
-        (1, 1, 1, 1, False, None, False, None),
+        pytest.param(1, 1, 1, 1, False, None, False, None, id="remote-default-prefetch"),
         (1, 2, 1, 1, False, None, False, None),
         (1, 1, 2, 1, True, None, False, None),
         (1, 1, 1, 2, True, None, False, None),
