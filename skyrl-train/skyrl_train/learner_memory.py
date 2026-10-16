@@ -62,6 +62,7 @@ class LearnerCudaMetrics:
             attributes["step"] = str(step)
         if overlapped:
             attributes["scope_overlap"] = "true"
+        logger.info("CUDA memory observation: attributes={} fields={}", attributes, fields)
         record_event("cuda_memory_observation", fields, attributes=attributes)
 
     def _disable(self, phase: str, error: Exception) -> None:

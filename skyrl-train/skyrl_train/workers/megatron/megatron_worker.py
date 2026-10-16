@@ -389,14 +389,21 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             return super().forward(data, probe_micro_batch_size=probe_micro_batch_size)
 
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self.strategy.offload_to_cpu(
-            self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
-        )
+        with self._memory.span("offload_to_cpu", step=None):
+            self.strategy.offload_to_cpu(
+                self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
+            )
 
     def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
-        self.strategy.backload_to_gpu(
-            self.actor_module, self.optimizer, non_blocking, backload_optimizer, backload_model
-        )
+        with self._memory.span("backload_to_gpu", step=None):
+            self.strategy.backload_to_gpu(
+                self.actor_module, self.optimizer, non_blocking, backload_optimizer, backload_model
+            )
+
+    def load_checkpoint(self, ckpt_dir, load_training_state=True):
+        phase = "checkpoint_training_state_load" if load_training_state else "checkpoint_weights_load"
+        with self._memory.span(phase, step=None):
+            return super().load_checkpoint(ckpt_dir, load_training_state=load_training_state)
 
     def init_worker_process_group(self):
         """
