@@ -37,6 +37,7 @@ from skyrl_train.distributed.utils import init_worker_process_group_with_device
 from skyrl_train.mismatch_probe.modes import TRAINER_MODES
 from skyrl_train.models.grug_moe import GRUG_MOE_MODEL_TYPE, validate_grug_training_strategy
 from skyrl_train.timing_observability import PhaseBreakdown
+from skyrl_train.tensor_ownership import record_cuda_tensor_ownership
 from marinskyrl.runtime_options import PolicyLossType
 from skyrl_train.training_batch import (
     TrainingBatchIterator,
@@ -388,13 +389,38 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         with self._memory.span("forward", step=data.metadata.get("global_step")):
             return super().forward(data, probe_micro_batch_size=probe_micro_batch_size)
 
+    def _record_tensor_ownership(self, phase: str) -> None:
+        if not self._memory.enabled:
+            return
+        tensors = defaultdict(list)
+        for module in self.actor_module:
+            tensors["model_parameter"].extend(module.parameters())
+            tensors["model_buffer"].extend(value for _, value in module.named_buffers())
+            for name in ("buffers", "expert_parallel_buffers"):
+                for buffer in vars(module).get(name, []):
+                    for field in ("param_data", "grad_data"):
+                        value = vars(buffer).get(field)
+                        if isinstance(value, torch.Tensor):
+                            tensors[f"ddp_{field}"].append(value)
+        for optimizer in vars(self.optimizer).get("chained_optimizers", [self.optimizer]):
+            inner = optimizer.optimizer
+            for group in inner.param_groups:
+                tensors["optimizer_parameter"].extend(group["params"])
+            for state in inner.state.values():
+                for name, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        tensors[f"optimizer_state_{name}"].append(value)
+        record_cuda_tensor_ownership(rank=self._rank, phase=phase, known_tensors=tensors)
+
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
         with self._memory.span("offload_to_cpu", step=None):
             self.strategy.offload_to_cpu(
                 self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
             )
+        self._record_tensor_ownership("offload_to_cpu_exit")
 
     def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
+        self._record_tensor_ownership("backload_to_gpu_enter")
         with self._memory.span("backload_to_gpu", step=None):
             self.strategy.backload_to_gpu(
                 self.actor_module, self.optimizer, non_blocking, backload_optimizer, backload_model
@@ -402,8 +428,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
     def load_checkpoint(self, ckpt_dir, load_training_state=True):
         phase = "checkpoint_training_state_load" if load_training_state else "checkpoint_weights_load"
+        self._record_tensor_ownership(phase + "_enter")
         with self._memory.span(phase, step=None):
-            return super().load_checkpoint(ckpt_dir, load_training_state=load_training_state)
+            result = super().load_checkpoint(ckpt_dir, load_training_state=load_training_state)
+        self._record_tensor_ownership(phase + "_exit")
+        return result
 
     def init_worker_process_group(self):
         """
