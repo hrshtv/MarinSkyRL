@@ -1,12 +1,9 @@
-from skyrl_train.telemetry import ConsumedWork
+from collections.abc import Sequence
+from marinskyrl.runtime_options import AdvantageEstimator
 from skyrl_train.batch_metrics import install_correction
-from skyrl_train.utils.importance_ratio_diagnostics import LocalReduction
-from skyrl_train.batch_assembly import BatchPlan, assemble_slice, fields_from_facts, forward_input
-from skyrl_train.rollouts.buffer import RowFacts
-from skyrl_train.trajectory_runners.trajectory_processing import token_reward_rows
-from skyrl_train.utils.advantage_estimators import batch_advantages, apply_loop_advantages, drop_advantage_inputs
-from skyrl_train.batch_metrics import domain_metric_source_key as _domain_metric_source_key
-from skyrl_train.batch_metrics import domain_reward_metrics as _domain_reward_metrics
+from skyrl_train.utils.advantage_estimators import GRPO_FLAT_REWARD_STD_TOLERANCE
+from skyrl_train.telemetry import ConsumedWork
+from pathlib import Path
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
@@ -18,9 +15,8 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from jaxtyping import Float
-from pathlib import Path
 import ray
 from ray import ObjectRef
 import torch
@@ -35,7 +31,10 @@ import numpy as np
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
-from skyrl_train.rollouts.buffer import RolloutGroup
+from skyrl_train.batch_metrics import reward_metrics, training_metrics, token_staleness_metrics
+
+from skyrl_train.batch_assembly import BatchPlan, assemble_slice, fields_from_facts, forward_input
+from skyrl_train.rollouts.buffer import RolloutGroup, RowFacts
 from skyrl_train.rollouts.context import TrainingContext, TrainingContextState
 from skyrl_train.trajectory_selection import trajectory_selector_from_config
 from skyrl_train.trajectory_runners.base import (
@@ -43,17 +42,12 @@ from skyrl_train.trajectory_runners.base import (
     TrajectoryRunner,
 )
 import copy
-from skyrl_train.batch_sampling import RowOwnership, filter_trajectory_batch
 from skyrl_train.trajectory_runners.trajectory_processing import (
     concatenate_trajectory_batches,
-    get_metrics_from_trajectory_batch,
-    graded_row_indices,
-    normalized_verifier_scores,
-    verifier_score_summary,
+    token_reward_rows,
 )
 from skyrl_train.trajectory_runners.trajectory_retention import make_trajectory_sink
 from skyrl_train.dataset.preprocess import (
-    collate_response_token_channel,
     convert_prompts_responses_to_batch_tensors,
 )
 from skyrl_train.dataset.routed_expert_batch import RoutedExpertRows
@@ -68,8 +62,12 @@ from skyrl_train.env_vars import NCCL_BUFFER_SIZE_ENV_VAR
 from skyrl_train.tensor_math import masked_mean
 from skyrl_train.utils.policy_math import compute_approx_kl, normalize_advantages_dict
 from skyrl_train.utils.kl_controllers import get_kl_controller, FixedKLController, AdaptiveKLController
-from skyrl_train.utils.algorithm_registry import AdvantageEstimator
-from skyrl_train.utils.advantage_estimators import GRPO_FLAT_REWARD_STD_TOLERANCE, compute_advantages_and_returns
+from skyrl_train.utils.advantage_estimators import (
+    compute_advantages_and_returns,
+    batch_advantages,
+    apply_loop_advantages,
+    drop_advantage_inputs,
+)
 from marinskyrl.runtime_options import PolicyLossType, reference_model_required
 from marinskyrl.distillation import (
     DistillationObjectiveKind,
@@ -150,8 +148,7 @@ from skyrl_train.telemetry import (
     record_training_metrics,
 )
 from skyrl_train.rollout_observability import async_phase_window, monitor_event_loop_lag
-from skyrl_train.inference_engines.base import UNSTAMPED_POLICY_STEP
-from skyrl_train.utils.importance_ratio_diagnostics import mismatch_ratio_metrics
+from skyrl_train.utils.importance_ratio_diagnostics import LocalReduction
 from skyrl_train.timing_observability import StepWallTime, publish_startup_timings, publish_step_timings
 from skyrl_train.hf_export import (
     protected_hf_export_steps,
@@ -185,8 +182,6 @@ class CheckpointSnapshot:
 
 _MODEL_INITIALIZATION_TIMEOUT = 60 * 60
 
-MAX_DOMAIN_REWARD_METRICS = 32
-
 
 def _active_online_eagle_results(results: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     return [item for engine_results in results for item in engine_results if item.get("active", False)]
@@ -209,31 +204,6 @@ def consumed_work(training_input: TrainingInputBatch) -> ConsumedWork:
         response_tokens=int(training_input["response_mask"][:real_rows].sum().item()),
         loss_tokens=int(training_input["loss_mask"][:real_rows].sum().item()),
     )
-
-
-def _token_staleness_metrics(
-    staleness: torch.Tensor, loss_mask: torch.Tensor, policy_steps: torch.Tensor | None
-) -> Dict[str, float]:
-    """Staleness of loss-masked response tokens by engine stamp, beside the lease family ``async/staleness_*``."""
-    trained = loss_mask > 0
-    count = trained.count_nonzero().item()
-    if not count:
-        return {}
-    charged = staleness.masked_fill(~trained, 0)
-    metrics = {
-        "async/staleness_tokens_mean": charged.sum().item() / count,
-        "async/staleness_tokens_max": charged.max().item(),
-        "async/staleness_tokens_ratio": charged.count_nonzero().item() / count,
-        "async/staleness_tokens_stamped": 0.0,
-        "async/staleness_tokens_spanning": 0.0,
-    }
-    if policy_steps is not None:
-        stamped = trained & (policy_steps != UNSTAMPED_POLICY_STEP)
-        steps = policy_steps.masked_fill(~stamped, UNSTAMPED_POLICY_STEP)
-        spanning = (stamped & (steps < steps.amax(dim=1, keepdim=True))).any(dim=1)
-        metrics["async/staleness_tokens_stamped"] = stamped.count_nonzero().item() / count
-        metrics["async/staleness_tokens_spanning"] = spanning.float().mean().item()
-    return metrics
 
 
 def _zero_std_group_fraction(uids: Sequence[str], rewards: torch.Tensor) -> float:
@@ -2098,18 +2068,10 @@ class RayPPOTrainer:
             plan, range(len(uids)), trajectory_batch, tokenizer=self.tokenizer, algorithm=self.cfg.trainer.algorithm
         )
         if self._training_metrics_enabled:
-            policy_steps = (
-                collate_response_token_channel(
-                    trajectory_batch.get("rollout_policy_steps"),
-                    training_input["response_mask"],
-                    dtype=torch.int32,
-                    expected_lengths=[len(row) for row in trajectory_batch["response_ids"]],
-                )
-                if rollout_staleness is not None
-                else None
-            )
             self.all_metrics.update(
-                _token_staleness_metrics(training_input["rollout_staleness"], training_input["loss_mask"], policy_steps)
+                token_staleness_metrics(
+                    training_input, facts if rollout_staleness is not None else (), reduction=LocalReduction()
+                )
             )
         rollout_staleness_tensor = training_input["rollout_staleness"]
         prompt_ids = trajectory_batch["prompt_token_ids"]
@@ -2357,53 +2319,17 @@ class RayPPOTrainer:
 
     def _record_reward_metrics(self, trajectory_batch: TrajectoryBatch, uids: List[str]) -> None:
         """Record reward metrics over graded rows; a step with none records no reward metrics."""
-        graded_indices = graded_row_indices(trajectory_batch)
-        if not graded_indices:
-            return
-        if len(graded_indices) < len(trajectory_batch["rewards"]):
-            trajectory_batch = filter_trajectory_batch(
-                trajectory_batch, graded_indices, row_ownership=RowOwnership.BORROWED
+        metrics = reward_metrics(
+            (RowFacts.from_batch(trajectory_batch),), uids, n_samples_per_prompt=self.cfg.generator.n_samples_per_prompt
+        )
+        self.all_metrics.update(metrics)
+        if metrics:
+            logger.info(
+                "reward/avg_pass_at_{}: {}, reward/avg_raw_reward: {}",
+                self.cfg.generator.n_samples_per_prompt,
+                metrics[f"reward/avg_pass_at_{self.cfg.generator.n_samples_per_prompt}"],
+                metrics["reward/avg_raw_reward"],
             )
-            uids = [uids[index] for index in graded_indices]
-        mean_reward, pass_at_n = get_metrics_from_trajectory_batch(trajectory_batch, uids)
-        rewards = trajectory_batch["rewards"]
-        n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
-
-        reward_metrics = {
-            f"reward/avg_pass_at_{n_samples_per_prompt}": pass_at_n,
-            "reward/avg_raw_reward": mean_reward,
-        }
-        # A group whose rewards all tie carries no advantage signal.
-        grouped_rewards = defaultdict(list)
-        for uid, reward in zip(uids, rewards):
-            grouped_rewards[uid].append(float(np.sum(reward)))
-        reward_metrics["reward/informative_group_fraction"] = sum(
-            max(values) > min(values) for values in grouped_rewards.values()
-        ) / len(grouped_rewards)
-        verifier_scores = normalized_verifier_scores(trajectory_batch)
-        if verifier_scores is not None:
-            coverage, average = verifier_score_summary(verifier_scores)
-            reward_metrics["reward/verifier_score_coverage"] = coverage
-            if average is not None:
-                reward_metrics["reward/avg_verifier_score"] = average
-            results = trajectory_batch["verification_results"]
-            scores_by_agent: Dict[str, List[float]] = defaultdict(list)
-            for result, score in zip(results, verifier_scores, strict=True):
-                if result is not None and score is not None and isinstance(result.diagnostics.get("agent"), str):
-                    agent = _domain_metric_source_key(result.diagnostics["agent"])
-                    scores_by_agent[agent].append(score)
-            for agent in sorted(scores_by_agent)[:MAX_DOMAIN_REWARD_METRICS]:
-                reward_metrics[f"reward/agent/{agent}/avg_verifier_score"] = float(np.mean(scores_by_agent[agent]))
-        self.all_metrics.update(reward_metrics)
-        data_sources = trajectory_batch.get("data_sources")
-        if data_sources is not None:
-            self.all_metrics.update(
-                _domain_reward_metrics(
-                    data_sources,
-                    [float(sum(reward) if isinstance(reward, list) else reward) for reward in rewards],
-                )
-            )
-        logger.info(f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, reward/avg_raw_reward: {mean_reward}")
 
     def select_trajectories(
         self, trajectory_batch: TrajectoryBatch, uids: List[str]
@@ -2601,9 +2527,6 @@ class RayPPOTrainer:
     ):
         """Attach policy scores, optional reference scores and values, and forward diagnostics."""
         # The shared forward projection retains compact replay routes.
-        fwd_keys = ["sequences", "attention_mask"]
-        if training_input.routed_experts is not None:
-            fwd_keys.append("rollout_routed_experts")
         data_fwd_pass = forward_input(training_input)
         data_fwd_pass.metadata["global_step"] = self.global_step
 
@@ -2633,9 +2556,8 @@ class RayPPOTrainer:
 
             reference_data = data_fwd_pass
             if "ftpo_chosen_mask" in training_input:
-                reference_data = training_input.select(
-                    keys=fwd_keys + ["ftpo_chosen_mask"], metadata_keys=["response_length"]
-                )
+                reference_data = forward_input(training_input)
+                reference_data["ftpo_chosen_mask"] = training_input["ftpo_chosen_mask"]
                 reference_data.metadata["global_step"] = self.global_step
             reference_score_refs = self.ref_model.async_run_ray_method("mesh", "forward", data=reference_data)
 
@@ -2707,34 +2629,17 @@ class RayPPOTrainer:
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
-        # Only the mismatch statistics read token staleness, so the workers never receive it.
-        rollout_staleness = training_input.pop("rollout_staleness")
-        if self._training_metrics_enabled and training_input.get("rollout_logprobs") is not None:
-            self.all_metrics.update(
-                mismatch_ratio_metrics(
-                    action_log_probs,
-                    training_input["rollout_logprobs"],
-                    training_input["loss_mask"],
-                    rollout_staleness,
-                    eps_clip_low=self.cfg.trainer.algorithm.eps_clip_low,
-                    eps_clip_high=self.cfg.trainer.algorithm.eps_clip_high,
-                )
-            )
-
-        if self.cfg.generator.sampling_params.logprobs is not None and training_input["rollout_logprobs"] is not None:
-            logprobs_diff = (
-                training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
-                - action_log_probs[training_input["loss_mask"] > 0]
-            )
-            prob_diff = logprobs_diff.exp().abs()
-            prob_diff_mean = prob_diff.mean().item()
-            prob_diff_std = prob_diff.std().item()
-            self.all_metrics.update(
-                {
-                    "policy/rollout_train_prob_diff_mean": prob_diff_mean,
-                    "policy/rollout_train_prob_diff_std": prob_diff_std,
-                }
-            )
+        metrics = training_metrics(
+            training_input,
+            algorithm=self.cfg.trainer.algorithm,
+            reduction=LocalReduction(),
+            phase="forward",
+            step_wise=self.cfg.trainer.step_wise_training,
+            training_metrics_enabled=self._training_metrics_enabled,
+            rollout_logprobs_enabled=self.cfg.generator.sampling_params.logprobs is not None,
+        )
+        if metrics:
+            self.all_metrics.update(metrics)
         # Always log KL divergence as a diagnostic, even when not used as penalty
         if base_log_probs is not None:
             _kl = compute_approx_kl(
