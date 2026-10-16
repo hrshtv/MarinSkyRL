@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -23,12 +24,36 @@ from skyrl_train.trainer import RayPPOTrainer, convert_prompts_responses_to_batc
 from skyrl_train.training_batch import TrainingInputBatch
 
 
+_device_memory_peak = 0
+_device_memory_lock = threading.Lock()
+_device_memory_thread = None
+
+
+def sample_device_memory(device):
+    global _device_memory_peak
+    timer = threading.Event()
+    while not timer.wait(0.1):
+        used = torch.cuda.device_memory_used(device)
+        with _device_memory_lock:
+            _device_memory_peak = max(_device_memory_peak, used)
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 def memory_stats(reset=False):
+    global _device_memory_peak, _device_memory_thread
     torch.cuda.synchronize()
+    used = torch.cuda.device_memory_used()
+    with _device_memory_lock:
+        _device_memory_peak = used if reset else max(_device_memory_peak, used)
+        peak = _device_memory_peak
+    if _device_memory_thread is None:
+        _device_memory_thread = threading.Thread(
+            target=sample_device_memory, args=(torch.cuda.current_device(),), daemon=True
+        )
+        _device_memory_thread.start()
     if reset:
         torch.cuda.reset_peak_memory_stats()
     return {
@@ -37,6 +62,9 @@ def memory_stats(reset=False):
         "reserved": torch.cuda.memory_reserved(),
         "peak_allocated": torch.cuda.max_memory_allocated(),
         "peak_reserved": torch.cuda.max_memory_reserved(),
+        "device_used": used,
+        "sampled_device_peak_used": peak,
+        "device_sampling_interval": 0.1,
     }
 
 
