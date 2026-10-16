@@ -231,11 +231,27 @@ class ReadinessTrainer(RayPPOTrainer):
                 "sampling_params_per_prompt": overrides,
             }
         )
+        shifted = await self.inference_engine_client.generate(
+            {
+                "prompt_token_ids": [prefix[:-1] for prefix in prefixes],
+                "sampling_params": {
+                    "temperature": temperature,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_tokens": 1,
+                    "logprobs": 128,
+                },
+                "sampling_params_per_prompt": overrides,
+            }
+        )
         gaps = []
+        shifted_gaps = []
         for index, target in enumerate(expected):
             assert replay["student_topk_indices"][index][0] == overrides[index]["logprob_token_ids"]
             gaps.extend(np.asarray(replay["behavior_topk_logprobs"][index][0]) - np.asarray(target))
+            shifted_gaps.extend(np.asarray(shifted["behavior_topk_logprobs"][index][0]) - np.asarray(target))
             samples[index]["prefix_replay_support_logprobs"] = replay["behavior_topk_logprobs"][index][0]
+        assert np.abs(gaps).mean() < np.abs(shifted_gaps).mean()
         return {
             "prefixes": len(prefixes),
             "prefix_ids_sha256": digest(prefixes),
@@ -243,6 +259,7 @@ class ReadinessTrainer(RayPPOTrainer):
             "temperature": temperature,
             "same_engine_decode_prefill_gap_abs_mean": float(np.abs(gaps).mean()),
             "same_engine_decode_prefill_gap_abs_max": float(np.abs(gaps).max()),
+            "one_token_shift_control_gap_abs_mean": float(np.abs(shifted_gaps).mean()),
             "policy_steps": sorted({step for row in replay["response_policy_steps"] for step in row}),
             "samples": samples,
         }
