@@ -253,6 +253,15 @@ def test_prefetch_bounded_ranges_and_unplanned_reads_preserve_tensors(tmp_path, 
     monkeypatch.setattr(remote_safetensors, "_PREFETCH_MAX_BLOCK", 8)
     monkeypatch.setattr(remote_safetensors, "_PREFETCH_MAX_GAP", 0)
     monkeypatch.setattr(remote_safetensors, "_PREFETCH_WINDOW_BYTES", window_bytes)
+    cat_file = filesystem.cat_file
+    payload_start = 8 + int.from_bytes(filesystem.payload[:8], "little")
+
+    def bounded_fetch(path, start=None, end=None, **kwargs):
+        if window_bytes == 16 and start is not None and start >= payload_start:
+            assert end - start <= 8
+        return cat_file(path, start=start, end=end, **kwargs)
+
+    monkeypatch.setattr(filesystem, "cat_file", bounded_fetch)
     cat_ranges = filesystem.cat_ranges
 
     def bounded_ranges(paths, starts, ends, **kwargs):
