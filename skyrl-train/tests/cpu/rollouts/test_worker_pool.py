@@ -390,8 +390,10 @@ class _FailingBuildSpec:
         return SimpleNamespace(startup=lifecycle, shutdown=lifecycle)
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("start_interval_seconds", [0, 0.01])
 @pytest.mark.asyncio
-async def test_shutdown_kills_every_worker_after_parallel_constructor_failure(ray_init, tmp_path):
+async def test_shutdown_kills_every_worker_after_constructor_failure(ray_init, tmp_path, start_interval_seconds):
     model = build_tiny_policy(tmp_path / "model")
     # The driver owns registries so a failed worker cannot terminate them during imports.
     sync_registries()
@@ -408,16 +410,22 @@ async def test_shutdown_kills_every_worker_after_parallel_constructor_failure(ra
     pool = RolloutWorkerPool(
         spec,
         RolloutWorkerResources(
-            num_workers=3, cpus_per_worker=1, executor_threads=1, progress_timeout_seconds=30, start_interval_seconds=0
+            num_workers=3,
+            cpus_per_worker=1,
+            executor_threads=1,
+            progress_timeout_seconds=30,
+            start_interval_seconds=start_interval_seconds,
         ),
     )
     # The caller can retain the startup error while shutting down its worker pool.
     with pytest.raises(ray.exceptions.RayActorError, match="runner build failed") as failure:
         await asyncio.wait_for(pool.startup(), timeout=120)
+    expected_workers = 3 if start_interval_seconds == 0 else 2
     async with asyncio.timeout(30):
-        while len(list(records.glob("worker-*.json"))) < 3:
+        while len(list(records.glob("worker-*.json"))) < expected_workers:
             await asyncio.sleep(0.01)
-    processes = [json.loads((records / f"worker-{index}.json").read_text())["pid"] for index in (0, 2)]
+    healthy_workers = (0, 2) if start_interval_seconds == 0 else (0,)
+    processes = [json.loads((records / f"worker-{index}.json").read_text())["pid"] for index in healthy_workers]
     assert all(psutil.pid_exists(pid) for pid in processes)
     with pytest.raises(ExceptionGroup):
         await asyncio.wait_for(pool.shutdown(), timeout=30)

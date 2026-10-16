@@ -386,7 +386,7 @@ def _copy_tokenizer_metadata(source: Path, destination: Path) -> None:
 
 
 def prepare_policy_tokenizer(
-    args: argparse.Namespace, *, policy_config_path: Path | None = None
+    args: argparse.Namespace, *, policy_config_path: Path | None
 ) -> PreparedPolicyTokenizer | None:
     """Stage the requested tokenizer with model metadata for config resolution."""
     tokenizer_path = args.policy_tokenizer

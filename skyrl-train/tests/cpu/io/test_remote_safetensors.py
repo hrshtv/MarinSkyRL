@@ -11,6 +11,7 @@ import torch
 from cloud.iris.hf_model_cache import stage_model_metadata
 from marinskyrl.model_manifest import snapshot_model_manifest
 from skyrl_train.io import io
+from skyrl_train.models.grug_moe import GRUG_STACKED_EXPERT_SLICE_PATTERNS
 from skyrl_train.distributed.megatron.remote_prefetch import (
     lazy_first_dim_patterns_for_bridge,
     prefetch_items_from_tasks,
@@ -23,7 +24,6 @@ from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore
 class CountingBufferedFile(AbstractBufferedFile):
     def read(self, length=-1):
         payload = super().read(length)
-        self.fs.reads += 1
         self.fs.bytes_read += len(payload)
         return payload
 
@@ -37,7 +37,6 @@ class CountingFileSystem(AbstractFileSystem):
         self.payload = payload
         self.shards = shards or {}
         self.opens = 0
-        self.reads = 0
         self.bytes_read = 0
         self.fetched_bytes = 0
         self.gets = 0
@@ -110,15 +109,10 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
             if path.startswith("s3://")
             else local_filesystem_for(path),
         )
-        # Grug's registered Bridge requires Megatron, which is outside the CPU lane.
         store = RemoteSafetensorsTensorStore(
             "s3://bucket/policy",
             metadata,
-            lazy_first_dim_patterns=(
-                "model.layers.*.mlp.experts.gate_proj.weight",
-                "model.layers.*.mlp.experts.up_proj.weight",
-                "model.layers.*.mlp.experts.down_proj.weight",
-            ),
+            lazy_first_dim_patterns=GRUG_STACKED_EXPERT_SLICE_PATTERNS,
         )
         tasks = [
             SimpleNamespace(
@@ -218,7 +212,7 @@ def test_twelve_rank_simulation_records_bounded_remote_reads_and_local_disk(tmp_
         RemoteSafetensorsTensorStore(
             str(remote),
             metadata,
-            lazy_first_dim_patterns=("model.layers.*.mlp.experts.*_proj.weight",),
+            lazy_first_dim_patterns=GRUG_STACKED_EXPERT_SLICE_PATTERNS,
         )
         for metadata in metadata_dirs
     ]
