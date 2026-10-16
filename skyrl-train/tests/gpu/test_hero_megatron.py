@@ -1,6 +1,7 @@
 """Hero architecture through the actual Megatron worker, with split-expert checkpoints."""
 
 import math
+from contextlib import ExitStack
 import os
 import posixpath
 from pathlib import Path
@@ -100,7 +101,7 @@ def write_tiny_hero_checkpoint(path: Path):
 @pytest.mark.parametrize(
     "tp,pp,ep,cp,packing,optimizer_offload,muonh,remote_read_mode",
     [
-        pytest.param(1, 1, 1, 1, False, None, False, None, id="remote-default-prefetch"),
+        pytest.param(1, 1, 1, 1, False, None, False, "default", id="remote-default-prefetch"),
         (1, 2, 1, 1, False, None, False, None),
         (1, 1, 2, 1, True, None, False, None),
         (1, 1, 1, 2, True, None, False, None),
@@ -124,43 +125,52 @@ def test_hero_worker_repeated_updates(
     model_path = tmp_path / "model"
     model_path.mkdir()
     original = write_tiny_hero_checkpoint(model_path)
-    source_uri = posixpath.join(checkpoint_prefix, "tests", "hero-source", uuid4().hex)
-    manifest = snapshot_model_manifest(model_path, model_id="tiny-hero", revision="fixture")
-    io.upload_directory(str(model_path), source_uri)
-    metadata = tmp_path / "metadata"
-    stage_model_metadata(source_uri, manifest, str(metadata))
-    cfg = _config(str(metadata), world_size=world_size, pp=pp, ep=ep)
-    cfg.trainer.policy.model.source_uri = source_uri
-    if remote_read_mode is not None:
-        cfg.trainer.policy.model.remote_read_mode = remote_read_mode
-    cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
-    cfg.trainer.policy.megatron_config.context_parallel_size = cp
-    if muonh:
-        cfg.trainer.policy.optimizer_config.optimizer = "MuonH"
-        cfg.trainer.policy.optimizer_config.weight_decay = 0.0
-        cfg.trainer.policy.optimizer_config.adam_betas = [0.9, 0.95]
-        cfg.trainer.policy.optimizer_config.optimizer_kwargs = {"adam_lr": 2.0e-2, "offload_momentum": True}
-        cfg.trainer.policy.megatron_config.optimizer_checkpoint_sharding_type = "dp_reshardable"
-    if optimizer_offload is not None:
-        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-        cfg.trainer.flash_attn = True
-        megatron = cfg.trainer.policy.megatron_config
-        megatron.ddp_config.overlap_param_gather = True
-        megatron.ddp_config.grad_reduce_in_fp32 = False
-        megatron.optimizer_checkpoint_sharding_type = "dp_reshardable"
-        with open_dict(megatron.transformer_config_kwargs), open_dict(megatron.optimizer_config_kwargs):
-            megatron.transformer_config_kwargs.deterministic_mode = True
-            megatron.optimizer_config_kwargs.use_precision_aware_optimizer = True
-            megatron.optimizer_config_kwargs.store_param_remainders = False
-            megatron.optimizer_config_kwargs.optimizer_cpu_offload = optimizer_offload > 0
-            megatron.optimizer_config_kwargs.optimizer_offload_fraction = optimizer_offload
-            megatron.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d = False
-    cfg.trainer.use_sample_packing = packing
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    batch = _padded_batch(tokenizer.pad_token_id, prompt_length=48, response_length=48, variable_lengths=True)
-    validate_cfg(cfg)
-    initialize_ray(cfg)
-    try:
+    source_uri = (
+        posixpath.join(checkpoint_prefix, "tests", "hero-source", uuid4().hex) if remote_read_mode is not None else None
+    )
+    with ExitStack() as cleanup:
+        for path in (checkpoint, source_uri):
+            if path is not None:
+                cleanup.callback(lambda path=path: io.remove(path) if io.exists(path) else None)
+        cleanup.callback(ray.shutdown)
+        policy_path = model_path
+        if source_uri is not None:
+            manifest = snapshot_model_manifest(model_path, model_id="tiny-hero", revision="fixture")
+            io.upload_directory(str(model_path), source_uri)
+            policy_path = tmp_path / "metadata"
+            stage_model_metadata(source_uri, manifest, str(policy_path))
+        cfg = _config(str(policy_path), world_size=world_size, pp=pp, ep=ep)
+        if source_uri is not None:
+            cfg.trainer.policy.model.source_uri = source_uri
+        if remote_read_mode == "per_key":
+            cfg.trainer.policy.model.remote_read_mode = remote_read_mode
+        cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
+        cfg.trainer.policy.megatron_config.context_parallel_size = cp
+        if muonh:
+            cfg.trainer.policy.optimizer_config.optimizer = "MuonH"
+            cfg.trainer.policy.optimizer_config.weight_decay = 0.0
+            cfg.trainer.policy.optimizer_config.adam_betas = [0.9, 0.95]
+            cfg.trainer.policy.optimizer_config.optimizer_kwargs = {"adam_lr": 2.0e-2, "offload_momentum": True}
+            cfg.trainer.policy.megatron_config.optimizer_checkpoint_sharding_type = "dp_reshardable"
+        if optimizer_offload is not None:
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            cfg.trainer.flash_attn = True
+            megatron = cfg.trainer.policy.megatron_config
+            megatron.ddp_config.overlap_param_gather = True
+            megatron.ddp_config.grad_reduce_in_fp32 = False
+            megatron.optimizer_checkpoint_sharding_type = "dp_reshardable"
+            with open_dict(megatron.transformer_config_kwargs), open_dict(megatron.optimizer_config_kwargs):
+                megatron.transformer_config_kwargs.deterministic_mode = True
+                megatron.optimizer_config_kwargs.use_precision_aware_optimizer = True
+                megatron.optimizer_config_kwargs.store_param_remainders = False
+                megatron.optimizer_config_kwargs.optimizer_cpu_offload = optimizer_offload > 0
+                megatron.optimizer_config_kwargs.optimizer_offload_fraction = optimizer_offload
+                megatron.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d = False
+        cfg.trainer.use_sample_packing = packing
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        batch = _padded_batch(tokenizer.pad_token_id, prompt_length=48, response_length=48, variable_lengths=True)
+        validate_cfg(cfg)
+        initialize_ray(cfg)
         policy = _init_policy(cfg, world_size)
         if muonh:
             snapshots = ray.get(policy.async_run_ray_method("pass_through", "grug_optimizer_route_snapshot"))
@@ -233,8 +243,3 @@ def test_hero_worker_repeated_updates(
             resumed = rank0_validation_snapshot(policy, names)
             for name in names:
                 torch.testing.assert_close(resumed[name], expected[name], rtol=0, atol=0)
-    finally:
-        ray.shutdown()
-        if io.exists(checkpoint):
-            io.remove(checkpoint)
-        io.remove(source_uri)
