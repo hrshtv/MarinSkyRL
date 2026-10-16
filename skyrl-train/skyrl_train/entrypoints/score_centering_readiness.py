@@ -163,7 +163,6 @@ class ReadinessTrainer(RayPPOTrainer):
                         "top_k": -1,
                         "min_p": 0.0,
                         "max_tokens": limit,
-                        "min_tokens": limit,
                         "ignore_eos": True,
                         "seed": 611 + group,
                         "logprobs": width,
