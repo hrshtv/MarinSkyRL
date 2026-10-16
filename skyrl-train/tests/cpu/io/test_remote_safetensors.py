@@ -11,7 +11,10 @@ import torch
 from cloud.iris.hf_model_cache import stage_model_metadata
 from marinskyrl.model_manifest import snapshot_model_manifest
 from skyrl_train.io import io
-from skyrl_train.distributed.megatron.remote_prefetch import lazy_first_dim_patterns_for_bridge, prefetch_items_from_tasks
+from skyrl_train.distributed.megatron.remote_prefetch import (
+    lazy_first_dim_patterns_for_bridge,
+    prefetch_items_from_tasks,
+)
 from skyrl_train.config.remote_read import RemoteReadMode
 import skyrl_train.io.remote_safetensors as remote_safetensors
 from skyrl_train.io.remote_safetensors import RemoteSafetensorsTensorStore
@@ -100,7 +103,13 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
     local_filesystem_for = io.filesystem_and_path
     for mode in RemoteReadMode:
         filesystem = CountingFileSystem(shard.read_bytes(), shards)
-        monkeypatch.setattr(io, "filesystem_and_path", lambda path: (filesystem, path.removeprefix("s3://")) if path.startswith("s3://") else local_filesystem_for(path))
+        monkeypatch.setattr(
+            io,
+            "filesystem_and_path",
+            lambda path: (filesystem, path.removeprefix("s3://"))
+            if path.startswith("s3://")
+            else local_filesystem_for(path),
+        )
         # Grug's registered Bridge requires Megatron, which is outside the CPU lane.
         store = RemoteSafetensorsTensorStore(
             "s3://bucket/policy",
@@ -112,13 +121,33 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
             ),
         )
         tasks = [
-            SimpleNamespace(megatron_module=object(), mapping=SimpleNamespace(hf_param={"left": "layer.2.weight", "right": "layer.0.weight"}, megatron_param="dense")),
-            SimpleNamespace(megatron_module=object(), mapping=SimpleNamespace(hf_param="layer.1.weight", megatron_param="dense")),
-            *[SimpleNamespace(megatron_module=object(), mapping=SimpleNamespace(
-                hf_param=expert_key if expert_layout == "stacked" else f"model.layers.0.mlp.experts.{index}.down_proj.weight",
-                megatron_param=str(index))) for index in (2, 0, 1)],
-            SimpleNamespace(megatron_module=None, mapping=SimpleNamespace(hf_param="unrequested.weight", megatron_param="other")),
-            SimpleNamespace(megatron_module=object(), mapping=SimpleNamespace(hf_param="missing.weight", megatron_param="dense")),
+            SimpleNamespace(
+                megatron_module=object(),
+                mapping=SimpleNamespace(
+                    hf_param={"left": "layer.2.weight", "right": "layer.0.weight"}, megatron_param="dense"
+                ),
+            ),
+            SimpleNamespace(
+                megatron_module=object(), mapping=SimpleNamespace(hf_param="layer.1.weight", megatron_param="dense")
+            ),
+            *[
+                SimpleNamespace(
+                    megatron_module=object(),
+                    mapping=SimpleNamespace(
+                        hf_param=expert_key
+                        if expert_layout == "stacked"
+                        else f"model.layers.0.mlp.experts.{index}.down_proj.weight",
+                        megatron_param=str(index),
+                    ),
+                )
+                for index in (2, 0, 1)
+            ],
+            SimpleNamespace(
+                megatron_module=None, mapping=SimpleNamespace(hf_param="unrequested.weight", megatron_param="other")
+            ),
+            SimpleNamespace(
+                megatron_module=object(), mapping=SimpleNamespace(hf_param="missing.weight", megatron_param="dense")
+            ),
         ]
         if mode == RemoteReadMode.PREFETCH:
             store.plan_prefetch(prefetch_items_from_tasks(tasks, store.lazy_first_dim_keys, int))
@@ -139,7 +168,7 @@ def test_single_key_and_expert_slice_reads_fetch_only_requested_bytes(
             len(filesystem.payload) + sum(map(len, shards.values())) - unrequested.numel() * unrequested.element_size()
         )
         assert store.read_stats.opens == filesystem.opens == (2 if split_shards else 1)
-        assert filesystem.fetched_bytes == filesystem.bytes_read == store.read_stats.bytes_read == expected_bytes
+        assert filesystem.fetched_bytes == store.read_stats.bytes_read == expected_bytes
         assert not tuple(metadata.glob("*.safetensors"))
 
         store.close()

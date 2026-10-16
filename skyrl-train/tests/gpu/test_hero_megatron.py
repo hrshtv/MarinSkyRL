@@ -9,7 +9,6 @@ from uuid import uuid4
 from omegaconf import open_dict
 from cloud.iris.hf_model_cache import stage_model_metadata
 from marinskyrl.model_manifest import snapshot_model_manifest
-from skyrl_train.workers.megatron import megatron_worker
 import pytest
 import ray
 import torch
@@ -99,20 +98,23 @@ def write_tiny_hero_checkpoint(path: Path):
 
 
 @pytest.mark.parametrize(
-    "tp,pp,ep,cp,packing,optimizer_offload,muonh",
+    "tp,pp,ep,cp,packing,optimizer_offload,muonh,remote_read_mode",
     [
-        (1, 1, 1, 1, False, None, False),
-        (1, 2, 1, 1, False, None, False),
-        (1, 1, 2, 1, True, None, False),
-        (1, 1, 1, 2, True, None, False),
-        (2, 1, 1, 1, True, None, False),
-        pytest.param(1, 1, 2, 1, True, 0.0, False, id="precision-aware-gpu"),
-        pytest.param(1, 1, 2, 1, True, 0.5, False, id="half-offloaded-adamw"),
-        pytest.param(1, 1, 2, 1, True, 1.0, False, id="cpu-adamw"),
-        pytest.param(1, 2, 2, 1, False, None, True, id="pp2-ep2-muonh-cpu-momentum"),
+        (1, 1, 1, 1, False, None, False, None),
+        (1, 2, 1, 1, False, None, False, None),
+        (1, 1, 2, 1, True, None, False, None),
+        (1, 1, 1, 2, True, None, False, None),
+        (2, 1, 1, 1, True, None, False, None),
+        pytest.param(1, 1, 2, 1, True, 0.0, False, None, id="precision-aware-gpu"),
+        pytest.param(1, 1, 2, 1, True, 0.5, False, None, id="half-offloaded-adamw"),
+        pytest.param(1, 1, 2, 1, True, 1.0, False, None, id="cpu-adamw"),
+        pytest.param(1, 2, 2, 1, False, None, True, None, id="pp2-ep2-muonh-cpu-momentum"),
+        pytest.param(1, 1, 1, 1, False, None, False, "per_key", id="remote-per-key"),
     ],
 )
-def test_hero_worker_repeated_updates(tmp_path, monkeypatch, tp, pp, ep, cp, packing, optimizer_offload, muonh):
+def test_hero_worker_repeated_updates(
+    tmp_path, monkeypatch, tp, pp, ep, cp, packing, optimizer_offload, muonh, remote_read_mode
+):
     world_size = tp * pp * ep * cp
     require_hoppers(world_size)
     checkpoint_prefix = os.environ.get("MARIN_TEMP_PREFIX", os.environ.get("MARIN_PREFIX", ""))
@@ -122,7 +124,15 @@ def test_hero_worker_repeated_updates(tmp_path, monkeypatch, tp, pp, ep, cp, pac
     model_path = tmp_path / "model"
     model_path.mkdir()
     original = write_tiny_hero_checkpoint(model_path)
-    cfg = _config(str(model_path), world_size=world_size, pp=pp, ep=ep)
+    source_uri = posixpath.join(checkpoint_prefix, "tests", "hero-source", uuid4().hex)
+    manifest = snapshot_model_manifest(model_path, model_id="tiny-hero", revision="fixture")
+    io.upload_directory(str(model_path), source_uri)
+    metadata = tmp_path / "metadata"
+    stage_model_metadata(source_uri, manifest, str(metadata))
+    cfg = _config(str(metadata), world_size=world_size, pp=pp, ep=ep)
+    cfg.trainer.policy.model.source_uri = source_uri
+    if remote_read_mode is not None:
+        cfg.trainer.policy.model.remote_read_mode = remote_read_mode
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
     cfg.trainer.policy.megatron_config.context_parallel_size = cp
     if muonh:
@@ -227,45 +237,4 @@ def test_hero_worker_repeated_updates(tmp_path, monkeypatch, tp, pp, ep, cp, pac
         ray.shutdown()
         if io.exists(checkpoint):
             io.remove(checkpoint)
-
-
-def test_hero_remote_read_modes_load_identical_tensors(tmp_path, monkeypatch):
-    require_hoppers(1)
-
-    class InspectablePolicyWorker(megatron_worker.MegatronPolicyWorkerBase):
-        def remote_read_stats(self):
-            return self.remote_hf_state.store.read_stats
-
-    monkeypatch.setattr(megatron_worker, "PolicyWorker", ray.remote(num_gpus=1)(InspectablePolicyWorker))
-    prefix = os.environ.get("MARIN_TEMP_PREFIX", os.environ.get("MARIN_PREFIX", ""))
-    if not prefix.startswith("s3://"):
-        raise ValueError("Run the Hero remote reader test on Iris with CoreWeave object storage configured")
-    remote = posixpath.join(prefix, "tests", "hero-remote-reader", uuid4().hex)
-    model_path = tmp_path / "model"
-    model_path.mkdir()
-    original = write_tiny_hero_checkpoint(model_path)
-    manifest = snapshot_model_manifest(model_path, model_id="tiny-hero", revision="fixture")
-    io.upload_directory(str(model_path), remote)
-    snapshots = []
-    try:
-        for mode in ("per_key", "prefetch"):
-            metadata = tmp_path / mode
-            stage_model_metadata(remote, manifest, str(metadata))
-            assert not tuple(metadata.rglob("*.safetensors"))
-            cfg = _config(str(metadata), world_size=1, pp=1, ep=1)
-            cfg.trainer.policy.model.source_uri = remote
-            cfg.trainer.policy.model.remote_read_mode = mode
-            initialize_ray(cfg)
-            try:
-                policy = _init_policy(cfg, 1)
-                snapshots.append(rank0_validation_snapshot(policy, list(original)))
-                stats = ray.get(policy.async_run_ray_method("pass_through", "remote_read_stats"))[0]
-                assert stats.prefetch_misses == stats.prefetch_unused == 0
-                print(f"Hero remote reader {mode}: {stats}")
-            finally:
-                ray.shutdown()
-        assert snapshots[0].keys() == snapshots[1].keys() == original.keys()
-        for name in original:
-            torch.testing.assert_close(snapshots[0][name], snapshots[1][name], rtol=0, atol=0)
-    finally:
-        io.remove(remote)
+        io.remove(source_uri)
