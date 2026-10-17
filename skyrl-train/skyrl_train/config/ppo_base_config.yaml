@@ -335,7 +335,7 @@ trainer:
   eval_num_prompts: null
   eval_before_train: true
   eval_interval: 5
-  eval_drain_timeout_seconds: 300 # discard unfinished training groups before synchronizing evaluation weights
+  eval_drain_timeout_seconds: 300 # discard unfinished training groups after this evaluation-boundary grace period
   preflight_gate:
     enabled: false
     min_reward: 0.25
