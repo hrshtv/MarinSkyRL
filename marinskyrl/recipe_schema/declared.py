@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TYPE_CHECKING
 
 from pydantic import AfterValidator, Field, PlainSerializer, PositiveInt
 
-from .model import FrozenMap, Section, SectionMap, field, thaw, unset_field
+from .model import FrozenMap, OpenMap, Section, SectionMap, field, thaw, unset_field
 
 if TYPE_CHECKING:
     from .sections import EvalSamplingParams
@@ -112,6 +112,14 @@ class EvaluationCallback(Section):
     stop_when: SectionMap[EvaluationMinimum | EvaluationImprovement] | None = unset_field()
 
 
+class HarborEvaluationCallback(Section):
+    type: Literal["harbor_evaluation"] = field()
+    cohorts: tuple[OpenMap, ...] = field()
+    timeout: int | float = field()
+    minimum_coverage: int | float = field()
+    daytona_api_key_env: str = field()
+
+
 class HFModelSaveCallback(Section):
     type: Literal["hf_model_save"] = field()
     save_steps: int = unset_field()
@@ -165,6 +173,7 @@ Callback = Annotated[
     CheckpointCallback
     | DistillationTokenBudgetCallback
     | EvaluationCallback
+    | HarborEvaluationCallback
     | HFModelSaveCallback
     | DatabaseRegistrationCallback
     | RefModelUpdateCallback
