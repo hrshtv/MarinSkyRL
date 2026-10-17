@@ -198,6 +198,12 @@ def _restore_driver_rng_state(state: dict[str, Any]) -> None:
     torch.set_rng_state(state["torch_cpu"])
 
 
+def _is_checkpoint_storage_error(error: Exception) -> bool:
+    if isinstance(error, ray.exceptions.RayTaskError):
+        error = error.as_instanceof_cause()
+    return isinstance(error, OSError)
+
+
 _MODEL_INITIALIZATION_TIMEOUT = 60 * 60
 
 MAX_DOMAIN_REWARD_METRICS = 32
@@ -830,7 +836,7 @@ class RayPPOTrainer:
 
     def _handle_checkpoint_save_error(self, state: TrainerState, error: Exception) -> None:
         """Record a storage failure or propagate a non-storage worker error."""
-        if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(error.as_instanceof_cause(), OSError):
+        if not _is_checkpoint_storage_error(error):
             raise error
         self._checkpoint_save_failures += 1.0
         self.all_metrics["trainer/checkpoint_save_failures"] = self._checkpoint_save_failures
@@ -863,23 +869,21 @@ class RayPPOTrainer:
         }
 
     def _settle_checkpoint_refs(self, refs: list[ObjectRef], *, operation: str) -> None:
-        """Wait for every rank before raising the first worker error."""
+        """Settle every rank, giving fatal errors priority over recoverable storage errors."""
+        if not refs:
+            return
         timeout = int(self.cfg.trainer.distributed.worker_collective_timeout_seconds)
-        deadline = time.monotonic() + timeout
-        pending = list(refs)
-        first_error: Exception | None = None
-        while pending:
-            ready, pending = ray.wait(pending, num_returns=1, timeout=max(0.0, deadline - time.monotonic()))
-            if not ready:
-                raise RuntimeError(f"{operation}: {len(pending)} worker calls did not settle within {timeout}s")
-            for ref in ready:
-                try:
-                    ray.get(ref)
-                except Exception as error:
-                    if first_error is None:
-                        first_error = error
-        if first_error is not None:
-            raise first_error
+        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+        if pending:
+            raise RuntimeError(f"{operation}: {len(pending)} worker calls did not settle within {timeout}s")
+        errors = []
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise next((error for error in errors if not _is_checkpoint_storage_error(error)), errors[0])
 
     def _save_megatron_component(self, component: str, actors: PPORayActorGroup, root: str) -> set[str]:
         component_path = join_resource_path(root, component)
