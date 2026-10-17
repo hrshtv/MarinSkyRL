@@ -20,6 +20,14 @@ class TokenDecoder(Protocol):
     def decode(self, token_ids: list[int]) -> str: ...
 
 
+class AgentGenerationStopped(Exception):
+    """The engine ended generation; the agent must proceed to verification."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Generation stopped: {reason}")
+
+
 class AgentInferenceBackend:
     """Route each correlated HTTP request to its waiting agent session.
 
@@ -58,7 +66,16 @@ class AgentInferenceBackend:
         if body.get("n", 1) != 1:
             raise ValueError("An agent session requires exactly one completion per request")
         options = {key: value for key, value in body.items() if key not in TRANSPORT_FIELDS}
-        turn = await self.sessions[trial_id](SessionStart(tuple(body["messages"]), options))
+        try:
+            turn = await self.sessions[trial_id](SessionStart(tuple(body["messages"]), options))
+        except AgentGenerationStopped as error:
+            return {
+                "error": {
+                    "message": "Maximum context length reached" if error.reason == "length" else str(error),
+                    "type": "context_length_exceeded" if error.reason == "length" else "generation_stopped",
+                    "code": 400,
+                }
+            }
         finish_reason = (
             "length" if turn.stop_reason == "length" else "tool_calls" if turn.message.get("tool_calls") else "stop"
         )
@@ -99,6 +116,10 @@ class AgentInferenceBackend:
 
     async def chat_completion_stream(self, request_payload: dict[str, Any]):
         response = await self.chat_completion(request_payload)
+        if "error" in response:
+            yield f"data: {json.dumps(response)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         choice = response["choices"][0]
         delta = dict(choice["message"])
         if "tool_calls" in delta:
