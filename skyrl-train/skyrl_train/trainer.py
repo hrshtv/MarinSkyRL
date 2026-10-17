@@ -828,7 +828,10 @@ class RayPPOTrainer:
         finally:
             await self._sync_policy_for_rollouts(reason="checkpoint_restore")
 
-    def _record_checkpoint_save_failure(self, state: TrainerState) -> None:
+    def _handle_checkpoint_save_error(self, state: TrainerState, error: Exception) -> None:
+        """Record a storage failure or propagate a non-storage worker error."""
+        if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(error.as_instanceof_cause(), OSError):
+            raise error
         self._checkpoint_save_failures += 1.0
         self.all_metrics["trainer/checkpoint_save_failures"] = self._checkpoint_save_failures
         logger.opt(exception=True).error(
@@ -879,7 +882,7 @@ class RayPPOTrainer:
             raise first_error
 
     def _save_megatron_component(self, component: str, actors: PPORayActorGroup, root: str) -> set[str]:
-        component_path = os.path.join(root, component)
+        component_path = join_resource_path(root, component)
         refs = actors.async_run_ray_method(
             "pass_through", "save_checkpoint", ckpt_dir=component_path, tokenizer=self.tokenizer
         )
@@ -927,11 +930,11 @@ class RayPPOTrainer:
         for filename, payload in states.items():
             buffer = stdlib_io.BytesIO()
             torch.save(payload, buffer)
-            io.write_bytes_atomic(os.path.join(attempt_path, filename), buffer.getvalue())
+            io.write_bytes_atomic(join_resource_path(attempt_path, filename), buffer.getvalue())
             required.add(filename)
 
-        step_path = os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}")
-        latest_path = os.path.join(self.cfg.trainer.ckpt_path, LATEST_CHECKPOINT_FILE)
+        step_path = join_resource_path(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}")
+        latest_path = join_resource_path(self.cfg.trainer.ckpt_path, LATEST_CHECKPOINT_FILE)
         previous = int(io.read_bytes(latest_path)) if io.exists(latest_path) else None
         if previous is not None and previous > step:
             raise RuntimeError(f"Refusing to replace latest checkpoint step {previous} with older step {step}")
@@ -944,11 +947,11 @@ class RayPPOTrainer:
         """Commit one Megatron generation, returning False after a storage failure."""
         await self._drain_checkpoint_upload()
         step = state.global_step
-        step_path = os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}")
+        step_path = join_resource_path(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{step}")
         attempt_path = new_attempt_path(step_path)
         with (
             Timer("save_checkpoints", self.all_timings),
-            checkpoint_phase("megatron", "save", "checkpoint_foreground_pause", rank=-1, step=step),
+            checkpoint_phase("megatron", "save", "checkpoint_foreground_pause", rank=-1, step=step) as phase,
         ):
             try:
                 io.makedirs(attempt_path, exist_ok=True)
@@ -960,13 +963,9 @@ class RayPPOTrainer:
                 finally:
                     if self.colocate_all:
                         await self._sync_policy_for_rollouts(reason="checkpoint_restore")
-            except OSError:
-                self._record_checkpoint_save_failure(state)
-                return False
-            except ray.exceptions.RayTaskError as error:
-                if not isinstance(error.as_instanceof_cause(), OSError):
-                    raise
-                self._record_checkpoint_save_failure(state)
+            except (OSError, ray.exceptions.RayTaskError) as error:
+                self._handle_checkpoint_save_error(state, error)
+                phase.outcome = "failure"
                 return False
 
             await self.callback_handler.call_event_async("on_save", state, self._control, trainer=self)
@@ -980,13 +979,9 @@ class RayPPOTrainer:
                 finally:
                     if rng_state is not None:
                         _restore_driver_rng_state(rng_state)
-            except OSError:
-                self._record_checkpoint_save_failure(state)
-                return False
-            except ray.exceptions.RayTaskError as error:
-                if not isinstance(error.as_instanceof_cause(), OSError):
-                    raise
-                self._record_checkpoint_save_failure(state)
+            except (OSError, ray.exceptions.RayTaskError) as error:
+                self._handle_checkpoint_save_error(state, error)
+                phase.outcome = "failure"
                 return False
         try:
             self._cleanup_old_checkpoints()
@@ -1000,13 +995,8 @@ class RayPPOTrainer:
         try:
             with Timer("save_checkpoints", self.all_timings):
                 snapshot = await self._save_checkpoints_with_residency()
-        except OSError:
-            self._record_checkpoint_save_failure(state)
-            return
-        except ray.exceptions.RayTaskError as error:
-            if not isinstance(error.as_instanceof_cause(), OSError):
-                raise
-            self._record_checkpoint_save_failure(state)
+        except (OSError, ray.exceptions.RayTaskError) as error:
+            self._handle_checkpoint_save_error(state, error)
             return
 
         try:
@@ -1052,13 +1042,8 @@ class RayPPOTrainer:
         try:
             with Timer("checkpoint_upload_blocking", self.all_timings, log_events=False):
                 duration, cleanup_duration = await task
-        except OSError:
-            self._record_checkpoint_save_failure(state)
-            return False
-        except ray.exceptions.RayTaskError as error:
-            if not isinstance(error.as_instanceof_cause(), OSError):
-                raise
-            self._record_checkpoint_save_failure(state)
+        except (OSError, ray.exceptions.RayTaskError) as error:
+            self._handle_checkpoint_save_error(state, error)
             return False
         self.all_timings["checkpoint_upload"] = self.all_timings.get("checkpoint_upload", 0.0) + duration
         self.all_timings["cleanup_old_checkpoints"] = (

@@ -8,7 +8,7 @@ import math
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from loguru import logger
 from skyrl_train.telemetry import TRAINER_ROLE, WORKER_ROLE, phase_attributes, phase_duration
@@ -54,6 +54,11 @@ class PhaseTiming:
     parent: str | None
 
 
+@dataclass
+class CheckpointPhase:
+    outcome: Literal["success", "failure"] = "success"
+
+
 @contextmanager
 def checkpoint_phase(
     backend: str,
@@ -62,14 +67,14 @@ def checkpoint_phase(
     *,
     rank: int,
     step: int | None,
-) -> Iterator[None]:
+) -> Iterator[CheckpointPhase]:
     """Record a rank-local wall span without synchronizing CUDA."""
     started = time.perf_counter()
-    outcome = "success"
+    observation = CheckpointPhase()
     try:
-        yield
+        yield observation
     except BaseException:
-        outcome = "failure"
+        observation.outcome = "failure"
         raise
     finally:
         duration = time.perf_counter() - started
@@ -79,7 +84,7 @@ def checkpoint_phase(
             "phase": phase,
             "rank": str(rank),
             "step": str(step),
-            "outcome": outcome,
+            "outcome": observation.outcome,
             "clock_domain": "inclusive_wall",
             "role": WORKER_ROLE if rank >= 0 else TRAINER_ROLE,
         }
