@@ -68,18 +68,6 @@ def test_committed_but_unadvertised_later_step_does_not_block_previous_resume(tm
     assert resolve_checkpoint_payload(str(previous_step), verify_files=True)
 
 
-def test_commit_resolves_exact_attempt_and_verifies_inventory(tmp_path):
-    step_path = tmp_path / "global_step_1"
-    attempt = _attempt(step_path)
-
-    commit_attempt(str(step_path), str(attempt), required_files=_REQUIRED)
-
-    assert resolve_checkpoint_payload(str(step_path), verify_files=True) == str(attempt)
-    (attempt / "policy" / "rank_0.pt").write_bytes(b"truncated")
-    with pytest.raises(ValueError, match="size changed"):
-        resolve_checkpoint_payload(str(step_path), verify_files=True)
-
-
 @pytest.mark.parametrize("failure_boundary", ["missing_rank", "manifest_write", "commit_write"])
 def test_failed_replacement_preserves_previous_generation(tmp_path, monkeypatch, failure_boundary):
     step_path = tmp_path / "global_step_1"

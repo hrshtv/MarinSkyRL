@@ -54,7 +54,6 @@ class _StepLimit(TrainerCallback):
     def __init__(self, limit: int, action: str = "continue"):
         self.limit = limit
         self.action = action
-        self.failed = False
 
     def on_train_begin(self, state, control, **kwargs):
         control.step_limit = self.limit
@@ -78,8 +77,7 @@ class _StepLimit(TrainerCallback):
     def on_save(self, state, control, **kwargs):
         if self.action == "save_stop":
             control.should_training_stop = True
-        if self.action == "save_failure" and not self.failed:
-            self.failed = True
+        if self.action == "save_failure":
             raise OSError("injected checkpoint callback storage failure")
         return control
 
@@ -95,7 +93,11 @@ def _run_limited_training(root: Path, model: Path, limits: tuple[int, ...], acti
         + [{"type": "checkpoint", "save_steps": 1}],
         force_add=True,
     )
-    experiment.run_tiny_training(cfg)
+    if action == "save_failure":
+        with pytest.raises(OSError, match="injected checkpoint callback storage failure"):
+            experiment.run_tiny_training(cfg)
+    else:
+        experiment.run_tiny_training(cfg)
 
 
 @pytest.fixture(scope="module")
@@ -219,7 +221,7 @@ def test_async_training_resumes_with_committed_groups(runs: BaseContext, tmp_pat
         ("ftpo_stop", ((1,), (3, 4)), [1]),
         ("callback_stop", ((1,), (3, 4)), [1]),
         ("save_stop", ((3,),), [1]),
-        ("save_failure", ((1,),), [1]),
+        ("save_failure", ((1,),), None),
     ],
 )
 def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_policy, action, phases, expected_steps):
@@ -233,6 +235,9 @@ def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_poli
             run.join()
             pytest.fail("callback-limited training did not finish")
         assert run.exitcode == 0
+        if action == "save_failure":
+            assert not (tmp_path / "ckpts" / "latest_ckpt_global_step.txt").exists()
+            return
         latest = int((tmp_path / "ckpts" / "latest_ckpt_global_step.txt").read_text())
         payload = Path(resolve_checkpoint_payload(str(tmp_path / "ckpts" / f"global_step_{latest}"), verify_files=True))
         rng_states.append(snapshot_value(torch.load(payload / "driver_rng_state.pt", weights_only=False)))
@@ -250,8 +255,6 @@ def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_poli
     for row in checkpoint_metrics:
         assert row["timing/step_wall/checkpoint_work"] >= row["timing/save_checkpoints"] > 0
         assert row["timing/step"] >= row["timing/step_wall/checkpoint_work"]
-    if action == "save_failure":
-        assert any(row.get("trainer/checkpoint_save_failures") == 1 for row in checkpoint_metrics)
 
 
 def test_one_step_is_independent_of_micro_batch_size(runs: BaseContext, tmp_path: Path, tiny_policy: Path):

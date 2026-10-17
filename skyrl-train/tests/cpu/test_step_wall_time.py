@@ -14,6 +14,7 @@ from skyrl_train.timing_observability import (
     publish_step_timings,
 )
 from skyrl_train.trainer import RayPPOTrainer
+from tests.cpu.evaluation_fakes import EvaluationLifecycle
 from skyrl_train.callbacks.base import CallbackHandler, TrainerControl, TrainerState
 
 
@@ -68,7 +69,6 @@ def test_step_end_checkpoint_and_evaluation_are_distinct_exclusive_phases():
     wall = _wall(clock)
     control = SimpleNamespace(should_save=True, should_save_hf_model=True, should_evaluate=True, reset=lambda: None)
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
-    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(strategy="other"))
     trainer._control = control
     trainer._pending_megatron_save = None
     trainer.eval_dataset = object()
@@ -77,6 +77,11 @@ def test_step_end_checkpoint_and_evaluation_are_distinct_exclusive_phases():
     trainer.global_step = 4
     trainer._training_metrics_enabled = False
     trainer.tracker = SimpleNamespace(log=lambda metrics, **kwargs: None)
+    trainer.context = EvaluationLifecycle()
+    trainer.eval_trajectory_runner = trainer.context
+    trainer.eval_trajectory_sink = None
+    trainer._inference_engines_configured = lambda: False
+    trainer.cfg = OmegaConf.create({"trainer": {"strategy": "other"}, "trajectory_runner": {"max_concurrent_tasks": 2}})
 
     async def callback(event, _state, current_control, **_kwargs):
         clock.advance(1)
@@ -89,11 +94,11 @@ def test_step_end_checkpoint_and_evaluation_are_distinct_exclusive_phases():
         clock.advance(3)
         return True
 
-    async def evaluate():
+    async def evaluate(**_kwargs):
         clock.advance(4)
         return {"eval/score": 0.5}
 
-    trainer.callback_handler = SimpleNamespace(call_event_async=callback)
+    trainer.callback_handler = SimpleNamespace(call_event_async=callback, callbacks=[])
     trainer._save_intermediate_checkpoint = save
     trainer._drain_checkpoint_upload = drain
     trainer.handle_hf_export = lambda: clock.advance(1)
@@ -135,7 +140,13 @@ def test_pretraining_evaluation_is_startup_only():
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.global_step = 0
     trainer.all_timings = {}
-    trainer.cfg = OmegaConf.create({"trainer": {"tracker_commit_each_step": True}})
+    trainer.cfg = OmegaConf.create(
+        {"trainer": {"tracker_commit_each_step": True}, "trajectory_runner": {"max_concurrent_tasks": 2}}
+    )
+    trainer.context = EvaluationLifecycle()
+    trainer.eval_trajectory_runner = trainer.context
+    trainer.eval_trajectory_sink = None
+    trainer._inference_engines_configured = lambda: False
     trainer.eval = AsyncMock(return_value={"eval/score": 0.5})
     trainer.tracker = SimpleNamespace(log=lambda metrics, **kwargs: logged.append((metrics, kwargs)))
     trainer._log_metrics_stdout = lambda metrics, **kwargs: mirrored.append((metrics, kwargs))

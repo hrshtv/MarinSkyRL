@@ -35,9 +35,7 @@ def test_cleanup_takes_no_cluster_dependency_when_disabled():
 
 def test_cleanup_runs_driver_side_after_fanout_failure(tmp_path):
     for step in (1, 2, 3):
-        checkpoint_dir = tmp_path / f"global_step_{step}"
-        checkpoint_dir.mkdir()
-        (checkpoint_dir / "trainer_state.pt").write_bytes(b"legacy checkpoint")
+        (tmp_path / f"global_step_{step}").mkdir()
     trainer = _make_bare_trainer(max_ckpts_to_keep=1, ckpt_path=str(tmp_path), node_ids=["a", "b"])
 
     with patch("skyrl_train.trainer.run_on_each_node", side_effect=ray.exceptions.WorkerCrashedError):

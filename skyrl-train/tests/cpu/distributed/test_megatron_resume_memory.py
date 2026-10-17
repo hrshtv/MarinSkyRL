@@ -7,7 +7,6 @@ gradients, which are not checkpointed, must be off the device for both calls.
 """
 
 import contextlib
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,10 +45,7 @@ def _load_with_fakes(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(megatron_strategy, "load_megatron_grads_to_gpu", lambda model: setattr(grads, "resident", True))
     source = "s3://bucket/checkpoint"
-    monkeypatch.setattr(
-        megatron_strategy.io, "exists", lambda path: path == source or (tmp_path / Path(path).name).exists()
-    )
-    monkeypatch.setattr(megatron_strategy.io, "open_file", lambda path, mode: (tmp_path / Path(path).name).open(mode))
+    monkeypatch.setattr(megatron_strategy.io, "exists", lambda path: path == source)
     monkeypatch.setattr(megatron_strategy, "remote_checkpoint_metadata", lambda path: contextlib.nullcontext(tmp_path))
     monkeypatch.setattr(megatron_strategy, "DirectS3TorchDistLoadShardedStrategy", lambda path: None)
     monkeypatch.setattr(
@@ -73,23 +69,14 @@ def _load_with_fakes(monkeypatch, tmp_path):
     model = SimpleNamespace(actor_module=[module])
     optimizer = _Optimizer(grads)
     scheduler = SimpleNamespace(state_dict=lambda: {}, load_state_dict=lambda state: None)
-    _, states = strategy.load_checkpoint(model, source, optimizer=optimizer, scheduler=scheduler)
-    return optimizer, grads, states
+    strategy.load_checkpoint(model, source, optimizer=optimizer, scheduler=scheduler)
+    return optimizer, grads
 
 
 def test_resume_rebuilds_the_optimizer_state_with_the_gradients_off_the_device(monkeypatch, tmp_path):
-    optimizer, grads, _ = _load_with_fakes(monkeypatch, tmp_path)
+    optimizer, grads = _load_with_fakes(monkeypatch, tmp_path)
     assert optimizer.grads_resident_during == {"sharded_state_dict": False, "load_state_dict": False}
     assert grads.resident, "training needs its gradient buffers back after the optimizer state is restored"
-
-
-def test_resume_returns_replicated_client_state_in_worker_expected_shape(monkeypatch, tmp_path):
-    client_state = {"z_clip_state": {"warmup_buffer": [1.0]}, "stale_clip_state": {"ema": 0.5}}
-    torch.save({"client_state": client_state, "tag": "step-1"}, tmp_path / "extra_state.pt")
-
-    _, _, states = _load_with_fakes(monkeypatch, tmp_path)
-
-    assert states == client_state
 
 
 def test_rank_rng_selection_preserves_exact_rank_and_maps_resized_dp(monkeypatch):

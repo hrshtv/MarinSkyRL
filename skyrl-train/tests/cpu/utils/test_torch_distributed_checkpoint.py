@@ -52,6 +52,11 @@ def test_streaming_fsspec_writer_round_trips_one_aggregated_object_per_rank(tmp_
     for key, value in state.items():
         assert torch.equal(restored[key], value)
 
+    with filesystem.open(f"{checkpoint_uri}/__0_0.distcp", "ab") as shard:
+        shard.write(b"corruption")
+    with pytest.raises(ValueError, match="size changed"):
+        resolve_checkpoint_payload(step_path, verify_files=True)
+
 
 class _FailingWriteStream:
     def __init__(self) -> None:

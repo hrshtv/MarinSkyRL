@@ -13,11 +13,12 @@ The test directory is a Python package so Ray workers can import the test's
 worker subclass by its fully qualified module name.
 
 ```bash
+set -euo pipefail
 export PYTHONPATH="$PWD/skyrl-train${PYTHONPATH:+:$PYTHONPATH}"
-uv run --frozen --group dev --extra vllm --extra megatron \
+timeout --signal=TERM --kill-after=30s 1800s uv run --frozen --group dev --extra vllm --extra megatron \
   pytest -s skyrl-train/tests/gpu/fault_injection/checkpoint_failure_retry.py \
   -k failed_save_preserves_latest_and_retry_commits
-uv run --frozen --group dev --extra vllm --extra megatron \
+timeout --signal=TERM --kill-after=30s 1800s uv run --frozen --group dev --extra vllm --extra megatron \
   pytest -s skyrl-train/tests/gpu/fault_injection/checkpoint_failure_retry.py \
   -k fresh_process_resumes_retry_and_saves_next_step
 ```
@@ -30,6 +31,10 @@ Both processes must exit zero; an expected injected exception is caught inside
 the first test. The S3 root is not deleted by the test and should expire under
 the bucket's TTL policy.
 
+Each phase has a 30-minute outer deadline. The Iris job owner must also set a
+job deadline and let a timeout or failed phase terminate the pod and its Ray
+workers; run the block as the job command, not in a detached interactive shell.
+
 ## Megatron checkpoint-to-next-step parity
 
 `checkpoint_step_parity.py` is an opt-in, four-H100 Qwen3-0.6B TP2/PP2
@@ -38,13 +43,14 @@ as separate pytest processes, in order, on one node
 with a unique local scratch directory and a unique east-region TTL S3 prefix:
 
 ```bash
+set -euo pipefail
 export CHECKPOINT_PARITY_LOCAL_ROOT=/local/scratch/<unique-case>
 export CHECKPOINT_PARITY_S3_ROOT=s3://marin-us-east-02a/tmp/ttl=14d/skyrl/users/atqamar/<unique-case>
 export PYTHONPATH="$PWD/skyrl-train${PYTHONPATH:+:$PYTHONPATH}"
-uv run --frozen --group dev --extra vllm --extra megatron \
+timeout --signal=TERM --kill-after=30s 1800s uv run --frozen --group dev --extra vllm --extra megatron \
   pytest -s skyrl-train/tests/gpu/fault_injection/checkpoint_step_parity.py \
   -k reference_records_uninterrupted_step
-uv run --frozen --group dev --extra vllm --extra megatron \
+timeout --signal=TERM --kill-after=30s 1800s uv run --frozen --group dev --extra vllm --extra megatron \
   pytest -s skyrl-train/tests/gpu/fault_injection/checkpoint_step_parity.py \
   -k fresh_actors_match_next_step
 ```
