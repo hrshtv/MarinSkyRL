@@ -19,11 +19,8 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     }
     recipe = schema.SkyRLRecipe.model_validate_json(json.dumps(supplied))
     original = recipe.to_skyrl()
-    supplied["generator"]["engine_init_kwargs"]["schedule"]["windows"].append(3)
     rendered = recipe.to_skyrl()
     rendered["generator"]["engine_init_kwargs"]["schedule"]["windows"].append(4)
-    with pytest.raises(TypeError):
-        recipe.generator.engine_init_kwargs["schedule"]["windows"][0] = 9
     assert recipe.to_skyrl() == original
     changed = recipe.merge(
         schema.RecipePatch(generator=schema.Generator(engine_init_kwargs={"schedule": {}, "enabled": False}))
@@ -67,6 +64,8 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     assert type(updated.data.sampling.domain_weights["code"]) is float
     restored = pickle.loads(pickle.dumps(updated))
     assert restored == updated
+    with pytest.raises(TypeError):
+        restored.generator.engine_init_kwargs["schedule"]["windows"] = (9,)
     for routes in ({1: 2}, {1: 2, "1": 3}):
         document = {"context_budget": context.to_skyrl(), "generator": {"engine_init_kwargs": routes}}
         original_routes = list(routes.items())
@@ -180,20 +179,29 @@ def test_public_recipe_round_trip_preserves_parts_and_reports_owned_paths():
     for following in ("hf_save_interval", "micro_forward_batch_size_per_gpu"):
         with pytest.raises(ValueError, match=following):
             edited.with_settings([f"trainer.{following}=null"])
-    draft = {
-        "generator": {
-            "speculative_decoding": {
-                "method": "eagle3",
-                "model": {"source_uri": "s3://models/draft", "source_identity": "sha256:" + "a" * 64},
-                "num_speculative_tokens": 3,
-            }
-        }
-    }
-    artifact = schema.SkyRLRecipe.from_document({**base.to_skyrl(), **draft})
-    assert artifact.to_skyrl()["generator"] == draft["generator"]
     uri_part = schema.RecipePatch.from_document(
         {"generator": {"speculative_decoding": {"model": {"source_uri": "s3://models/draft"}}}}
     )
+    artifact = schema.SkyRLRecipe.combine(
+        base=base,
+        uri=uri_part,
+        details=schema.RecipePatch.from_document(
+            {
+                "generator": {
+                    "speculative_decoding": {
+                        "method": "eagle3",
+                        "model": {"source_identity": "sha256:" + "a" * 64},
+                        "num_speculative_tokens": 3,
+                    }
+                }
+            }
+        ),
+    )
+    assert artifact.to_skyrl()["generator"]["speculative_decoding"] == {
+        "method": "eagle3",
+        "model": {"source_uri": "s3://models/draft", "source_identity": "sha256:" + "a" * 64},
+        "num_speculative_tokens": 3,
+    }
     with pytest.raises(ValueError, match="artifact sources require sha256"):
         schema.SkyRLRecipe.combine(base=base, uri=uri_part)
     with pytest.raises(ValueError, match="artifact sources require sha256"):
