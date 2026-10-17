@@ -227,7 +227,7 @@ class InstalledAgentRuntime:
                 startup_timeout=self.settings.service_startup_timeout,
                 shutdown_timeout=self.settings.service_shutdown_timeout,
             ) as port,
-            registered_agent_endpoint(port) as endpoint,
+            registered_agent_endpoint(port, request_timeout=run_timeout) as endpoint,
         ):
             api_base = await endpoint.api_base(required_lifetime=capability_lifetime)
             source = self.settings.agent if agent is None else agent
