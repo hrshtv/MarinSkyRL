@@ -36,7 +36,7 @@ class HarborTaskCache:
 
 
 def validation_metrics(result: JobResult, config: JobConfig, reward_key: str) -> dict[str, float]:
-    """Count only completed, verified trials; expose missing scores separately."""
+    """Score verified outcomes, including model-caused stops; expose missing scores."""
     expected = {str(task.get_task_id()) for task in config.tasks}
     observed = [str(trial.task_id) for trial in result.trial_results]
     if len(expected) != len(config.tasks) or config.n_attempts != 1:
