@@ -137,9 +137,10 @@ def test_hugging_face_draft_mirror_uses_the_policy_tokenizer(tmp_path, monkeypat
         cache_source_prefix="s3://region/run",
     )
     assert artifact.source_uri == artifact_uri and artifact.source_identity == manifest.identity
+    mismatched = SpeculatorModelConfig(source_uri=artifact_uri, source_identity="author-identity")
     with pytest.raises(ValueError):
         prepare_draft_model(
-            SpeculatorModelConfig(source_uri=artifact_uri, source_identity="author-identity"),
+            mismatched,
             cache_ttl_days=14,
             cache_source_prefix="s3://region/run",
         )
