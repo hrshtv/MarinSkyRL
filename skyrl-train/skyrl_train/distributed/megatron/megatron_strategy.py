@@ -16,6 +16,8 @@ from torch import distributed as dist
 from skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl_train.distributed.utils import ModelOrModelOptimPair
 from skyrl_train.io import io
+from skyrl_train.checkpoint_listing import extract_step_from_path
+from skyrl_train.timing_observability import checkpoint_phase
 from skyrl_train.workers.megatron.megatron_model_wrapper import MegatronModelWrapper
 import megatron.core.parallel_state as mpu
 from skyrl_train.distributed.megatron.megatron_utils import (
@@ -314,6 +316,8 @@ class MegatronStrategy(DistributedStrategy):
         tag=None,
         tokenizer: Optional[PreTrainedTokenizer] = None,
     ):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        step = extract_step_from_path(os.path.dirname(ckpt_dir.rstrip("/")))
         # Extract base model.
         model: List[nn.Module] = model.actor_module
         materialize_megatron_params(model)
@@ -377,13 +381,14 @@ class MegatronStrategy(DistributedStrategy):
 
         with io.local_work_dir(ckpt_dir) as work_dir:
             # TODO(tgriggs): Support configurable async saves.
-            async_save_request = dist_checkpointing.save(
-                sharded_state_dict=sharded_state_dict,
-                checkpoint_dir=work_dir,
-                sharded_strategy=save_strategy,
-                async_sharded_save=False,
-                validate_access_integrity=True,
-            )
+            with checkpoint_phase("megatron", "save", "distributed_checkpoint", rank=rank, step=step):
+                async_save_request = dist_checkpointing.save(
+                    sharded_state_dict=sharded_state_dict,
+                    checkpoint_dir=work_dir,
+                    sharded_strategy=save_strategy,
+                    async_sharded_save=False,
+                    validate_access_integrity=True,
+                )
             assert async_save_request is None, "Async save is not yet supported for Megatron"
 
             # Only global rank 0 saves the Huggingface config and tokenizer.
@@ -410,6 +415,9 @@ class MegatronStrategy(DistributedStrategy):
         load_module_strict: bool = True,
         load_training_state: bool = True,
     ):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        step = extract_step_from_path(os.path.dirname(ckpt_dir.rstrip("/")))
+        operation = "load" if load_training_state else "model_only_load"
         load_strategy = DirectS3TorchDistLoadShardedStrategy(ckpt_dir)
         if not io.exists(ckpt_dir):
             raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
@@ -430,7 +438,10 @@ class MegatronStrategy(DistributedStrategy):
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
         muonh = self.optimizer_config is not None and str(self.optimizer_config.optimizer).lower() == "muonh"
-        with remote_checkpoint_metadata(ckpt_dir) as read_dir:
+        with (
+            checkpoint_phase("megatron", operation, "read_and_load", rank=rank, step=step),
+            remote_checkpoint_metadata(ckpt_dir) as read_dir,
+        ):
             if optimizer and load_training_state:
                 common_state = dist_checkpointing.load_common_state_dict(read_dir)
                 if muonh and common_state.get("optimizer_recipe") != _MUONH_CHECKPOINT_RECIPE:
@@ -460,35 +471,39 @@ class MegatronStrategy(DistributedStrategy):
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-            state_dict = dist_checkpointing.load(
-                sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
-            )
+            with checkpoint_phase("megatron", operation, "distributed_checkpoint", rank=rank, step=step):
+                state_dict = dist_checkpointing.load(
+                    sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
+                )
 
         # Load the model, optimizer, and scheduler state dicts.
         assert "model" in state_dict, (
             f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
         )
-        model[0].load_state_dict(state_dict.pop("model"), strict=load_module_strict)
+        with checkpoint_phase("megatron", operation, "apply_model_state", rank=rank, step=step):
+            model[0].load_state_dict(state_dict.pop("model"), strict=load_module_strict)
         self.log("Loaded model state dict.")
 
         if optimizer and load_training_state:
             assert "optimizer" in state_dict, (
                 f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
             )
-            if muonh:
-                _muonh_fp32_groups_as_lists(state_dict["optimizer"])
-            optimizer.load_state_dict(state_dict.pop("optimizer"))
-            if muonh:
-                _restore_muonh_adamh_step(optimizer, common_state["optimizer_recipe_step"])
-            restore_offloaded_optimizer_state(optimizer)
-            load_megatron_grads_to_gpu(model)
+            with checkpoint_phase("megatron", operation, "apply_optimizer_state", rank=rank, step=step):
+                if muonh:
+                    _muonh_fp32_groups_as_lists(state_dict["optimizer"])
+                optimizer.load_state_dict(state_dict.pop("optimizer"))
+                if muonh:
+                    _restore_muonh_adamh_step(optimizer, common_state["optimizer_recipe_step"])
+                restore_offloaded_optimizer_state(optimizer)
+                load_megatron_grads_to_gpu(model)
             self.log("Loaded optimizer state dict.")
 
         if scheduler and load_training_state:
             assert "lr_scheduler" in state_dict, (
                 f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
             )
-            scheduler.load_state_dict(state_dict["lr_scheduler"])
+            with checkpoint_phase("megatron", operation, "apply_scheduler_state", rank=rank, step=step):
+                scheduler.load_state_dict(state_dict["lr_scheduler"])
             self.log("Loaded LR scheduler state dict.")
 
         # Load RNG state, if present.

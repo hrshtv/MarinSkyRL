@@ -149,7 +149,12 @@ from skyrl_train.telemetry import (
 from skyrl_train.rollout_observability import async_phase_window, monitor_event_loop_lag
 from skyrl_train.inference_engines.base import UNSTAMPED_POLICY_STEP
 from skyrl_train.utils.importance_ratio_diagnostics import mismatch_ratio_metrics
-from skyrl_train.timing_observability import StepWallTime, publish_startup_timings, publish_step_timings
+from skyrl_train.timing_observability import (
+    StepWallTime,
+    checkpoint_phase,
+    publish_startup_timings,
+    publish_step_timings,
+)
 from skyrl_train.hf_export import (
     protected_hf_export_steps,
     read_hf_export_request,
@@ -835,12 +840,15 @@ class RayPPOTrainer:
             actor_refs.extend(self.critic_model.async_run_ray_method("pass_through", "wait_checkpoint_upload"))
         ray.get(actor_refs)
         if commit:
-            io.write_bytes_atomic(snapshot.trainer_state_path, snapshot.trainer_state_payload)
-            io.write_bytes_atomic(snapshot.rollout_state_path, snapshot.rollout_state_payload)
-            io.write_bytes_atomic(snapshot.marker_path, str(snapshot.step).encode())
+            with checkpoint_phase("megatron", "save", "continuation_state", rank=-1, step=snapshot.step):
+                io.write_bytes_atomic(snapshot.trainer_state_path, snapshot.trainer_state_payload)
+                io.write_bytes_atomic(snapshot.rollout_state_path, snapshot.rollout_state_payload)
+            with checkpoint_phase("megatron", "save", "latest_pointer", rank=-1, step=snapshot.step):
+                io.write_bytes_atomic(snapshot.marker_path, str(snapshot.step).encode())
             self._last_saved_step = snapshot.step
             cleanup_started = time.monotonic()
-            self._cleanup_old_checkpoints()
+            with checkpoint_phase("megatron", "save", "retention", rank=-1, step=snapshot.step):
+                self._cleanup_old_checkpoints()
             cleanup_duration = time.monotonic() - cleanup_started
         return time.monotonic() - snapshot.upload_started_at, cleanup_duration
 
@@ -3177,14 +3185,15 @@ class RayPPOTrainer:
         io.makedirs(global_step_folder, exist_ok=True)
 
         # Save policy checkpoint
-        ray.get(
-            self.policy_model.async_run_ray_method(
-                "pass_through",
-                "save_checkpoint",
-                ckpt_dir=policy_save_dir,
-                tokenizer=self.tokenizer,
+        with checkpoint_phase("megatron", "save", "policy_workers", rank=-1, step=step):
+            ray.get(
+                self.policy_model.async_run_ray_method(
+                    "pass_through",
+                    "save_checkpoint",
+                    ckpt_dir=policy_save_dir,
+                    tokenizer=self.tokenizer,
+                )
             )
-        )
 
         # Save critic checkpoint (if it exists)
         if self.critic_model is not None:
@@ -3381,14 +3390,15 @@ class RayPPOTrainer:
 
         # 3. Load policy checkpoint
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
-        _ = ray.get(
-            self.policy_model.async_run_ray_method(
-                "pass_through",
-                "load_checkpoint",
-                ckpt_dir=policy_ckpt_dir,
-                load_training_state=True,
+        with checkpoint_phase("megatron", "load", "policy_workers", rank=-1, step=global_step):
+            _ = ray.get(
+                self.policy_model.async_run_ray_method(
+                    "pass_through",
+                    "load_checkpoint",
+                    ckpt_dir=policy_ckpt_dir,
+                    load_training_state=True,
+                )
             )
-        )
         logger.info("Successfully loaded policy checkpoint")
 
         # 4. Load critic checkpoint if it exists and we have a critic model
