@@ -47,6 +47,12 @@ training buffer. Harbor configurations require unique pinned tasks, one agent, a
 one attempt per task. Retries remain explicitly configured Harbor infrastructure
 retries. The full sweep, including all cohorts, uses one policy version.
 
+Inline Harbor scoring retains verifier rewards after agent-attributable stops and
+partial-work terminations, as classified by Harbor's pinned error taxonomy.
+Infrastructure and unknown errors remain unscored, even if a reward is present.
+Results without a verifier reward remain unscored for every category. Scoring uses
+the verifier reward without the training loss's error-treatment overrides.
+
 Callbacks that add evaluation sources implement `collect_evaluation(state, trainer,
 pool)` and admit each unit of work with `pool.run(source, run, limit=...)`. They return
 metrics after all requests complete. `on_evaluate` remains the ordered reduction and
