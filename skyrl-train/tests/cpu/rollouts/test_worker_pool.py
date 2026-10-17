@@ -203,6 +203,33 @@ async def test_training_tasks_wait_for_all_eval_workers(spec):
 
 
 @pytest.mark.asyncio
+async def test_eval_runs_while_an_existing_training_request_is_blocked(spec):
+    started, release = asyncio.Event(), asyncio.Event()
+    worker = _SessionWorker("shared", [])
+
+    async def run(input_batch, _observe):
+        if input_batch.batch_metadata.training_phase == "train":
+            started.set()
+            await release.wait()
+        return _output(input_batch.trajectory_ids), None
+
+    worker.run = _RemoteMethod(run)
+    pool = _pool([worker], spec, timeout=10)
+    training = asyncio.create_task(pool.run(_request([TrajectoryID("training", 0)], "train")))
+    try:
+        async with asyncio.timeout(5):
+            await started.wait()
+            await pool.start_eval_session(run_name="run", eval_step=2)
+            result = await pool.run(_request([TrajectoryID("heldout", 0)], "eval"))
+        assert result["trajectory_ids"] == [TrajectoryID("heldout", 0)]
+        assert not training.done()
+    finally:
+        release.set()
+        await training
+        await pool.stop_eval_session()
+
+
+@pytest.mark.asyncio
 async def test_pool_isolates_eval_from_concurrent_training(spec):
     calls: list[tuple[str, str]] = []
     pool = _pool(

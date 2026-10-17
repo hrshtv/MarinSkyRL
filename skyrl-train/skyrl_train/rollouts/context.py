@@ -225,9 +225,12 @@ class TrainingContext:
         await asyncio.gather(*tasks, return_exceptions=True)
         ray.kill(self._buffer)
 
+    def pause(self) -> None:
+        self._submission_allowed.clear()
+
     async def pause_and_drain(self, timeout: float) -> int:
         """Pause submissions and return the number of groups discarded at the deadline."""
-        self._submission_allowed.clear()
+        self.pause()
         if not self._running:
             return 0
         _, pending = await self._until_failure(asyncio.wait(tuple(self._running), timeout=timeout))
@@ -450,7 +453,11 @@ class TrainingContext:
         """Await ``awaitable`` unless a rollout task fails first, then raise that failure."""
         assert self._failure is not None, "start the training context before reading from it"
         work: asyncio.Future[Any] = asyncio.ensure_future(awaitable)
-        await asyncio.wait({work, self._failure}, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            await asyncio.wait({work, self._failure}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            work.cancel()
+            raise
         if work.done():
             return work.result()
         work.cancel()

@@ -143,7 +143,7 @@ class RolloutWorkerPool:
     """Rollout worker actors that the trainer uses as its trajectory runner.
 
     Each training task or ``run`` request goes whole to the least-loaded worker; training tasks write their groups
-    straight to the rollout buffer. Evaluation drains training requests and uses the same entire pool;
+    straight to the rollout buffer. Evaluation overlaps draining requests and uses the same entire pool;
     new training submissions wait until evaluation finishes. A request fails with
     ``RolloutWorkerStalledError`` when its worker completes nothing for the progress timeout.
 
@@ -222,7 +222,7 @@ class RolloutWorkerPool:
         eval_step: int,
         val_set_name: str | None = None,
     ) -> None:
-        """Give evaluation priority, drain every worker, and begin one frozen session."""
+        """Block new training submissions and admit evaluation alongside existing requests."""
         async with self._routing:
             if self._eval_session_active:
                 raise RuntimeError("an eval session is already active")
@@ -232,8 +232,6 @@ class RolloutWorkerPool:
                 "Evaluation session requested: run={} step={} workers={}", run_name, eval_step, len(self._actors)
             )
         try:
-            async with self._routing:
-                await self._routing.wait_for(lambda: not any(self._pending))
 
             async def start(actor):
                 await actor.start_eval_session.remote(run_name=run_name, eval_step=eval_step, val_set_name=val_set_name)

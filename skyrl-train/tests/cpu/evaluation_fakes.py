@@ -9,6 +9,9 @@ class EvaluationLifecycle:
         self.events.append("drained")
         return 0
 
+    def pause(self):
+        pass
+
     def resume(self):
         self.events.append("resumed")
 
