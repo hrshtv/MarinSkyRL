@@ -132,7 +132,6 @@ class InstalledAgentRuntime:
         agent = self.settings.agent.model_copy(
             update={
                 "override_timeout_sec": lowered.session.total_turn_timeout or self.settings.run_timeout,
-                "kwargs": {**self.settings.agent.kwargs, "max_turns": lowered.session.max_turns},
             }
         )
         config = TrialConfig(
