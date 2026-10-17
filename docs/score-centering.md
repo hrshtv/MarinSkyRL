@@ -125,6 +125,7 @@ overhead claim is made for them. Existing worker PPO/TIS metrics remain on in ev
 
 Intervals use paired log ratios across three repetitions with Student-t assumptions. One allocation, persistent
 caches and changing learner weights limit the inference; variation between allocations was not measured.
+The measured candidate precedes main's [DP-chunk sharing optimization](https://github.com/marin-community/MarinSkyRL/pull/999).
 Peak reserved learner memory was 62.38/61.37/61.44/62.50 GiB in table order. Inference peaks were
 57.57 GiB allocated, 58.87 GiB reserved and 64.40 GiB sampled device memory in every mode. Device peaks
 were sampled every 0.1 seconds and can miss shorter spikes; allocator caches persist across modes.
