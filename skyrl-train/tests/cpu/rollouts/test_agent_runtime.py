@@ -81,7 +81,7 @@ async def test_original_trial_mints_capability_for_container_setup_and_agent_run
             )
 
     @asynccontextmanager
-    async def endpoint(_port):
+    async def endpoint(_port, *, request_timeout):
         yield AgentEndpoint("/trial", Controller())
 
     monkeypatch.setattr("skyrl_train.rollouts.agent_runtime.registered_agent_endpoint", endpoint)
@@ -182,7 +182,7 @@ async def test_native_runtime_routes_through_proxy_and_publishes_failed_attempts
     tmp_path, monkeypatch, task_inputs, path, fail
 ):
     @asynccontextmanager
-    async def local_endpoint(port):
+    async def local_endpoint(port, *, request_timeout):
         async def api_base(*, required_lifetime):
             return f"http://127.0.0.1:{port}/v1"
 
