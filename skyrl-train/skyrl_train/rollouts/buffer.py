@@ -423,6 +423,8 @@ class RolloutBuffer:
         self._policy = async_rollout_policy(config)
         self._policy_step = 0
         self._leases: dict[str, RolloutLease] = {}
+        # Keep revoked IDs for this run: cancelling a worker cannot retract an
+        # already submitted commit RPC. Tombstones prevent that write from training.
         self._cancelled_leases: set[str] = set()
         # Committed groups not yet assigned to a batch; only groups restored before the first publish wait here.
         self._ready: list[ReadyRollout] = []

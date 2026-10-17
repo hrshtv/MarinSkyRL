@@ -114,7 +114,8 @@ async def test_worker_preserves_task_download_stderr(tmp_path):
     async with HarborTrialClient(os.environ.copy()) as client:
         with pytest.raises(RuntimeError, match="Subprocess stderr:") as caught:
             await client.run(cohort, 0)
-    assert "missing-repository" in str(caught.value)
+    stderr = str(caught.value).split("Subprocess stderr:", 1)[1]
+    assert "missing-repository" in stderr
 
 
 @pytest.mark.asyncio

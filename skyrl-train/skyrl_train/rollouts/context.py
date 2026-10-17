@@ -226,7 +226,7 @@ class TrainingContext:
         ray.kill(self._buffer)
 
     async def pause_and_drain(self, timeout: float) -> int:
-        """Pause submissions; discard unfinished groups after the drain deadline."""
+        """Pause submissions and return the number of groups discarded at the deadline."""
         self._submission_allowed.clear()
         if not self._running:
             return 0
