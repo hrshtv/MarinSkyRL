@@ -112,6 +112,7 @@ class ReadinessExp(BasePPOExp):
 
 class ReadinessTrainer(RayPPOTrainer):
     def save_probe(self):
+        self.probe["applied_updates"] = self._readiness_applied_updates
         path = Path(self.cfg.trainer.export_path) / "readiness.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.probe, indent=2, allow_nan=False) + "\n")
@@ -454,6 +455,7 @@ class ReadinessTrainer(RayPPOTrainer):
         self.probe["qualification"]["sampled_diagnostics"] = result
         self.probe["qualification"]["stale_prefix_replay"] = await self.prefix_replay(captured)
         assert self.probe["qualification"]["stale_prefix_replay"]["policy_steps"] == [1]
+        self.save_probe()
         if not short:
             # Qualify the actual task projection, admission and training path too.
             await self._sync_policy_for_rollouts(reason="native_qualification")
@@ -476,7 +478,6 @@ class ReadinessTrainer(RayPPOTrainer):
                 "shape": list(native["sequences"].shape),
                 "tokens": int(native["response_mask"].sum()),
                 "loss_tokens": int(native["loss_mask"].sum()),
-                "uids": native.metadata["uids"],
                 "metrics": dict(self.all_metrics),
                 "timings": dict(self.all_timings),
                 "applied_updates": 1,
