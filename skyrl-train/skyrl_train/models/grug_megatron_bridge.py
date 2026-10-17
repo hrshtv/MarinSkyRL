@@ -27,10 +27,8 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 from megatron.core.utils import get_pg_rank
 
 from skyrl_train.config.numerics import NumericsMode
-from skyrl_train.models.grug_exact.layers import ExactFinalGatedNorm
 from skyrl_train.models.grug_exact.model import GrugExactGPTModel
-from skyrl_train.models.grug_exact.spec import exact_layer_spec
-from skyrl_train.models.grug_megatron import GrugGatedRMSNorm, GrugGPTModel, grug_block_spec, grug_layer_spec
+from skyrl_train.models.grug_megatron import GrugGPTModel, grug_block_spec
 from skyrl_train.models.grug_moe import (
     GRUG_DEFAULT_GLOBAL_EVERY,
     GRUG_MOE_MODEL_TYPE,
@@ -54,7 +52,7 @@ class GrugModelProvider(GPTModelProvider):
     grug_sconv_kernel: int = 4
     grug_sconv_sites: tuple[str, ...] = ()
     grug_hero: bool = False
-    # The trainer's numerics: exact selects the layer spec and model of ``grug_exact``.
+    # The trainer's numerics: exact builds ``GrugExactGPTModel``.
     grug_numerics: NumericsMode = NumericsMode.NATIVE
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> GrugGPTModel:
@@ -76,15 +74,14 @@ class GrugModelProvider(GPTModelProvider):
         if post_process is None:
             post_process = is_pp_last_stage(pp_group)
         self._vp_stage = vp_stage
-        exact = self.grug_numerics is NumericsMode.EXACT
+        model_class = GrugExactGPTModel if self.grug_numerics is NumericsMode.EXACT else GrugGPTModel
         block_spec = grug_block_spec(
             self,
             vp_stage=vp_stage,
             pp_rank=get_pg_rank(pp_group),
-            layer_spec=exact_layer_spec(self) if exact else grug_layer_spec(self),
-            final_norm=ExactFinalGatedNorm if exact else GrugGatedRMSNorm,
+            layer_spec=model_class.layer_spec(self),
+            final_norm=model_class.final_norm_class,
         )
-        model_class = GrugExactGPTModel if exact else GrugGPTModel
         return model_class(
             self,
             transformer_layer_spec=block_spec,

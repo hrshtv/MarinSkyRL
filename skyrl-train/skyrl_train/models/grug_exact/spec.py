@@ -1,4 +1,4 @@
-"""The Megatron layer spec of the exact Grug trainer, which ``GrugModelProvider`` selects under exact numerics."""
+"""The Megatron layer spec of the exact Grug trainer."""
 
 from functools import partial
 
@@ -21,18 +21,9 @@ from skyrl_train.models.grug_exact.layers import (
 )
 from skyrl_train.models.grug_megatron import grug_self_attention_spec
 
-# The parallelism the exact modules run on: TP 1, CP 1 and ETP 1, as the decode-invariant engines' kernels take one
-# rank's whole rows.
-EXACT_PARALLELISM = {"tensor_model_parallel_size": 1, "context_parallel_size": 1, "expert_tensor_parallel_size": 1}
-
 
 def exact_layer_spec(config: TransformerConfig) -> ModuleSpec:
     """The Transformer Engine layer spec for one exact Grug decoder layer."""
-    if config.grug_hero or config.grug_sconv_sites or config.moe_latent_size:
-        raise ValueError("exact numerics cover Grug without Hero layers, ShortConv or latent experts")
-    found = {name: getattr(config, name) for name in EXACT_PARALLELISM}
-    if found != EXACT_PARALLELISM:
-        raise ValueError(f"exact numerics run on {EXACT_PARALLELISM}, got {found}")
     backend = TESpecProvider()
     moe = get_moe_module_spec_for_backend(backend, num_experts=config.num_moe_experts, moe_grouped_gemm=True)
     submodules = moe.keywords["submodules"]

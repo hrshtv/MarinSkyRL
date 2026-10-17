@@ -18,49 +18,27 @@ class ResidualSum:
 
 @dataclass
 class ExactForward:
-    """One model forward's hand-offs: each sequence's serving engine rank and the engine's expert-parallel size,
-    which order the expert-parallel combine, and the attention outputs a checkpointed layer's first forward keeps
-    for its recompute (``keep_attention``), keyed by layer number."""
+    """One model forward's hand-offs: each sequence's engine data-parallel rank and the engines' expert-parallel size,
+    which order the expert-parallel combine, and the attention output each checkpointed layer keeps for its recompute,
+    keyed by layer number."""
 
-    serving_ranks: torch.Tensor
+    engine_dp_ranks: torch.Tensor
     expert_parallel_size: int
-    keep_attention: bool
     attention: dict[int, torch.Tensor] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        if self.serving_ranks.ndim != 1 or self.serving_ranks.dtype != torch.long:
-            raise ValueError(f"serving ranks must be one long per sequence, got {self.serving_ranks}")
-
-    def row_serving_ranks(self, rows: int) -> torch.Tensor:
-        """Each of ``rows`` router rows' serving rank: row ``s * B + b`` holds position ``s`` of sequence ``b``."""
-        sequences = self.serving_ranks.numel()
-        if rows % sequences:
-            raise ValueError(f"{rows} router rows do not cover {sequences} sequences evenly")
-        return self.serving_ranks.repeat(rows // sequences)
-
-    def kept_attention(self, layer_number: int) -> torch.Tensor | None:
-        """The attention output kept for this layer's recompute, taken once; ``None`` in a first forward."""
-        return self.attention.pop(layer_number, None)
-
-    def keep(self, layer_number: int, attention: torch.Tensor) -> None:
-        if self.keep_attention:
-            self.attention[layer_number] = attention
-
-    def assert_drained(self) -> None:
-        """Raise unless every attention output kept by a first forward was taken by a recompute."""
-        if self.attention:
-            raise RuntimeError(f"layers {sorted(self.attention)} kept attention outputs no recompute took")
+    def row_engine_dp_ranks(self, rows: int) -> torch.Tensor:
+        """Each of ``rows`` router rows' engine data-parallel rank: row ``s * B + b`` is position ``s`` of sequence
+        ``b``."""
+        return self.engine_dp_ranks.repeat(rows // self.engine_dp_ranks.numel())
 
 
-def check_serving_ranks(ranks: torch.Tensor, scored: torch.Tensor, data_parallel_size: int) -> None:
-    """Raise unless every sequence with loss tokens (``scored``, ``[B]`` bool) has a serving engine rank below
+def check_engine_dp_ranks(ranks: torch.Tensor, scored: torch.Tensor, data_parallel_size: int) -> None:
+    """Raise unless every sequence with loss tokens (``scored``, ``[B]`` bool) has an engine data-parallel rank below
     ``data_parallel_size``; a sequence without loss tokens may carry ``UNKNOWN_ENGINE_DP_RANK``."""
-    if ranks.shape != scored.shape:
-        raise ValueError(f"{ranks.numel()} serving ranks for {scored.numel()} sequences")
     if bool(((ranks < 0) & scored).any()):
-        raise ValueError(f"every sequence with loss tokens needs its serving engine rank, got {ranks.tolist()}")
+        raise ValueError(f"every sequence with loss tokens needs its engine data-parallel rank, got {ranks.tolist()}")
     if bool((ranks < UNKNOWN_ENGINE_DP_RANK).any()) or bool((ranks >= data_parallel_size).any()):
         raise ValueError(
-            f"serving engine ranks must be below the engines' data-parallel size {data_parallel_size} or "
+            f"engine data-parallel ranks must be below the engines' data-parallel size {data_parallel_size} or "
             f"{UNKNOWN_ENGINE_DP_RANK}, got {ranks.tolist()}"
         )

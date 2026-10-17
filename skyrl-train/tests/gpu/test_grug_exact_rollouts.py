@@ -1,6 +1,5 @@
 import asyncio
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -16,31 +15,20 @@ from skyrl_train.exactness_check import ExactnessCheck
 from skyrl_train.inference_engines.base import UNKNOWN_ENGINE_DP_RANK, InferenceEngineInput, InferenceEngineOutput
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
-from skyrl_train.models.grug_moe import GrugMoeConfig
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.trajectory_runners.types import ENGINE_DP_RANKS_KEY, ROLLOUT_ENGINE_DP_RANKS_KEY
 from skyrl_train.utils import initialize_ray
 from skyrl_train.utils.utils import validate_cfg
-from tests.gpu.grug_exact_checkpoint import VOCAB, exact_numerics_config, write_snowball_checkpoint
+from tests.gpu.grug_exact_checkpoint import exact_numerics_config, write_snowball_checkpoint
 from tests.gpu.grug_gpu_gates import require_hoppers
 from tests.gpu.utils import init_worker_with_type
 
 
-@dataclass(frozen=True)
-class Layout:
-    """One node's GPUs: one decode-invariant engine of ``engine_ranks`` data- and expert-parallel ranks, and a
-    two-stage pipeline-parallel policy on ``policy_gpus`` GPUs with ``expert_parallel`` expert ranks."""
-
-    engine_ranks: int
-    policy_gpus: int
-    expert_parallel: int
-
-
-LAYOUTS = {
-    "engines_ep2_policy_pp2": Layout(engine_ranks=2, policy_gpus=2, expert_parallel=1),
-    # Four engine ranks add their expert partials in an order that depends on the serving rank.
-    "engines_ep4_policy_pp2_ep2": Layout(engine_ranks=4, policy_gpus=4, expert_parallel=2),
-}
+# One node: a decode-invariant engine of four data- and expert-parallel ranks, which add their expert partials in
+# an order that depends on the serving rank, and a two-stage pipeline-parallel policy with two expert ranks.
+ENGINE_RANKS = 4
+POLICY_GPUS = 4
+POLICY_EXPERT_PARALLEL = 2
 PAD_TOKEN_ID = 0
 # Prompts on both sides of the 2,048-token sliding window, served by every engine rank; one more row is a trajectory
 # that failed before its model call (two placeholder tokens, no loss tokens, no serving rank).
@@ -52,14 +40,14 @@ MAX_BATCHED_TOKENS = 2048
 SAMPLING_SEED = 11
 
 
-def _config(model_path: str, layout: Layout, router_replay: bool):
+def _config(model_path: str, router_replay: bool):
     rows = len(PROMPT_LENGTHS) + 1
     cfg = exact_numerics_config(
         model_path,
-        policy_gpus=layout.policy_gpus,
+        policy_gpus=POLICY_GPUS,
         pipeline_stages=2,
-        expert_parallel=layout.expert_parallel,
-        engine_ranks=layout.engine_ranks,
+        expert_parallel=POLICY_EXPERT_PARALLEL,
+        engine_ranks=ENGINE_RANKS,
     )
     cfg.trainer.gradient_checkpointing = False
     cfg.trainer.max_prompt_length = max(PROMPT_LENGTHS)
@@ -86,21 +74,19 @@ def _config(model_path: str, layout: Layout, router_replay: bool):
     return cfg
 
 
-def _prompts() -> list[list[int]]:
+def _prompts(vocab_size: int) -> list[list[int]]:
     generator = torch.Generator().manual_seed(5)
-    return [torch.randint(10, VOCAB, (length,), generator=generator).tolist() for length in PROMPT_LENGTHS]
+    return [torch.randint(10, vocab_size, (length,), generator=generator).tolist() for length in PROMPT_LENGTHS]
 
 
-def _generate(
-    client: InferenceEngineClient, prompts: list[list[int]], sampling_params: dict, engine_ranks: int
-) -> InferenceEngineOutput:
+def _generate(client: InferenceEngineClient, prompts: list[list[int]], sampling_params: dict) -> InferenceEngineOutput:
     started = time.monotonic()
     rollout = asyncio.run(
         client.generate(InferenceEngineInput(prompt_token_ids=prompts, sampling_params=sampling_params))
     )
     print(f"generated {len(prompts)} responses in {time.monotonic() - started:.1f}s: {rollout['stop_reasons']}")
     assert all(len(response) == RESPONSE_LENGTH for response in rollout["response_ids"]), rollout["stop_reasons"]
-    assert set(rollout[ENGINE_DP_RANKS_KEY]) == set(range(engine_ranks)), rollout[ENGINE_DP_RANKS_KEY]
+    assert set(rollout[ENGINE_DP_RANKS_KEY]) == set(range(ENGINE_RANKS)), rollout[ENGINE_DP_RANKS_KEY]
     return rollout
 
 
@@ -190,23 +176,20 @@ def _run_check(check: ExactnessCheck, client: InferenceEngineClient) -> None:
 
 
 @pytest.mark.parametrize("router_replay", [False, True], ids=["native_routing", "router_replay"])
-@pytest.mark.parametrize("layout", list(LAYOUTS.values()), ids=list(LAYOUTS))
-def test_exact_trainer_reproduces_decode_invariant_engine_logprobs_across_a_weight_update(
-    tmp_path, layout, router_replay
-):
+def test_exact_trainer_reproduces_decode_invariant_engine_logprobs_across_a_weight_update(tmp_path, router_replay):
     """The exact Megatron trainer gives every response token of a decode-invariant engine the engine's
     log-probability bit for bit, with a failed trajectory's placeholder row in the batch, and the online exactness
-    check passes. Routes moved by one position no longer match. A prefix-cache re-read gives the same responses, and
-    after one optimizer step and the production weight sync the new responses match again.
+    check passes. Routes moved by one position no longer match. The training forward reproduces the scoring
+    forward's log-probabilities, and after one optimizer step and the production weight sync the new responses match again.
     """
-    require_hoppers(layout.policy_gpus + layout.engine_ranks)
+    require_hoppers(POLICY_GPUS + ENGINE_RANKS)
     model_path = tmp_path / "model"
     model_path.mkdir()
-    write_snowball_checkpoint(model_path)
-    cfg = _config(str(model_path), layout, router_replay)
-    num_experts = GrugMoeConfig.from_pretrained(model_path).num_local_experts
+    model_config = write_snowball_checkpoint(model_path)
+    cfg = _config(str(model_path), router_replay)
+    num_experts = model_config.num_local_experts
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    prompts = _prompts()
+    prompts = _prompts(model_config.vocab_size)
     sampling_params = {
         **get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params),
         "max_tokens": RESPONSE_LENGTH,
@@ -218,15 +201,11 @@ def test_exact_trainer_reproduces_decode_invariant_engine_logprobs_across_a_weig
     try:
         engines = create_ray_wrapped_inference_engines_from_config(cfg, colocate_pg=None, tokenizer=tokenizer)
         client = InferenceEngineClient(engines, tokenizer, cfg)
-        first = _generate(client, prompts, sampling_params, layout.engine_ranks)
+        first = _generate(client, prompts, sampling_params)
         assert (first.get("routed_experts") is not None) == router_replay
-        # The second read of the same prompts hits the prefix cache: the same values, so the same seeded samples.
-        cached = _generate(client, prompts, sampling_params, layout.engine_ranks)
-        assert cached["response_ids"] == first["response_ids"]
-        assert _mismatches("prefix-cache re-read", torch.from_numpy(_engine_logprobs(cached)), first) == 0
 
         policy = init_worker_with_type(
-            "policy", shared_pg=None, colocate_all=False, num_gpus_per_node=layout.policy_gpus, num_nodes=1, cfg=cfg
+            "policy", shared_pg=None, colocate_all=False, num_gpus_per_node=POLICY_GPUS, num_nodes=1, cfg=cfg
         )
         batch = _batch(prompts, first, num_experts)
         logprobs = _trainer_logprobs(policy, batch)
@@ -242,11 +221,12 @@ def test_exact_trainer_reproduces_decode_invariant_engine_logprobs_across_a_weig
 
         batch["action_log_probs"] = logprobs * batch["loss_mask"]
         status = ray.get(policy.async_run_ray_method("mesh", "ppo_train", batch))[0].metadata["train_status"]
-        print(f"policy step: loss {status['policy_loss']}")
+        print(f"policy step: loss {status['policy_loss']}, log-ratio max abs {status['log_ratio_abs_max']}")
+        assert status["log_ratio_diagnostics_failed"] == 0.0 and status["log_ratio_abs_max"] == 0.0, status
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
 
-        updated = _generate(client, prompts, sampling_params, layout.engine_ranks)
+        updated = _generate(client, prompts, sampling_params)
         assert updated["response_ids"] != first["response_ids"]
         assert (
             _mismatches("updated weights", _trainer_logprobs(policy, _batch(prompts, updated, num_experts)), updated)

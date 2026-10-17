@@ -1,7 +1,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, List, NamedTuple, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn as nn
@@ -11,12 +11,11 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallel as MegatronDDP
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import Float16Module
 
-from skyrl_train.config.numerics import FULL_RECOMPUTE, NumericsMode
-from skyrl_train.models.grug_exact.context import ExactForward, check_serving_ranks
-from skyrl_train.models.grug_exact.rounding import kernel_value
+from skyrl_train.config.numerics import NumericsMode
+from skyrl_train.models.grug_exact.context import ExactForward, check_engine_dp_ranks
+from skyrl_train.models.grug_exact.kernel_values import kernel_value
 from skyrl_train.models.grug_exact.vllm_kernels import token_logprobs
 from skyrl_train.distributed.megatron.model_utils import (
     from_parallel_logits_to_logprobs,
@@ -79,14 +78,6 @@ class MegatronForwardMicroBatch:
     loss_mask: Optional[torch.Tensor] = None
     ftpo_chosen_mask: torch.Tensor | None = None
     probe_row_indices: Optional[torch.Tensor] = None
-
-
-class MicroBatchForward(NamedTuple):
-    """One micro-batch's model outputs, its packed-sequence parameters, and under exact numerics its ``ExactForward``."""
-
-    outputs: Any
-    packed_seq_params: PackedSeqParams | None
-    exact: ExactForward | None
 
 
 @dataclass(frozen=True)
@@ -220,8 +211,6 @@ class MegatronModelWrapper:
     def _engine_logprobs(logits: torch.Tensor, sequences: torch.Tensor) -> torch.Tensor:
         """``from_parallel_logits_to_logprobs`` on unsharded ``[batch, seq_len, vocab]`` logits, computed as the
         engine's model runner computes it, without gradients."""
-        if mpu.get_tensor_model_parallel_world_size() != 1:
-            raise NotImplementedError("exact numerics need the unsharded vocabulary (TP 1)")
         batch, seq_len, vocab = logits.shape
         target = sequences.roll(shifts=-1, dims=-1)
         with torch.no_grad():
@@ -342,24 +331,19 @@ class MegatronModelWrapper:
         record_recompute: bool = False,
         rollout_engine_dp_ranks: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
-    ) -> MicroBatchForward:
+    ):
         """Run the shared packed or left-unpadded Megatron model boundary.
 
         When router replay is installed and routes are present, brackets the
         model call with ``begin_forward`` / ``end_forward`` (never falling back
         to native routing); with replay installed but no routes, fails fast
         before the model runs. Under exact numerics the model call receives an
-        ``ExactForward`` with each sequence's serving engine rank, returned
-        third; every sequence with loss tokens must have one.
+        ``ExactForward`` with each sequence's engine data-parallel rank.
         """
         attention_mask = attention_mask.to(bool)
         model_kwargs = {}
-        exact = None
         if self.exact:
-            exact = self._exact_forward(
-                model, attention_mask, rollout_engine_dp_ranks, loss_mask, num_actions, record_recompute
-            )
-            model_kwargs["exact"] = exact
+            model_kwargs["exact"] = self._exact_forward(attention_mask, rollout_engine_dp_ranks, loss_mask, num_actions)
         armed = False
         if self.router_replay is not None:
             if rollout_routed_experts is None:
@@ -418,33 +402,25 @@ class MegatronModelWrapper:
                 # error and mask the original failure; reset and re-raise.
                 self.router_replay.abort_forward()
             raise
-        return MicroBatchForward(outputs, packed_seq_params, exact)
+        return outputs, packed_seq_params
 
     def _exact_forward(
         self,
-        model,
         attention_mask: torch.Tensor,
         rollout_engine_dp_ranks: Optional[torch.Tensor],
         loss_mask: Optional[torch.Tensor],
         num_actions: Optional[int],
-        record_recompute: bool,
     ) -> ExactForward:
-        """The ``ExactForward`` of one unpacked micro-batch: each row's serving engine rank, checked against the engine
-        data parallelism, and whether the forward keeps its attention outputs for a full recompute."""
-        if self.use_sample_packing:
-            raise NotImplementedError("exact numerics run on unpacked sequences")
+        """The ``ExactForward`` of one micro-batch, whose rows with loss tokens each need an engine data-parallel
+        rank."""
         if rollout_engine_dp_ranks is None:
-            raise ValueError("exact numerics need each sequence's serving engine rank (rollout_engine_dp_ranks)")
+            raise ValueError("exact numerics need each sequence's engine data-parallel rank (rollout_engine_dp_ranks)")
         ranks = rollout_engine_dp_ranks.to(device=attention_mask.device, dtype=torch.long)
         # A trajectory that failed before its model call is a row of placeholder tokens, no loss tokens and no
-        # serving rank; no loss reads its values.
+        # engine rank; no loss reads its values.
         scored = loss_mask.to(ranks.device) != 0 if loss_mask is not None else attention_mask[:, -num_actions:]
-        check_serving_ranks(ranks, scored.any(dim=1), int(self.cfg.generator.inference_engine_data_parallel_size))
-        return ExactForward(
-            serving_ranks=ranks,
-            expert_parallel_size=int(self.cfg.generator.inference_engine_expert_parallel_size),
-            keep_attention=record_recompute and get_model_config(model).recompute_granularity == FULL_RECOMPUTE,
-        )
+        check_engine_dp_ranks(ranks, scored.any(dim=1), int(self.cfg.generator.inference_engine_data_parallel_size))
+        return ExactForward(ranks, int(self.cfg.generator.inference_engine_expert_parallel_size))
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -487,7 +463,7 @@ class MegatronModelWrapper:
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
-            outputs, packed_seq_params, _ = self._forward_micro_batch(
+            outputs, packed_seq_params = self._forward_micro_batch(
                 model,
                 batch.sequences,
                 batch.attention_mask,
@@ -712,13 +688,11 @@ class MegatronModelWrapper:
                 metrics.update(log_ratio_monitor.metrics(gather_fn=partial(gather_ratio_tensor, group=group)))
             return objective.optimization_loss, metrics
 
-        exact_forwards: list[ExactForward] = []
-
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
 
             with profiler.capture_forward() if profiler is not None else nullcontext():
-                outputs, packed_seq_params, exact = self._forward_micro_batch(
+                outputs, packed_seq_params = self._forward_micro_batch(
                     model,
                     batch.sequences,
                     batch.attention_mask,
@@ -729,8 +703,6 @@ class MegatronModelWrapper:
                     rollout_engine_dp_ranks=batch.rollout_engine_dp_ranks,
                     loss_mask=batch.loss_mask,
                 )
-            if exact is not None:
-                exact_forwards.append(exact)
 
             return outputs, partial(loss_func, data=batch, packed_seq_params=packed_seq_params)
 
@@ -748,8 +720,6 @@ class MegatronModelWrapper:
                 forward_only=False,
             )
 
-        for exact in exact_forwards:
-            exact.assert_drained()
         if self.router_replay is not None:
             # Fail before the optimizer step: a non-empty FIFO or a masked row
             # that was not replayed means a layout bug, not a metric.

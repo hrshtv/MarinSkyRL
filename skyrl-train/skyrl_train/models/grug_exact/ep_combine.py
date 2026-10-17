@@ -1,11 +1,8 @@
-"""The routed expert outputs added in the engine's expert-parallel order.
+"""The routed expert outputs added in the decode-invariant engine's expert-parallel order.
 
-vLLM's ``allgather_reducescatter`` expert-parallel combine adds the expert partial outputs in NCCL ring order
-starting from the engine's data-parallel rank, and Megatron's token unpermute adds them in another order; the same
-four bf16 values added in two orders can round to different sums. The kernel here adds them in the engine's order,
-which is why the trainer needs each row's engine data-parallel rank: vLLM's EP rank ``r`` owns experts
-``[r * E / R, (r + 1) * E / R)`` and adds the row's slots it owns, in slot order, into an fp32 zero and rounds once;
-the ring reduce-scatter then adds the rank partials in bf16 from rank ``home + 1`` round to ``home``.
+vLLM's EP rank ``r`` owns experts ``[r * E / R, (r + 1) * E / R)`` and adds the row's slots it owns, in slot order,
+into an fp32 zero and rounds once; NCCL's ring reduce-scatter then adds the rank partials in bf16 from rank
+``home + 1`` round to ``home``, the EP rank of the engine data-parallel rank that served the row.
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ HIDDEN_BLOCK = 512
 def _ep_combine_kernel(
     permuted_ptr,
     selected_ptr,
-    home_ranks_ptr,
+    engine_dp_ranks_ptr,
     pairs_through_ptr,
     output_ptr,
     hidden,
@@ -39,7 +36,7 @@ def _ep_combine_kernel(
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     in_row = columns < hidden
     rounded = output_ptr.dtype.element_ty
-    home = tl.load(home_ranks_ptr + token) % EP_SIZE
+    home = tl.load(engine_dp_ranks_ptr + token) % EP_SIZE
     home = (home + EP_SIZE) % EP_SIZE
     # The rank sum holds values of the output dtype in fp32; ranks without slots add an exact zero.
     total = tl.zeros([BLOCK], dtype=tl.float32)
@@ -60,14 +57,14 @@ def ep_combine(
     permuted: torch.Tensor,
     routing_map: torch.Tensor,
     selected: torch.Tensor,
-    home_ranks: torch.Tensor,
+    engine_dp_ranks: torch.Tensor,
     ep_size: int,
 ) -> torch.Tensor:
     """Each token's ``[tokens, hidden]`` routed output as vLLM's expert-parallel combine adds it.
 
     ``permuted`` holds the weighted expert outputs in Megatron's permuted order (by expert, then token);
     ``routing_map`` is the ``[tokens, experts]`` selection, ``selected`` the ``[tokens, top_k]`` experts in the
-    engine's slot order and ``home_ranks`` the engine data-parallel rank that served each token's sequence.
+    engine's slot order and ``engine_dp_ranks`` the engine data-parallel rank that served each token's sequence.
     """
     tokens, experts = routing_map.shape
     top_k = selected.shape[1]
@@ -88,7 +85,7 @@ def ep_combine(
     _ep_combine_kernel[grid](
         permuted,
         selected,
-        home_ranks.long().contiguous(),
+        engine_dp_ranks.long().contiguous(),
         pairs_through,
         output,
         hidden,

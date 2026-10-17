@@ -1,16 +1,13 @@
-"""The Snowball-shaped Grug checkpoint and the run config the exact-numerics GPU tests serve and train."""
-
 from pathlib import Path
 
 import torch
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
-from skyrl_train.models.grug_moe import GrugMoeConfig, GrugMoeForCausalLM
+from skyrl_train.models.grug_moe import GrugMoeConfig, GrugMoeForCausalLM, GrugMoeGatedNorm
 from tests.gpu.utils import get_test_actor_config
 
 TOKENIZER = "Qwen/Qwen2.5-0.5B-Instruct"
-VOCAB = 128256
 
 
 def write_snowball_checkpoint(
@@ -21,7 +18,6 @@ def write_snowball_checkpoint(
     router weights are scaled by ``router_weight_scale``."""
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
     config = GrugMoeConfig(
-        vocab_size=VOCAB,
         num_hidden_layers=num_hidden_layers,
         num_local_experts=num_local_experts,
         intermediate_size=128,
@@ -31,7 +27,7 @@ def write_snowball_checkpoint(
     model = GrugMoeForCausalLM(config)
     with torch.no_grad():
         for module in model.modules():
-            if module.__class__.__name__ == "GrugMoeGatedNorm":
+            if isinstance(module, GrugMoeGatedNorm):
                 module.down_proj.weight.normal_(std=0.2)
                 module.up_proj.weight.normal_(std=0.2)
         for layer in model.model.layers:

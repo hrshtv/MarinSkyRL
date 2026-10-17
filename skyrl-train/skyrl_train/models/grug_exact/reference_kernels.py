@@ -1,10 +1,5 @@
-"""Gradients of the trainer's reference chains, computed without running the chains' forward.
-
-Each function returns a kernel's value for a region with the gradient that autograd's backward of the trainer's
-chain for that value (``rounding``) gives, bit for bit: the Triton kernels evaluate autograd's elementwise formulas
-in its order and roundings, and the reductions run as the same torch sums and GEMMs. For one Snowball layer of a
-9,216-token sequence on an H100 they take 3.3 ms, where running the chains forward and backward takes 11.4 ms.
-"""
+"""Kernel values with the gradient autograd gives the trainer's chain for them, bit for bit, computed without running
+the chain: the Triton kernels evaluate autograd's elementwise formulas in its order and roundings."""
 
 from __future__ import annotations
 
@@ -418,7 +413,7 @@ class _XsaHeadGate(torch.autograd.Function):
 
 
 class _QueryKeyReference(torch.autograd.Function):
-    """``value`` differentiated as one output of ``rounded_query_key(qk_norm_fp32(query), qk_norm_fp32(key), ...)``."""
+    """``value`` differentiated as one output of ``query_key_values``' chain."""
 
     @staticmethod
     def forward(ctx, value, raw, freqs, multiplier, multiplier_scale, query):
@@ -504,8 +499,8 @@ def swiglu_value(value: torch.Tensor, fc1_output: torch.Tensor) -> torch.Tensor:
 def hybrid_input_norm_value(
     value: torch.Tensor, hidden: torch.Tensor, variance: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """``value``, differentiated as ``rms_norm_hybrid(hidden, variance_with_gradient(variance, hidden), weight, eps)``
-    (the bf16 input normalized by the unrounded sum's variance)."""
+    """``value``, differentiated as ``(hidden.float() * rsqrt(variance + eps) * weight.float()).to(bf16)`` with
+    ``variance`` differentiated as ``hidden.float().pow(2).mean(-1, keepdim=True)``."""
     if not torch.is_grad_enabled():
         return value
     return _HybridInputNorm.apply(value, hidden, hidden, variance, weight, eps)
@@ -514,7 +509,8 @@ def hybrid_input_norm_value(
 def xsa_head_gate_value(
     value: torch.Tensor, attention: torch.Tensor, kv_value: torch.Tensor, gate: torch.Tensor, head_dim: int
 ) -> torch.Tensor:
-    """``value``, differentiated as ``xsa_and_gate_single_rounding(attention, kv_value, gate, head_dim)``."""
+    """``value``, differentiated as XSA of ``attention`` against its group's ``kv_value`` head, times the
+    ``2 * sigmoid(gate)`` head gate, in fp32 and rounded once."""
     if not torch.is_grad_enabled():
         return value
     return _XsaHeadGate.apply(value, attention, kv_value, gate, head_dim)
@@ -529,8 +525,8 @@ def query_key_values(
     multiplier: float,
     multiplier_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The vLLM query and key values, differentiated as ``rounded_query_key(qk_norm_fp32(query), qk_norm_fp32(key),
-    freqs, multiplier, multiplier_scale, dtype)``."""
+    """The vLLM query and key values, differentiated as Grug's fp32 per-head RMS norm of the raw projections, then
+    NeoX RoPE with the bf16 cos/sin table and the query scale at compiled vLLM's rounding points."""
     if not torch.is_grad_enabled():
         return query_value, key_value
     query_freqs, key_freqs = freqs if freqs is not None else (None, None)

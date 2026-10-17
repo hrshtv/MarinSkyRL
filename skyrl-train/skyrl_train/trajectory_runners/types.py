@@ -16,9 +16,8 @@ ROUTED_EXPERTS_KEY = "routed_experts"
 RESPONSE_POLICY_STEPS_KEY = "response_policy_steps"
 # The data-parallel rank of the inference engine that served each response: the batched engine-output key and the
 # ModelTurn.metadata key (one rank per turn), and the trajectory and training batch key (one rank per row). Under
-# expert parallelism an engine adds the experts' partial outputs in an order that depends on its rank, so the Grug
-# exact trainer (``models/grug_exact``) reads the rank from the training batch to add them in the engine's order, and
-# the exactness check reports mismatches per engine rank.
+# expert parallelism an engine adds the experts' partial outputs in an order that depends on its rank, so the exactness
+# check reports mismatches per engine rank.
 ENGINE_DP_RANKS_KEY = "engine_dp_ranks"
 ROLLOUT_ENGINE_DP_RANKS_KEY = "rollout_engine_dp_ranks"
 RESPONSE_SPAN_TAGS_KEY = "response_span_tags"

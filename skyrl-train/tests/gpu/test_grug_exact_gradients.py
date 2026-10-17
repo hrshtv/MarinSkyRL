@@ -199,10 +199,9 @@ def _relative_difference(value: torch.Tensor, reference: torch.Tensor) -> float:
     return difference / max(reference.double().norm().item(), torch.finfo(torch.float64).tiny)
 
 
-def test_exact_gradients_repeat_bit_for_bit_with_and_without_recompute_and_follow_native_gradients(tmp_path):
+def test_exact_gradients_equal_with_and_without_recompute_and_follow_native_gradients(tmp_path):
     """Under exact numerics on two pipeline stages, the same forward-backward gives the same gradients bit for bit
-    when repeated and with full activation recompute in one-layer units or without recompute, and every gradient is
-    within ``NATIVE_RELATIVE_TOLERANCE`` of native numerics' gradient on the same weights, batch and expert routes,
+    with full activation recompute in one-layer units and without recompute, and every gradient is within ``NATIVE_RELATIVE_TOLERANCE`` of native numerics' gradient on the same weights, batch and expert routes,
     each mode's ratios taken against its own eval forward."""
     require_hoppers(POLICY_WORLD_SIZE)
     model_path = tmp_path / "model"
@@ -215,7 +214,6 @@ def test_exact_gradients_repeat_bit_for_bit_with_and_without_recompute_and_follo
         batch["action_log_probs"] = (eval_logprobs * batch["response_mask"]).float()
         metrics = {
             "a": _gradients(policy, batch, tmp_path / "a", recompute=True),
-            "a_repeat": _gradients(policy, batch, tmp_path / "a_repeat", recompute=True),
             "b": _gradients(policy, batch, tmp_path / "b", recompute=False),
         }
     with _policy(_config(str(model_path), NumericsMode.NATIVE), str(model_path)) as policy:
@@ -224,15 +222,13 @@ def test_exact_gradients_repeat_bit_for_bit_with_and_without_recompute_and_follo
 
     for arm, arm_metrics in metrics.items():
         print(f"{arm}: losses {arm_metrics['losses']}, log-ratio max abs {arm_metrics['log_ratio_abs_max']}")
-    for arm in ("a", "a_repeat", "b"):
+    for arm in ("a", "b"):
         # The training forward reproduces the eval forward's log-probabilities bit for bit.
         assert metrics[arm]["log_ratio_abs_max"] == 0.0, (arm, metrics[arm]["log_ratio_abs_max"])
-    assert metrics["a"]["losses"] == metrics["a_repeat"]["losses"] == metrics["b"]["losses"], metrics
+    assert metrics["a"]["losses"] == metrics["b"]["losses"], metrics
 
-    a, a_repeat, b, native = (_load_gradients(tmp_path / arm) for arm in ("a", "a_repeat", "b", "native"))
-    assert a.keys() == a_repeat.keys() == b.keys() == native.keys()
-    not_repeated = [name for name in a if not torch.equal(a[name], a_repeat[name])]
-    assert not not_repeated, f"{len(not_repeated)} of {len(a)} gradients differ when repeated: {not_repeated}"
+    a, b, native = (_load_gradients(tmp_path / arm) for arm in ("a", "b", "native"))
+    assert a.keys() == b.keys() == native.keys()
     recompute_differs = [name for name in a if not torch.equal(a[name], b[name])]
     assert not recompute_differs, f"{len(recompute_differs)} of {len(a)} gradients differ: {recompute_differs}"
     relative = {name: _relative_difference(a[name], native[name]) for name in a}

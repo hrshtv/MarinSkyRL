@@ -74,11 +74,13 @@ def test_from_config_forwards_vllm_engine_options(monkeypatch, tmp_path):
     assert captured["decode_context_parallel_size"] == 2
     assert captured["vllm_attention_backend"] == "FLASH_ATTN"
 
-    # trainer.numerics.mode=exact with a Snowball-shaped Grug policy builds decode-invariant rollout engines and
-    # leaves the config as written.
+    # trainer.numerics.mode=exact with a Snowball-shaped Grug policy and Snowball's exact settings validates with
+    # on_failure=stop, builds decode-invariant rollout engines and leaves the config as written.
     captured.clear()
     cfg3 = get_default_config()
     cfg3.trainer.numerics.mode = "exact"
+    cfg3.trainer.numerics.check.on_failure = "stop"
+    cfg3.trainer.use_sample_packing = False
     GrugMoeConfig().save_pretrained(tmp_path / "policy")
     cfg3.trainer.policy.model.path = str(tmp_path / "policy")
     cfg3.generator.enforce_eager = False

@@ -6,13 +6,15 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
-from skyrl_train.inference_engines.vllm.decode_invariant.engine import decode_invariant_engine_environment
+from skyrl_train.inference_engines.vllm.decode_invariant.engine import DECODE_INVARIANT_ENGINE_ENVIRONMENT
 from skyrl_train.models.grug_exact.ep_combine import ep_combine
+from skyrl_train.models.grug_moe import GrugMoeConfig
 from tests.gpu.grug_gpu_gates import require_hoppers
 
-HIDDEN = 2560
-EXPERTS = 256
-TOP_K = 4
+SNOWBALL = GrugMoeConfig()
+HIDDEN = SNOWBALL.hidden_size
+EXPERTS = SNOWBALL.num_local_experts
+TOP_K = SNOWBALL.num_experts_per_tok
 # Snowball's decode-invariant engines: eight data- and expert-parallel ranks on one node.
 RANKS = 8
 EXPERTS_PER_RANK = EXPERTS // RANKS
@@ -75,7 +77,7 @@ def _ring_sum(partials: torch.Tensor, home: int, direction: int) -> torch.Tensor
 
 
 def _combine_on_rank(rank: int, rendezvous: str) -> None:
-    os.environ.update(decode_invariant_engine_environment())
+    os.environ.update(DECODE_INVARIANT_ENGINE_ENVIRONMENT)
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=RANKS, timeout=timedelta(minutes=5))
     communicator = PyNcclCommunicator(dist.group.WORLD, device=rank)

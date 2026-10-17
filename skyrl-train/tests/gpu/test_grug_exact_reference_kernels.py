@@ -2,6 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from skyrl_train.models.grug_exact.inductor_kernels import COMPILED_MODEL
+from skyrl_train.models.grug_exact.inductor_regions import HEAD_DIM, HEADS, HIDDEN, KV_HEADS, ROTARY_DIM
+from skyrl_train.models.grug_exact.kernel_values import kernel_value
 from skyrl_train.models.grug_exact.reference_kernels import (
     gated_product_value,
     hybrid_input_norm_value,
@@ -10,21 +13,55 @@ from skyrl_train.models.grug_exact.reference_kernels import (
     swiglu_value,
     xsa_head_gate_value,
 )
-from skyrl_train.models.grug_exact.rounding import (
-    gated_norm_product_fp32,
-    kernel_value,
-    qk_norm_fp32,
-    rms_norm_hybrid,
-    rounded_query_key,
-    swiglu_single_rounding,
-    variance_with_gradient,
-    xsa_and_gate_single_rounding,
-)
+from skyrl_train.models.grug_moe import GRUG_ATTN_GATE_SCALE, GRUG_QK_RMS_NORM_EPS, GRUG_XSA_EPS, GrugMoeConfig
 from tests.gpu.grug_gpu_gates import require_hoppers
 
 # 3,328 rows put every non-NaN bf16 bit pattern into the head-gate logits ([rows, 1, 20]).
-ROWS, HIDDEN, HEADS, KV_HEADS, HEAD_DIM, EXPERTS = 3328, 2560, 20, 5, 128, 256
-QUERY_MULTIPLIER = 1.5703274004183787
+ROWS = 3328
+EXPERTS = GrugMoeConfig().num_local_experts
+
+
+def _swiglu_chain(fc1_output):
+    gate, up = torch.chunk(fc1_output, 2, dim=-1)
+    return (F.silu(gate.float()) * up.float()).to(fc1_output.dtype)
+
+
+def _hybrid_norm_chain(hidden, variance, weight, eps):
+    variance = kernel_value(variance, lambda: hidden.float().pow(2).mean(dim=-1, keepdim=True))
+    return (hidden.float() * torch.rsqrt(variance + eps) * weight.float()).to(weight.dtype)
+
+
+def _xsa_gate_chain(core_attn_out, value, gate):
+    heads = core_attn_out.shape[-1] // HEAD_DIM
+    attention = core_attn_out.view(*value.shape[:-2], heads, HEAD_DIM).float()
+    v = value.repeat_interleave(heads // value.shape[-2], dim=-2).float()
+    dot = (attention * v).sum(dim=-1, keepdim=True)
+    projected = attention - (dot / (v.square().sum(dim=-1, keepdim=True) + GRUG_XSA_EPS)) * v
+    scale = (GRUG_ATTN_GATE_SCALE * torch.sigmoid(gate.float())).view(*gate.shape, 1)
+    return (projected * scale).to(core_attn_out.dtype).reshape(core_attn_out.shape)
+
+
+def _qk_norm(raw):
+    fp32 = raw.float()
+    return fp32 * torch.rsqrt(fp32.square().mean(dim=-1, keepdim=True) + GRUG_QK_RMS_NORM_EPS)
+
+
+def _neox_rope(x, angles):
+    """vLLM's NeoX rotation of the first ``ROTARY_DIM`` dims in fp32 with its bf16 cos/sin table."""
+    cos = angles.cos().to(torch.bfloat16).float()[:, None, None, :]
+    sin = angles.sin().to(torch.bfloat16).float()[:, None, None, :]
+    first, second = x[..., : ROTARY_DIM // 2], x[..., ROTARY_DIM // 2 : ROTARY_DIM]
+    return torch.cat((first * cos - second * sin, second * cos + first * sin, x[..., ROTARY_DIM:]), dim=-1)
+
+
+def _query_key_chain(query, key, angles, multiplier):
+    """Compiled vLLM's rounding points for the normalized q and k: k rounds once after RoPE; q's rotated half rounds
+    before the scale and again after it, its pass-through half once."""
+    if angles is not None:
+        query = _neox_rope(query, angles)
+        query = torch.cat((query[..., :ROTARY_DIM].to(torch.bfloat16).float(), query[..., ROTARY_DIM:]), dim=-1)
+        key = _neox_rope(key, angles)
+    return (query.float() * multiplier).to(torch.bfloat16), key.to(torch.bfloat16)
 
 
 def _every_bf16(shape, generator) -> torch.Tensor:
@@ -65,7 +102,7 @@ def _gated_product(generator):
         if fused:
             out = gated_product_value(value, n, g)
         else:
-            out = kernel_value(value, lambda n=n, g=g: gated_norm_product_fp32(n, g).to(torch.bfloat16))
+            out = kernel_value(value, lambda n=n, g=g: (n.float() * torch.sigmoid(g.float())).to(torch.bfloat16))
         out.backward(grad)
         results.append((n.grad, g.grad))
     return results
@@ -77,7 +114,7 @@ def _swiglu(generator):
     results = []
     for fused in (False, True):
         (f,) = _leaves(fc1)
-        out = swiglu_value(value, f) if fused else kernel_value(value, lambda f=f: swiglu_single_rounding(f))
+        out = swiglu_value(value, f) if fused else kernel_value(value, lambda f=f: _swiglu_chain(f))
         out.backward(grad)
         results.append((f.grad,))
     return results
@@ -114,9 +151,7 @@ def _hybrid_input_norm(generator):
         if fused:
             normalized = hybrid_input_norm_value(value, h, variance, w, 1e-5)
         else:
-            normalized = kernel_value(
-                value, lambda h=h, w=w: rms_norm_hybrid(h, variance_with_gradient(variance, h), w, 1e-5)
-            )
+            normalized = kernel_value(value, lambda h=h, w=w: _hybrid_norm_chain(h, variance, w, 1e-5))
         torch.autograd.backward((normalized, h + attention), (grad, residual_grad))
         results.append((h.grad, w.grad))
     return results
@@ -133,7 +168,7 @@ def _xsa_head_gate(generator):
         if fused:
             out = xsa_head_gate_value(value, a, v, g, HEAD_DIM)
         else:
-            out = kernel_value(value, lambda a=a, v=v, g=g: xsa_and_gate_single_rounding(a, v, g, HEAD_DIM))
+            out = kernel_value(value, lambda a=a, v=v, g=g: _xsa_gate_chain(a, v, g))
         out.backward(grad)
         results.append((a.grad, v.grad, g.grad))
     return results
@@ -144,26 +179,20 @@ def _query_key(generator, rope: bool):
     raw_key = _activations((ROWS, 1, KV_HEADS, HEAD_DIM), generator)
     query_grad = _activations((ROWS, 1, HEADS, HEAD_DIM), generator)
     key_grad = _activations((ROWS, 1, KV_HEADS, HEAD_DIM), generator)
-    inverse = 1.0 / (10000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
-    angles = torch.outer(torch.arange(ROWS, dtype=torch.float32), inverse)
-    freqs = torch.cat((angles, angles), dim=-1).view(ROWS, 1, 1, 64).cuda() if rope else None
+    multiplier = COMPILED_MODEL["qk_mult"]
+    inverse = 1.0 / (10000.0 ** (torch.arange(0, ROTARY_DIM, 2, dtype=torch.float32) / ROTARY_DIM))
+    angles = torch.outer(torch.arange(ROWS, dtype=torch.float32), inverse).cuda() if rope else None
+    freqs = torch.cat((angles, angles), dim=-1).view(ROWS, 1, 1, ROTARY_DIM) if rope else None
     results = []
     for fused in (False, True):
         q, k = _leaves(raw_query, raw_key)
         query_value, key_value = q.detach().clone(), k.detach().clone()
         if fused:
             out_q, out_k = query_key_values(
-                query_value, key_value, q, k, (freqs, freqs) if rope else None, QUERY_MULTIPLIER, 1.0
+                query_value, key_value, q, k, (freqs, freqs) if rope else None, multiplier, 1.0
             )
         else:
-            ref_q, ref_k = rounded_query_key(
-                qk_norm_fp32(q),
-                qk_norm_fp32(k),
-                (freqs, freqs) if rope else None,
-                QUERY_MULTIPLIER,
-                1.0,
-                torch.bfloat16,
-            )
+            ref_q, ref_k = _query_key_chain(_qk_norm(q), _qk_norm(k), angles, multiplier)
             out_q = kernel_value(query_value, lambda ref_q=ref_q: ref_q)
             out_k = kernel_value(key_value, lambda ref_k=ref_k: ref_k)
         torch.autograd.backward((out_q, out_k), (query_grad, key_grad))

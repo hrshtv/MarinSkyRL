@@ -335,6 +335,12 @@ class GrugGPTModel(GPTModel):
     """GPTModel with Grug's gated embedding norm on the first pipeline stage."""
 
     embed_norm_class: type[nn.Module] = GrugGatedRMSNorm
+    final_norm_class: type[nn.Module] = GrugGatedRMSNorm
+
+    @staticmethod
+    def layer_spec(config: TransformerConfig) -> ModuleSpec:
+        """The layer spec of the model's decoder layers."""
+        return grug_layer_spec(config)
 
     def __init__(self, config: TransformerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
@@ -530,7 +536,7 @@ def grug_block_spec(
     pp_rank: int,
     *,
     layer_spec: ModuleSpec,
-    final_norm: type[nn.Module] = GrugGatedRMSNorm,
+    final_norm: type[nn.Module],
 ) -> ModuleSpec:
     """Build this pipeline stage's decoder block spec from ``layer_spec`` with ``final_norm`` as its gated final norm."""
 

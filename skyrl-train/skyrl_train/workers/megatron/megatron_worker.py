@@ -33,8 +33,9 @@ from skyrl_train.distributed.megatron.optimizer import (
 )
 from skyrl_train.distributed.megatron.remote_model import install_remote_hf_state
 from skyrl_train.distributed.utils import init_worker_process_group_with_device
-from skyrl_train.config.numerics import NUMERICS_KEY, NumericsMode, resolve_exact_numerics
+from skyrl_train.config.numerics import NumericsMode
 from skyrl_train.mismatch_probe.modes import TRAINER_MODES
+from skyrl_train.models.grug_exact.support import resolve_exact_numerics
 from skyrl_train.models.grug_exact.vllm_kernels import require_hopper_gpu
 from skyrl_train.models.grug_moe import GRUG_MOE_MODEL_TYPE, validate_grug_training_strategy
 from skyrl_train.timing_observability import PhaseBreakdown
@@ -169,8 +170,6 @@ class MegatronWorker:
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
         if self.numerics is NumericsMode.EXACT:
-            if hf_config.model_type != GRUG_MOE_MODEL_TYPE:
-                raise ValueError(f"{NUMERICS_KEY}.mode=exact needs a Grug model, got {hf_config.model_type}")
             require_hopper_gpu()
             provider.grug_numerics = self.numerics
         provider.finalize()
