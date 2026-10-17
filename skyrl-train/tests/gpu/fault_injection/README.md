@@ -70,6 +70,25 @@ saved local snapshots are trusted pickle inputs; do not reuse an untrusted
 artifact directory. Inspect both pytest exit statuses and the manifest before
 claiming success.
 
+## Snowball qualification
+
+`snowball_checkpoint_parity.py` runs two fresh-process phases on four eight-H100
+nodes with Snowball TP1/PP2/CP1/EP8 and `dp_reshardable` optimizer state. The
+qualification launcher selects it with `run.checkpoint_parity_phase` (`reference`
+or `resume`) and `run.checkpoint_parity_root`. Both phases use the same source,
+dependencies, model identity, trainer settings and durable root. Generation engines
+are disabled; this is a numerical recovery check, not a save-performance workload.
+
+The reference saves step 1, injects a failure after every rank completes step 2's
+distributed save, and requires that step 1 remains readable through latest. It
+retries step 2 with a distinct attempt, then records all ranks' model, optimizer,
+scheduler and RNG hashes before and after an uninterrupted step 3. The resume
+phase loads the committed retry and requires identical hashes on identical inputs.
+It also restores the real rollout context's loader position and pending retry
+prompt. Gradients must be finite and nonzero, and step 3 must change model values.
+Separate standard-entrypoint resumes exercise live rollout generation. Hashing,
+failure injection and inspection are separate from measured checkpoint pauses.
+
 ## Distributed debug artifact acceptance
 
 The opt-in two-node test in `distributed_debug_artifact_contract.py` runs one

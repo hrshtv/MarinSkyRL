@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List
@@ -30,6 +31,7 @@ from cloud.iris.rl_data import (
 )
 from marinskyrl.process_diagnostics import ProcessOutcomeKind, write_process_outcome
 from marinskyrl.resource_locator import is_cloud_uri, model_source_for_path
+from marinskyrl.checkpoint_paths import extract_step_from_path
 from cloud.iris.launch_config import RunMode, load_launch_config
 from cloud.iris.rl_config_translation import TaskLocalSkyRLValues, apply_task_local_values
 
@@ -185,7 +187,53 @@ class LocalRLRunner:
         )
         launch_config.skyrl = skyrl_config
         self._write_resolved_config(launch_config)
+        if launch_config.run.load_probe_paths:
+            return self._run_load_probe(launch_config)
         return self._run_skyrl(launch_config)
+
+    def _run_load_probe(self, launch_config: DictConfig) -> int:
+        """Measure fresh-process checkpoint loads serially on one allocation."""
+        paths = [str(path) for path in launch_config.run.load_probe_paths]
+        trainer = launch_config.skyrl.trainer
+        if int(trainer.ckpt_interval) != -1 or int(trainer.hf_save_interval) != -1 or trainer.callbacks:
+            raise ValueError("Load probes require checkpoint, export and explicit callbacks disabled")
+        if any(extract_step_from_path(path) < int(trainer.max_steps) for path in paths):
+            raise ValueError("Load probes must not execute a training step")
+        expected_gpus = int(launch_config.iris.allocation.num_nodes * launch_config.iris.allocation.gpus_per_node)
+        for index, path in enumerate(paths):
+            trial = OmegaConf.create(OmegaConf.to_container(launch_config, resolve=True))
+            trial.skyrl.trainer.resume_mode = "from_path"
+            trial.skyrl.trainer.resume_path = path
+            observation = {"trial": index, "checkpoint": path, "reader_revision": str(trial.runtime.launcher_commit)}
+            print("CHECKPOINT_LOAD_TRIAL " + json.dumps({**observation, "event": "start"}), flush=True)
+            started = time.monotonic()
+            result = self._run_skyrl(trial)
+            print(
+                "CHECKPOINT_LOAD_TRIAL "
+                + json.dumps(
+                    {**observation, "event": "end", "exit_code": result, "elapsed_seconds": time.monotonic() - started}
+                ),
+                flush=True,
+            )
+            if result != 0:
+                return result
+            if index < len(paths) - 1:
+                self._wait_for_gpu_cleanup(expected_gpus)
+        return 0
+
+    @staticmethod
+    def _wait_for_gpu_cleanup(expected_gpus: int) -> None:
+        import ray  # noqa: PLC0415 - only the load probe needs a Ray client
+
+        deadline = time.monotonic() + 300
+        ray.init(address=os.environ["RAY_ADDRESS"])
+        try:
+            while float(ray.available_resources().get("GPU", 0)) < expected_gpus:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Checkpoint load trial retained GPUs; expected {expected_gpus} available")
+                time.sleep(2)
+        finally:
+            ray.shutdown()
 
     def _gpus_per_node(self) -> int:
         """GPUs per node, defaulting to total `gpus` for the single-node case."""
@@ -238,7 +286,12 @@ class LocalRLRunner:
         config_path = Path(tempfile.gettempdir()) / "marinskyrl" / "skyrl-launch.yaml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         OmegaConf.save(launch_config, config_path, resolve=True)
-        cmd = [python_exe, "-m", "cloud.iris.skyrl_entrypoint", "--config", str(config_path)]
+        module = (
+            "tests.gpu.fault_injection.snowball_checkpoint_parity"
+            if OmegaConf.select(launch_config, "run.checkpoint_parity_phase")
+            else "cloud.iris.skyrl_entrypoint"
+        )
+        cmd = [python_exe, "-m", module, "--config", str(config_path)]
 
         print("\nRunning SkyRL:")
         print(f"  Entrypoint: {launch_config.runtime.entrypoint}")
