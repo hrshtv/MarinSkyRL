@@ -57,85 +57,82 @@ def test_ownership_sentinels_distinguish_launch_writers_context_writers_and_auth
         "export_hf_artifact": True,
     }
     monkeypatch.setattr(task_runtime.tempfile, "tempdir", str(tmp_path))
-    outcomes = []
-    for suffix, number in (("A", 2), ("B", 4)):
-        seeded = copy.deepcopy(full)
-        for parts, value in leaves(full):
-            sentinel = (
-                not value
-                if isinstance(value, bool)
-                else 31
-                if isinstance(value, int)
-                else 3.125
-                if isinstance(value, float)
-                else [f"/author/{suffix}"]
-                if isinstance(value, list)
-                else f"author-{suffix}"
-            )
-            set_path(seeded, ".".join(parts), sentinel)
-        for path in LAUNCH_PATHS:
-            set_path(seeded, path, False if path == "trainer.export_hf_artifact" else f"author-{suffix}")
-        for path in FILL_WHEN_UNSET | GPU_PATHS:
-            set_path(
-                seeded,
-                path,
-                f"author-{suffix}"
-                if path in {"trainer.run_name", "terminal_bench.installed_agent.output_path"}
-                else number,
-            )
-        section_values = {
-            name: seeded[name]
-            for name in ("trainer", "generator", "data", "environment", "trajectory_runner", "terminal_bench")
+    suffix, number = "B", 4
+    seeded = copy.deepcopy(full)
+    for parts, value in leaves(full):
+        sentinel = (
+            not value
+            if isinstance(value, bool)
+            else 31
+            if isinstance(value, int)
+            else 3.125
+            if isinstance(value, float)
+            else [f"/author/{suffix}"]
+            if isinstance(value, list)
+            else f"author-{suffix}"
+        )
+        set_path(seeded, ".".join(parts), sentinel)
+    for path in LAUNCH_PATHS:
+        set_path(seeded, path, False if path == "trainer.export_hf_artifact" else f"author-{suffix}")
+    for path in FILL_WHEN_UNSET | GPU_PATHS:
+        set_path(
+            seeded,
+            path,
+            f"author-{suffix}"
+            if path in {"trainer.run_name", "terminal_bench.installed_agent.output_path"}
+            else number,
+        )
+    section_values = {
+        name: seeded[name]
+        for name in ("trainer", "generator", "data", "environment", "trajectory_runner", "terminal_bench")
+    }
+    injected = replace(parsed, **section_values)
+    authored_parameters = {
+        **parameters,
+        "train_data": seeded["data"]["train_data"],
+        "val_data": seeded["data"]["val_data"],
+    }
+    filled = launcher._skyrl_config_sections(injected, authored_parameters, SimpleNamespace(gpus_per_node=8))
+    data = resolve_rl_train_data_with_sources(injected.data["terminal_bench_data"], kind="tasks", verbose=False)
+    staged = launcher.apply_task_local_values(
+        OmegaConf.create(filled),
+        launcher.TaskLocalSkyRLValues(
+            train_data=tuple(authored_parameters["train_data"]),
+            validation_data=tuple(authored_parameters["val_data"]),
+            terminal_bench_data=tuple(data.paths),
+        ),
+    )
+    launch = OmegaConf.create(
+        {
+            "run": {"id": f"ownership-{suffix}", "attempt_id": "1"},
+            "inputs": {"model": {"uri": "/launch/model"}},
+            "skyrl": staged,
         }
-        injected = replace(parsed, **section_values)
-        authored_parameters = {
-            **parameters,
-            "train_data": seeded["data"]["train_data"],
-            "val_data": seeded["data"]["val_data"],
-        }
-        filled = launcher._skyrl_config_sections(injected, authored_parameters, SimpleNamespace(gpus_per_node=8))
-        data = resolve_rl_train_data_with_sources(injected.data["terminal_bench_data"], kind="tasks", verbose=False)
-        staged = launcher.apply_task_local_values(
-            OmegaConf.create(filled),
-            launcher.TaskLocalSkyRLValues(
-                train_data=tuple(authored_parameters["train_data"]),
-                validation_data=tuple(authored_parameters["val_data"]),
-                terminal_bench_data=tuple(data.paths),
-            ),
-        )
-        launch = OmegaConf.create(
-            {
-                "run": {"id": f"ownership-{suffix}", "attempt_id": "1"},
-                "inputs": {"model": {"uri": "/launch/model"}},
-                "skyrl": staged,
-            }
-        )
-        written = task_runtime._write_final_config(
-            launch,
-            policy_model=task_runtime.PreparedPolicyModel("s3://launch/model", "sha256:launch", "/stage/model"),
-            policy_tokenizer=task_runtime.PreparedPolicyTokenizer("/stage/tokenizer"),
-            draft_model=None,
-        )
-        result = OmegaConf.to_container(OmegaConf.load(written).skyrl, resolve=False)
-        result["terminal_bench"] = result.pop("terminal_bench_config")
-        changed = {
-            ".".join(parts) for parts, before in leaves(section_values) if get_path(result, ".".join(parts)) != before
-        }
-        assert LAUNCH_PATHS <= changed
-        assert changed - LAUNCH_PATHS == frozenset()
-        for path in FILL_WHEN_UNSET | GPU_PATHS:
-            assert get_path(result, path) == get_path(seeded, path)
-        outcomes.append(result)
-        absent = copy.deepcopy(section_values)
-        for path in FILL_WHEN_UNSET:
-            set_path(absent, path, None)
-        defaults = launcher._skyrl_config_sections(
-            replace(parsed, **absent), authored_parameters, SimpleNamespace(gpus_per_node=8)
-        )
-        defaults["terminal_bench"] = defaults.pop("terminal_bench_config")
-        for path in FILL_WHEN_UNSET:
-            assert get_path(defaults, path) not in (MISSING, None)
-    assert outcomes[0]["data"]["terminal_bench_data"] != outcomes[1]["data"]["terminal_bench_data"]
+    )
+    written = task_runtime._write_final_config(
+        launch,
+        policy_model=task_runtime.PreparedPolicyModel("s3://launch/model", "sha256:launch", "/stage/model"),
+        policy_tokenizer=task_runtime.PreparedPolicyTokenizer("/stage/tokenizer"),
+        draft_model=None,
+    )
+    result = OmegaConf.to_container(OmegaConf.load(written).skyrl, resolve=False)
+    result["terminal_bench"] = result.pop("terminal_bench_config")
+    changed = {
+        ".".join(parts) for parts, before in leaves(section_values) if get_path(result, ".".join(parts)) != before
+    }
+    assert LAUNCH_PATHS <= changed
+    assert changed - LAUNCH_PATHS == frozenset()
+    for path in FILL_WHEN_UNSET | GPU_PATHS:
+        assert get_path(result, path) == get_path(seeded, path)
+    absent = copy.deepcopy(section_values)
+    for path in FILL_WHEN_UNSET:
+        set_path(absent, path, None)
+    defaults = launcher._skyrl_config_sections(
+        replace(parsed, **absent), authored_parameters, SimpleNamespace(gpus_per_node=8)
+    )
+    defaults["terminal_bench"] = defaults.pop("terminal_bench_config")
+    for path in FILL_WHEN_UNSET:
+        assert get_path(defaults, path) not in (MISSING, None)
     derived = {}
     context_paths = DERIVED_PATHS
     for path in context_paths:

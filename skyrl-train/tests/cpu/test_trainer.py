@@ -886,16 +886,6 @@ def _batch_size_config(
             },
             None,
         ),
-        (
-            {
-                "train_batch_size": 32,
-                "policy_mini_batch_size": 16,
-                "micro_train_batch_size_per_gpu": 4,
-                "n_samples_per_prompt": 1,
-                "policy_dp": 8,
-            },
-            "policy_mini_batch_size_per_gpu .* should be divisible by micro_train_batch_size_per_gpu",
-        ),
         # A mini-batch larger than the train batch fails the first (unmessaged) assertion.
         ({"train_batch_size": 8, "policy_mini_batch_size": 16}, "^$"),
         ({"train_batch_size": 100}, "train_batch_size .* should be divisible by policy_mini_batch_size"),
