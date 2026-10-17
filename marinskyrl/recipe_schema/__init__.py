@@ -18,6 +18,7 @@ from .declared import EvaluationImprovement as EvaluationImprovement
 from .declared import CheckpointCallback as CheckpointCallback
 from .declared import DistillationTokenBudgetCallback as DistillationTokenBudgetCallback
 from .declared import EvaluationCallback as EvaluationCallback
+from .declared import HarborEvaluationCallback as HarborEvaluationCallback
 from .declared import HFModelSaveCallback as HFModelSaveCallback
 from .declared import DatabaseRegistrationCallback as DatabaseRegistrationCallback
 from .declared import RefModelUpdateCallback as RefModelUpdateCallback
