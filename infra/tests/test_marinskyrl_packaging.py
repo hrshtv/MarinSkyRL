@@ -196,7 +196,7 @@ def test_standalone_recipe_wheel_authors_without_launcher_dependencies(tmp_path:
     minimum = next(bound.version for bound in pydantic.specifier if bound.operator == ">=")
     subprocess.run(["uv", "pip", "install", "--python", str(interpreter), f"pydantic=={minimum}"], check=True)
     subprocess.run(
-        ["uv", "pip", "install", "--python", str(interpreter), "--no-deps", str(wheel)], check=True
+        ["uv", "pip", "install", "--python", str(interpreter), "--no-index", str(wheel)], check=True
     )
     program = """
 import json
@@ -213,7 +213,6 @@ recipe = schema.SkyRLRecipe.combine(
     arm=schema.RecipePatch(data=schema.Data(sampling=schema.Sampling(domain_weights={"math": 1, "code": 2}))),
 ).with_settings(["data.sampling.domain_weights.math=3"])
 restored = schema.SkyRLRecipe.from_document(recipe.to_skyrl())
-assert json.dumps(restored.to_skyrl()) == json.dumps(recipe.to_skyrl())
 print(json.dumps({"source": schema.__file__, "pydantic": pydantic.__version__, "document": restored.to_skyrl()}))
 """
     result = subprocess.run(
@@ -226,4 +225,7 @@ print(json.dumps({"source": schema.__file__, "pydantic": pydantic.__version__, "
     )
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
-    assert output["document"]["data"]["sampling"]["domain_weights"] == {"math": 3, "code": 2}
+    assert output["document"] == {
+        "context_budget": {"request_window_tokens": 256, "max_new_tokens_per_turn": 64, "max_turns": 4},
+        "data": {"sampling": {"domain_weights": {"math": 3, "code": 2}}},
+    }
