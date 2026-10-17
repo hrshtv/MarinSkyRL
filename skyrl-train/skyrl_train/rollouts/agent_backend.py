@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Any, Protocol
 from uuid import uuid4
 
-from rolloutengine.contracts import ModelTurn, SessionStart
+from rolloutengine.contracts import LENGTH_STOP_REASON, ModelTurn, SessionStart
 
 
 TRIAL_HEADER = "x-ot-trial-id"
@@ -71,13 +71,17 @@ class AgentInferenceBackend:
         except AgentGenerationStopped as error:
             return {
                 "error": {
-                    "message": "Maximum context length reached" if error.reason == "length" else str(error),
-                    "type": "context_length_exceeded" if error.reason == "length" else "generation_stopped",
+                    "message": "Maximum context length reached" if error.reason == LENGTH_STOP_REASON else str(error),
+                    "type": "context_length_exceeded" if error.reason == LENGTH_STOP_REASON else "generation_stopped",
                     "code": 400,
                 }
             }
         finish_reason = (
-            "length" if turn.stop_reason == "length" else "tool_calls" if turn.message.get("tool_calls") else "stop"
+            "length"
+            if turn.stop_reason == LENGTH_STOP_REASON
+            else "tool_calls"
+            if turn.message.get("tool_calls")
+            else "stop"
         )
         logprobs = None
         if turn.logprobs is not None:
