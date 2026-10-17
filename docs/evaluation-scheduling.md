@@ -1,9 +1,18 @@
 # Evaluation scheduling
 
 An evaluation sweep pauses the training producer and drains its submitted generation
-requests. It then reserves every rollout worker and synchronizes the policy weights.
-The optimizer cannot advance until the sweep returns. Queued training groups remain
-in the training buffer; draining does not consume them or perform optimizer updates.
+requests for up to `trainer.eval_drain_timeout_seconds` (300 seconds by default).
+At the deadline it revokes unfinished groups and cancels their remote requests.
+Completed groups remain available for training; late writes from revoked groups are
+ignored. Cancellation cleanup has a separate per-request limit,
+`trajectory_runner.rollout_workers.cancellation_timeout_seconds` (120 seconds by
+default), with all cancellations issued concurrently. Cleanup failure fails the run
+before evaluation can switch weights. Dropped groups can favor faster tasks; monitor
+`eval/drain_discarded_groups`, the number of revoked groups in each sweep.
+
+The trainer then reserves every rollout worker and synchronizes the policy weights.
+The optimizer cannot advance until the sweep returns. Draining does not consume
+completed training groups or perform optimizer updates.
 Training submissions resume when the evaluation session exits, including on errors.
 
 Native validation rows, named sampling profiles, and inline Harbor trials enter one
