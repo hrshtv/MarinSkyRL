@@ -266,6 +266,7 @@ def test_intermediate_checkpoint_does_not_suppress_non_storage_failure():
     assert trainer.all_metrics == {}
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("failure", ["mixed_errors", "timeout"])
 def test_megatron_save_settles_all_ranks_and_preserves_fatal_errors(ray_init, tmp_path, failure):
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
