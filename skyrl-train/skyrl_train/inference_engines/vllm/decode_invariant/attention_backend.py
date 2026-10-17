@@ -1,19 +1,14 @@
-"""vLLM's CUSTOM attention backend for a decode-invariant engine, whose output for each query row equals a one-row
-decode step of that row: FA3 with ``FA3_INVARIANT_SPLITS`` splits for every request and cascade attention off.
-
-A step of one-row requests runs as vLLM builds it, on FA3's causal kernel with the window start of each request as
-``leftpad_k`` for a sliding-window layer. A step with longer requests runs the calls ``fa3_invariant_requests`` and
-``fa3_request_calls`` plan, eagerly.
-"""
+"""vLLM's CUSTOM attention backend for a decode-invariant engine: each query row's output equals a one-row decode
+step of that row."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, replace
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import torch
+from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType, CommonAttentionMetadata
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -23,11 +18,12 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from skyrl_train.inference_engines.vllm.decode_invariant.engine import FLASH_ATTN_VERSION
 from skyrl_train.inference_engines.vllm.decode_invariant.fa3 import (
     FA3_BLOCK_M,
     FA3_DYNAMIC_SPLIT_MAX_BATCH,
+    FA3_HEAD_DIM,
     FA3_INVARIANT_SPLITS,
+    FLASH_ATTN_VERSION,
     Fa3Requests,
     fa3_fixed_split_metadata,
     fa3_invariant_requests,
@@ -49,8 +45,8 @@ class StepCall(NamedTuple):
 
 @dataclass
 class DecodeInvariantMetadata(FlashAttentionMetadata):
-    """A step's FA3 metadata with the per-step caches the first layer fills: the step's calls and planned requests
-    per layer window, and the window starts per window. The KV-cache groups of a step share ``plans``."""
+    """A step's FA3 metadata with the calls, window starts and planned requests of each layer window, which the
+    step's first layer of that window fills."""
 
     calls: dict[int | None, list[StepCall]] = field(default_factory=dict)
     window_starts: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -60,10 +56,6 @@ class DecodeInvariantMetadata(FlashAttentionMetadata):
 class DecodeInvariantMetadataBuilder(FlashAttentionMetadataBuilder):
     # Full CUDA graphs cover one-row decode steps; a step with longer requests runs its planned calls eagerly.
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.max_num_splits = FA3_INVARIANT_SPLITS
 
     def _get_scheduler_metadata(
         self,
@@ -91,7 +83,7 @@ class DecodeInvariantMetadataBuilder(FlashAttentionMetadataBuilder):
     def update_block_table(
         self, metadata: DecodeInvariantMetadata, blk_table: torch.Tensor, slot_mapping: torch.Tensor
     ) -> DecodeInvariantMetadata:
-        # Each KV-cache group builds its own calls, which gather rows of the group's block table, from the shared plans.
+        # The KV-cache groups of a step share ``plans``; each builds its own calls from its block table.
         return replace(metadata, block_table=blk_table, slot_mapping=slot_mapping, calls={}, window_starts={})
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -106,15 +98,8 @@ class DecodeInvariantAttentionImpl(FlashAttentionImpl):
                 f"a decode-invariant engine runs FA{FLASH_ATTN_VERSION}; vLLM selected FA{self.vllm_flash_attn_version} "
                 f"for {torch.cuda.get_device_name()}"
             )
-        if (
-            self.attn_type != AttentionType.DECODER
-            or self.alibi_slopes is not None
-            or self.sinks is not None
-            or is_quantized_kv_cache(self.kv_cache_dtype)
-        ):
-            raise NotImplementedError(
-                "a decode-invariant engine runs decoder attention over an unquantized KV cache, without ALiBi or sinks"
-            )
+        if self.alibi_slopes is not None:
+            raise NotImplementedError("a decode-invariant engine runs attention without ALiBi")
         if FA3_BLOCK_M % self.num_queries_per_kv:
             raise NotImplementedError(f"a decode-invariant engine needs query heads per KV head dividing {FA3_BLOCK_M}")
         left, right = self.sliding_window
@@ -243,6 +228,8 @@ class DecodeInvariantAttentionImpl(FlashAttentionImpl):
 
 
 class DecodeInvariantAttentionBackend(FlashAttentionBackend):
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16", "bfloat16"]
+
     @staticmethod
     def get_name() -> str:
         return AttentionBackendEnum.CUSTOM.name
@@ -250,6 +237,18 @@ class DecodeInvariantAttentionBackend(FlashAttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == HOPPER_COMPUTE_CAPABILITY_MAJOR
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return head_size == FA3_HEAD_DIM
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == AttentionType.DECODER
 
     @staticmethod
     def get_impl_cls() -> type[DecodeInvariantAttentionImpl]:

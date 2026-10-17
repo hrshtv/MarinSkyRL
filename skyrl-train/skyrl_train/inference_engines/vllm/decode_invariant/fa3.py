@@ -1,9 +1,4 @@
-"""FA3 calls whose output for each Grug query row equals a one-row decode step of that row.
-
-FA3 (vLLM's FlashAttention fork, Hopper) adds a row's key-block splits in an order set by the split count and by
-the rows that share its query tile. Fixing the split count and splitting varlen requests at tile boundaries makes a
-row's reduction order depend on that row alone.
-"""
+"""FA3 calls whose output for each Grug query row equals a one-row decode step of that row."""
 
 from __future__ import annotations
 
@@ -14,7 +9,9 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-# FA3's query tile rows (``tile_size_fwd_sm90``) for Grug on H100: head dim 128, bf16, packed query heads.
+FLASH_ATTN_VERSION = 3
+FA3_HEAD_DIM = 128
+# FA3's query tile rows (``tile_size_fwd_sm90``) on Hopper for ``FA3_HEAD_DIM``, bf16 and packed query heads.
 FA3_BLOCK_M = 128
 # ``prepare_varlen_num_blocks`` splits dynamically only for batches one CTA covers; ``mha_fwd`` runs a varlen call of
 # more requests with one split.
@@ -34,13 +31,10 @@ def _padded_requests(requests: int) -> int:
 
 
 def fa3_fixed_split_metadata(query_start: torch.Tensor, query_heads_per_kv_head: int, kv_heads: int) -> torch.Tensor:
-    """FA3's scheduler metadata for a causal or local varlen call that runs every request with
-    ``FA3_INVARIANT_SPLITS`` splits, whatever else the call holds.
+    """FA3's scheduler metadata that runs every request of a varlen call with ``FA3_INVARIANT_SPLITS`` splits.
 
     The layout is ``mha_fwd``'s for packed query heads, dynamic splits and the head swizzle: per request its packed
-    query rows, its split count and its heads per L2 section, each vector padded to a multiple of 4, then the tile
-    semaphore, which starts at zero and which FA3's combine kernel zeroes after the call. A call of more than
-    ``FA3_DYNAMIC_SPLIT_MAX_BATCH`` requests runs unsplit whatever the metadata.
+    query rows, split count and heads per L2 section, each padded to a multiple of 4, then a zero tile semaphore.
     """
     requests = query_start.numel() - 1
     rounded = _padded_requests(requests)
@@ -66,10 +60,9 @@ def fa3_invariant_requests(
 ) -> Fa3Requests:
     """Split each varlen request so that every row's FA3 output equals the output of the row decoded alone.
 
-    A request's query rows are the last ``q`` of its ``k`` keys (positions ``k - q .. k - 1``). A request of several
-    rows starts at a multiple of ``alignment`` positions (one tile of packed query heads), its rows before the first
-    such position becoming a request of their own. With ``window``, each row at a position of at least ``window`` is a
-    request of its own. Takes host values; returns CPU tensors.
+    A request's query rows are the last ``q`` of its ``k`` keys. A request of several rows starts at a multiple of
+    ``alignment`` positions, its rows before the first such position becoming a request of their own; with ``window``,
+    each row at a position of at least ``window`` is a request of its own.
     """
     query_start = np.asarray(query_start, dtype=np.int64)
     key_lengths = np.asarray(key_lengths, dtype=np.int64)
@@ -137,11 +130,7 @@ def fa3_causal_varlen(
     v_descale: torch.Tensor | None = None,
     s_aux: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FA3's causal varlen forward into ``out``, called through the FA3 torch op ``_vllm_fa3_C.fwd``.
-
-    vLLM's Python wrapper ``flash_attn_varlen_func`` passes ``leftpad_k=None``; this call passes the caller's
-    ``leftpad_k`` and otherwise the wrapper's arguments.
-    """
+    """FA3's causal varlen forward into ``out`` through the op ``_vllm_fa3_C.fwd``, which takes ``leftpad_k``."""
     torch.ops._vllm_fa3_C.fwd(
         query,
         key,
@@ -204,14 +193,8 @@ def fa3_window_start_rows(
     v_descale: torch.Tensor | None = None,
     s_aux: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One-row paged FA3 requests of a sliding-window layer on FA3's causal kernel, each over its window alone:
-    ``leftpad_k`` holds each request's window start (its key length minus the window, at least 0).
-
-    With the fixed-split scheduler metadata the causal kernel reads the same key blocks from the window start, in the
-    same splits, as the local kernel's one-row request, so every row gets the local kernel's floating-point result.
-    """
-    if cu_seqlens_q.numel() - 1 != leftpad_k.numel():
-        raise ValueError("leftpad_k needs one window start per request")
+    """One-row paged requests of a sliding-window layer on FA3's causal kernel, each from its window start
+    ``leftpad_k``, with the floating-point result of FA3's local kernel."""
     query, key_cache, value_cache = (
         x if x.stride(-1) == 1 else x.contiguous() for x in (query, key_cache, value_cache)
     )

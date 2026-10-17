@@ -4,12 +4,16 @@ from skyrl_train.inference_engines.vllm.decode_invariant.fa3 import fa3_invarian
 
 
 @pytest.mark.parametrize(
-    "window, pieces",
+    "window, pieces, calls",
     [
         # Full layer: the unaligned prefill's rows before position 8, then the rest; a chunk past position 8 lies
-        # within one 4-position group, so it stays whole.
-        (None, [(5, 3), (8, 3), (19, 1), (0, 5), (2, 1), (9, 3), (4, 3), (4, 6)]),
-        # Sliding-window layer: rows at positions 8 and later are alone.
+        # within one 4-position group, so it stays whole. Calls hold at most three requests.
+        (
+            None,
+            [(5, 3), (8, 3), (19, 1), (0, 5), (2, 1), (9, 3), (4, 3), (4, 6)],
+            [(0, 3, False), (3, 6, False), (6, 8, False)],
+        ),
+        # Sliding-window layer: rows at positions 8 and later are alone, and one-row requests get calls of their own.
         (
             8,
             [
@@ -28,10 +32,20 @@ from skyrl_train.inference_engines.vllm.decode_invariant.fa3 import fa3_invarian
                 (8, 1),
                 (9, 1),
             ],
+            [
+                (0, 1, False),
+                (1, 4, True),
+                (4, 5, True),
+                (5, 6, False),
+                (6, 9, True),
+                (9, 10, True),
+                (10, 12, False),
+                (12, 14, True),
+            ],
         ),
     ],
 )
-def test_fa3_invariant_requests_start_prefills_aligned_and_run_rows_past_the_window_alone(window, pieces):
+def test_fa3_invariant_requests_start_prefills_aligned_and_run_rows_past_the_window_alone(window, pieces, calls):
     alignment = 4
     # (query rows, keys) per request: a prefill from position 5 across position 8, a decode row past it, a prefill
     # from position 0, a decode row, a prefill chunk from position 9, and prefills from aligned cached prefixes, the
@@ -50,16 +64,5 @@ def test_fa3_invariant_requests_start_prefills_aligned_and_run_rows_past_the_win
     assert starts[0] == 0 and starts[-1] == query_start[-1]
     owners = split.owner.tolist()
     assert owners == sorted(owners) and set(owners) == set(range(len(requests)))
-
-
-def test_fa3_request_calls_separate_one_row_runs_and_bound_each_call():
-    # Request sizes: three one-row requests, two longer ones, four one-row ones.
-    query_start = [0, 1, 2, 3, 7, 10, 11, 12, 13, 14]
-
-    calls = fa3_request_calls(query_start, one_row_calls=True, max_requests=3)
-
-    assert [tuple(call) for call in calls] == [(0, 3, True), (3, 5, False), (5, 8, True), (8, 9, True)]
-    assert [tuple(call) for call in fa3_request_calls(query_start, one_row_calls=False, max_requests=5)] == [
-        (0, 5, False),
-        (5, 9, False),
-    ]
+    planned = fa3_request_calls(starts, one_row_calls=window is not None, max_requests=3)
+    assert [tuple(call) for call in planned] == calls

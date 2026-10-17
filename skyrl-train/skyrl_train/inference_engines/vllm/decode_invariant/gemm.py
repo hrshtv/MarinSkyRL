@@ -1,8 +1,4 @@
-"""A Triton GEMM with one tile shape at every row count, so a row's result does not depend on the other rows.
-
-The decode-invariant vLLM engine computes Grug's router logits and head gates with it, through the
-``skyrl::invariant_gemm`` torch custom op, which stays opaque inside vLLM's compiled graph.
-"""
+"""A Triton GEMM with one tile shape at every row count, so a row's result does not depend on the other rows."""
 
 from __future__ import annotations
 
@@ -69,13 +65,8 @@ def _gemm_sum_kernel(partial_ptr, out_ptr, elements, SPLITS: tl.constexpr, BLOCK
 
 
 def invariant_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` in fp32 for ``x`` ``[rows, K]`` and ``weight`` ``[N, K]``, both bf16-valued.
-
-    Each row's result depends on that row and the weight alone: the kernel multiplies on bf16 tensor cores with one
-    tile shape at every row count, accumulates each of eight fixed K slices block by block, then adds the slice sums
-    left to right. Inputs may be bf16 or fp32 holding bf16 values; callers check the weight once
-    (``check_bf16_values``).
-    """
+    """``x @ weight.T`` in fp32 for bf16-valued ``x`` ``[rows, K]`` and ``weight`` ``[N, K]``, each row's result
+    depending on that row and the weight alone."""
     if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
         raise ValueError(f"invariant_gemm needs [rows, K] and [N, K], got {tuple(x.shape)} and {tuple(weight.shape)}")
     depth = x.shape[1]

@@ -26,6 +26,7 @@ from ray.exceptions import ActorDiedError
 
 import skyrl_train.inference_engines.ray_wrapped_inference_engine as rwie
 import skyrl_train.tokenizer as tokenizer_module
+from skyrl_train.config.numerics import validate_numerics_config
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.entrypoints import main_base
 from skyrl_train.inference_engines.vllm.decode_invariant.engine import (
@@ -72,7 +73,8 @@ def test_from_config_forwards_vllm_engine_options(monkeypatch):
     assert captured["decode_context_parallel_size"] == 2
     assert captured["vllm_attention_backend"] == "FLASH_ATTN"
 
-    # trainer.numerics.mode=exact builds decode-invariant rollout engines and leaves the config as written.
+    # trainer.numerics.mode=exact with the Snowball engine settings validates, builds decode-invariant rollout engines
+    # and leaves the config as written.
     captured.clear()
     cfg3 = get_default_config()
     cfg3.trainer.numerics.mode = "exact"
@@ -80,6 +82,7 @@ def test_from_config_forwards_vllm_engine_options(monkeypatch):
     cfg3.generator.inference_engine_tensor_parallel_size = 1
     cfg3.generator.vllm_attention_backend = "FLASH_ATTN"
     cfg3.generator.engine_init_kwargs = {"moe_backend": "triton"}
+    validate_numerics_config(cfg3)
     main_base.create_ray_wrapped_inference_engines_from_config(cfg3, colocate_pg=None, tokenizer=None)
     assert captured["vllm_attention_backend"] == DECODE_INVARIANT_ATTENTION_BACKEND
     assert (

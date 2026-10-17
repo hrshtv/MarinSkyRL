@@ -1,18 +1,22 @@
+import pytest
 import torch
 
 from skyrl_train.inference_engines.vllm.decode_invariant.gemm import invariant_gemm
+from skyrl_train.models.grug_moe import GrugMoeConfig
 from tests.gpu.grug_gpu_gates import require_hoppers
 
-# Grug's router GEMM: 2,560 hidden columns, 256 experts.
-HIDDEN, EXPERTS = 2560, 256
+SNOWBALL = GrugMoeConfig()
 
 
-def test_invariant_gemm_gives_each_row_the_same_result_in_any_call_holding_it():
+@pytest.mark.parametrize(
+    "columns", [SNOWBALL.num_local_experts, SNOWBALL.num_attention_heads], ids=["router", "head_gate"]
+)
+def test_invariant_gemm_gives_each_row_the_same_result_in_any_call_holding_it(columns):
     require_hoppers(1)
     generator = torch.Generator().manual_seed(0)
     scale = 10.0 ** torch.empty(300, 1).uniform_(-30, 30, generator=generator)
-    x = (torch.randn(300, HIDDEN, generator=generator) * scale).to(torch.bfloat16).cuda()
-    weight = (torch.randn(EXPERTS, HIDDEN, generator=generator) * 0.02).to(torch.bfloat16).cuda()
+    x = (torch.randn(300, SNOWBALL.hidden_size, generator=generator) * scale).to(torch.bfloat16).cuda()
+    weight = (torch.randn(columns, SNOWBALL.hidden_size, generator=generator) * 0.02).to(torch.bfloat16).cuda()
     full = invariant_gemm(x, weight)
 
     for rows in (1, 7, 64, 65, 129):

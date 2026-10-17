@@ -229,9 +229,9 @@ def _build_inference_engine_runtime_env(
     """Forward managed inference settings into each vLLM engine actor.
 
     This covers NCCL diagnostics, the policy's weight-sync buffer size, batch
-    invariance, and the role's ``engine_environment``. Selected-ID scoring also forces the V1 model runner.
-    RunAI-backed engines receive conservative S3 stall tolerance and stderr diagnostics. Returns ``None`` when no
-    managed or derived settings apply.
+    invariance and ``engine_environment``. Selected-ID scoring also forces the V1 model runner. RunAI-backed
+    engines receive conservative S3 stall tolerance and stderr diagnostics. Returns ``None`` when no managed
+    or derived settings apply.
     """
     passthrough = set(_NCCL_FR_ENV_PASSTHROUGH) | set(managed_environment_names(EnvVarScope.INFERENCE_WORKER))
     env_vars = {key: os.environ[key] for key in passthrough if key in os.environ}

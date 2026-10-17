@@ -11,9 +11,8 @@ from transformers import PreTrainedTokenizerBase
 from skyrl_train.config.weight_sync_pause import resolve_weight_sync_pause_policy
 from skyrl_train.inference_engines.vllm.decode_invariant.engine import (
     DECODE_INVARIANT_ATTENTION_BACKEND,
-    decode_invariant_engine_environment,
+    DECODE_INVARIANT_ENGINE_ENVIRONMENT,
     decode_invariant_engine_init_kwargs,
-    verify_decode_invariant_config,
 )
 
 
@@ -31,7 +30,6 @@ class InferenceEngineRoleConfig:
     decode_context_parallel_size: int
     shared_pg: Any
     inference_engine_enable_sleep: bool
-    # Build decode-invariant vLLM engines (``inference_engines/vllm/decode_invariant``).
     decode_invariant: bool
     max_logprobs: int = 1
 
@@ -43,23 +41,14 @@ def inference_engine_kwargs_from_config(
     *,
     engine_init_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    """Combine shared generator settings with explicit role geometry and ownership; a decode-invariant role gets
-    the CUSTOM attention backend, the decode-invariant engine kwargs and its engine environment after its settings
-    are verified."""
+    """Combine shared generator settings with explicit role geometry and ownership, and with the decode-invariant
+    engine settings for a decode-invariant role."""
     attention_backend = cfg.generator.get("vllm_attention_backend", None)
     engine_environment = {}
     if role.decode_invariant:
-        verify_decode_invariant_config(
-            backend=role.backend,
-            attention_backend=attention_backend,
-            enforce_eager=cfg.generator.enforce_eager,
-            tensor_parallel_size=role.tensor_parallel_size,
-            decode_context_parallel_size=role.decode_context_parallel_size,
-            engine_init_kwargs=engine_init_kwargs,
-        )
         attention_backend = DECODE_INVARIANT_ATTENTION_BACKEND
         engine_init_kwargs = {**engine_init_kwargs, **decode_invariant_engine_init_kwargs()}
-        engine_environment = decode_invariant_engine_environment()
+        engine_environment = DECODE_INVARIANT_ENGINE_ENVIRONMENT
     kwargs = {
         "num_inference_engines": role.num_inference_engines,
         "tensor_parallel_size": role.tensor_parallel_size,

@@ -5,16 +5,15 @@ from enum import StrEnum
 
 from omegaconf import DictConfig, OmegaConf
 
-from skyrl_train.inference_engines.vllm.decode_invariant.engine import verify_decode_invariant_config
-
 NUMERICS_KEY = "trainer.numerics"
 CHECK_KEY = f"{NUMERICS_KEY}.check"
+# Engine kwargs a decode-invariant engine sets itself.
+DECODE_INVARIANT_ENGINE_KWARGS = ("attention_backend", "compilation_config", "model_class_overrides")
 
 
 class NumericsMode(StrEnum):
-    """The kernels the trainer and the rollout engines run: each side's own (``native``), vLLM's batch-invariant
-    kernels on both sides (``batch_invariant``), or decode-invariant vLLM rollout engines with the trainer's own
-    kernels (``exact``, ``inference_engines/vllm/decode_invariant``)."""
+    """The kernels a run uses: ``native``, the trainer's and the engines' own; ``batch_invariant``, vLLM's
+    batch-invariant kernels in both; ``exact``, decode-invariant vLLM engines and the trainer's own kernels."""
 
     NATIVE = "native"
     BATCH_INVARIANT = "batch_invariant"
@@ -64,8 +63,8 @@ def exactness_check_config(cfg: DictConfig) -> ExactnessCheckConfig:
 
 
 def validate_numerics_config(cfg: DictConfig) -> None:
-    """Accept a known mode, ``batch_invariant`` and ``exact`` only with local vLLM engines, ``exact`` only with
-    settings a decode-invariant engine runs on and in-memory rollout hand-off, and check settings the mode supports."""
+    """Accept a known mode, the other modes than ``native`` only with local vLLM engines, and check settings the mode
+    supports."""
     numerics = cfg.trainer.numerics
     try:
         mode = resolve_numerics(cfg).mode
@@ -101,21 +100,28 @@ def validate_numerics_config(cfg: DictConfig) -> None:
 
 
 def _validate_exact_numerics(cfg: DictConfig) -> None:
-    """Raise unless the rollout engines of ``cfg`` can be decode-invariant and hand their rollouts to the trainer in
-    memory: the trainer must receive the engines' log-probabilities and routes in memory, and the object-store path
-    is not covered by the exactness tests."""
-    if cfg.trainer.rollout_buffer.object_store_root is not None:
-        raise ValueError(f"{NUMERICS_KEY}.mode=exact requires trainer.rollout_buffer.object_store_root to be unset")
-    if cfg.generator.get("speculative_decoding") is not None:
-        raise ValueError(f"{NUMERICS_KEY}.mode=exact runs without speculative decoding")
-    try:
-        verify_decode_invariant_config(
-            backend=cfg.generator.backend,
-            attention_backend=cfg.generator.get("vllm_attention_backend"),
-            enforce_eager=cfg.generator.enforce_eager,
-            tensor_parallel_size=cfg.generator.inference_engine_tensor_parallel_size,
-            decode_context_parallel_size=cfg.generator.inference_engine_decode_context_parallel_size,
-            engine_init_kwargs=OmegaConf.to_container(cfg.generator.engine_init_kwargs, resolve=True),
-        )
-    except ValueError as error:
-        raise ValueError(f"{NUMERICS_KEY}.mode=exact: {error}") from error
+    """Raise unless the rollout engines of ``cfg`` can be decode-invariant and hand rollouts to the trainer in memory."""
+    generator = cfg.generator
+    kwargs = OmegaConf.to_container(generator.engine_init_kwargs, resolve=True)
+    moe_backend = kwargs.get("moe_backend", (kwargs.get("kernel_config") or {}).get("moe_backend"))
+    all2all_backend = kwargs.get("all2all_backend", "allgather_reducescatter")
+    # vLLM's model runner V2, which a decode-invariant engine runs, refuses logits processors.
+    refused_kwargs = [
+        key for key in (*DECODE_INVARIANT_ENGINE_KWARGS, "speculative_config", "logits_processors") if kwargs.get(key)
+    ]
+    requirements = {
+        "trainer.rollout_buffer.object_store_root=null": cfg.trainer.rollout_buffer.object_store_root is None,
+        "generator.speculative_decoding=null": generator.get("speculative_decoding") is None,
+        "generator.vllm_attention_backend null or FLASH_ATTN": generator.vllm_attention_backend in (None, "FLASH_ATTN"),
+        "generator.enforce_eager=false": not generator.enforce_eager,
+        "generator.inference_engine_tensor_parallel_size=1": generator.inference_engine_tensor_parallel_size == 1,
+        "generator.inference_engine_decode_context_parallel_size=1": (
+            generator.inference_engine_decode_context_parallel_size == 1
+        ),
+        "engine_init_kwargs.moe_backend=triton": moe_backend == "triton",
+        "engine_init_kwargs.all2all_backend=allgather_reducescatter": all2all_backend == "allgather_reducescatter",
+        f"engine_init_kwargs without {', '.join(refused_kwargs)}": not refused_kwargs,
+    }
+    unmet = [requirement for requirement, met in requirements.items() if not met]
+    if unmet:
+        raise ValueError(f"{NUMERICS_KEY}.mode=exact requires {'; '.join(unmet)}")

@@ -1,11 +1,12 @@
 import asyncio
-import sys
 
 import pytest
 import ray
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
+from vllm.model_executor.models.grugmoe import GrugMoeForCausalLM
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.inference_engines.base import InferenceEngineInput
@@ -16,6 +17,9 @@ from skyrl_train.inference_engines.configuration import (
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl_train.inference_engines.vllm import vllm_engine
+from skyrl_train.inference_engines.vllm.decode_invariant.engine import DECODE_INVARIANT_ATTENTION_BACKEND
+from skyrl_train.inference_engines.vllm.decode_invariant.model import DecodeInvariantGrugMoeForCausalLM
 from skyrl_train.utils import initialize_ray
 from tests.gpu.grug_gpu_gates import require_hoppers
 from tests.gpu.grug_tiny_checkpoint import write_tiny_checkpoint
@@ -43,31 +47,17 @@ LONG_PROMPT = [1 + (index * 7919) % 20000 for index in range(500)]
 # arrive later.
 SHARED_PREFIX_PROMPT = LONG_PROMPT[:256] + [7, 11, 13] * 30
 LATER_PROMPTS = [list(range(1, 20)), [1, 23]]
-BACKEND_MODULE = "skyrl_train.inference_engines.vllm.decode_invariant.attention_backend"
-STOCK_CLASSES = {
-    "model": "GrugMoeForCausalLM",
-    "router": "ReplicatedLinear",
-    "attention": "FLASH_ATTN",
-    "loaded": False,
-}
+STOCK_CLASSES = {"model": GrugMoeForCausalLM.__name__, "attention": FlashAttentionBackend.get_name()}
 INVARIANT_CLASSES = {
-    "model": "DecodeInvariantGrugMoeForCausalLM",
-    "router": "InvariantLinear",
-    "attention": "CUSTOM",
-    "loaded": True,
+    "model": DecodeInvariantGrugMoeForCausalLM.__name__,
+    "attention": DECODE_INVARIANT_ATTENTION_BACKEND,
 }
 
 
 def _engine_classes(worker) -> dict:
-    """Worker RPC: the names of the classes serving the model, and whether the custom backend module is loaded."""
+    """Worker RPC: the names of the model class and attention backend serving the model."""
     model = worker.model_runner.model
-    layer = model.model.layers[0]
-    return {
-        "model": type(model).__name__,
-        "router": type(layer.mlp.router).__name__,
-        "attention": layer.self_attn.attn.attn_backend.get_name(),
-        "loaded": BACKEND_MODULE in sys.modules,
-    }
+    return {"model": type(model).__name__, "attention": model.model.layers[0].self_attn.attn.attn_backend.get_name()}
 
 
 def _write_checkpoint(path) -> None:
@@ -136,7 +126,6 @@ def test_decode_invariant_engine_gives_a_response_the_same_log_probabilities_in_
     tmp_path, monkeypatch, decode_invariant, max_num_batched_tokens, classes
 ):
     require_hoppers(1)
-    from skyrl_train.inference_engines.vllm import vllm_engine  # noqa: PLC0415 - vLLM is a GPU-only extra
 
     class ReportingEngine(vllm_engine.AsyncVLLMInferenceEngine):
         async def engine_classes(self):

@@ -1,9 +1,4 @@
-"""The vLLM general plugin (``vllm.general_plugins`` entry point) that points vLLM's CUSTOM attention backend at
-``attention_backend.DecodeInvariantAttentionBackend``.
-
-vLLM loads general plugins in its API, engine-core and worker processes. The registration names the class path, so a
-process imports the backend only when its engine selects ``attention_backend=CUSTOM``.
-"""
+"""The ``vllm.general_plugins`` entry point that makes vLLM's CUSTOM attention backend the decode-invariant one."""
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 

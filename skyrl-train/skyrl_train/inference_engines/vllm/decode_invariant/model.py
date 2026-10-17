@@ -1,9 +1,5 @@
-"""Grug for a decode-invariant vLLM engine: the stock model with its router logits and head gates from the
-fixed-tile GEMM, and one Triton configuration for the fused expert kernels at every token count.
-
-``ModelConfig.model_class_overrides`` maps the ``GrugMoeForCausalLM`` architecture to
-``DecodeInvariantGrugMoeForCausalLM`` in every process of a decode-invariant engine.
-"""
+"""Grug for a decode-invariant vLLM engine: router logits and head gates from ``skyrl::invariant_gemm`` and one
+fused-MoE tile configuration at every token count."""
 
 from __future__ import annotations
 
@@ -19,8 +15,7 @@ from vllm.sequence import IntermediateTensors
 from skyrl_train.inference_engines.vllm.decode_invariant.gemm import check_bf16_values
 
 ROUTER_WEIGHT_SUFFIX = ".mlp.router.weight"
-# The fused expert kernels' tile configuration at every token count, the one vLLM's batch-invariant mode uses; vLLM
-# otherwise picks a configuration per token count, with K blocks of 64 or 128 columns.
+# vLLM batch-invariant mode's fused-MoE tile configuration.
 INVARIANT_MOE_CONFIG = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8, "SPLIT_K": 1}
 
 
@@ -71,7 +66,6 @@ class DecodeInvariantGrugMoeForCausalLM(GrugMoeForCausalLM):
             )
         compilation = vllm_config.compilation_config
         if compilation.cudagraph_mode == CUDAGraphMode.NONE or 1 in compilation.cudagraph_capture_sizes:
-            # vLLM sets cudagraph_mode NONE for a Grug model with short convolutions.
             raise ValueError(
                 "a decode-invariant engine runs every one-token step padded in a CUDA graph; vLLM chose "
                 f"cudagraph_mode={compilation.cudagraph_mode.name} and capture sizes {compilation.cudagraph_capture_sizes}"
@@ -80,8 +74,6 @@ class DecodeInvariantGrugMoeForCausalLM(GrugMoeForCausalLM):
         for layer in self.model.layers:
             if isinstance(layer, GrugMoeDecoderLayer):
                 layer.mlp.router = invariant_linear(layer.mlp.router)
-                # cuBLAS computes the 20-column head-gate GEMM with a token-count-dependent split of its 2,560-wide
-                # reduction.
                 layer.self_attn.attn_gate = invariant_linear(layer.self_attn.attn_gate)
 
     def forward(
