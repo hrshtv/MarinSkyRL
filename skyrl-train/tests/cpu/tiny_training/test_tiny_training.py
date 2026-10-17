@@ -2,11 +2,13 @@
 
 import multiprocessing
 import json
+import os
 import random
 import sys
 from multiprocessing.context import BaseContext
 from pathlib import Path
 
+from loguru import logger
 import pytest
 import torch
 import numpy as np
@@ -17,7 +19,7 @@ from skyrl_train.callbacks.builtin import register_callback
 from skyrl_train.callbacks.types import CallbackErrorBehavior
 
 from marinskyrl.checkpoint_paths import POLICY_CHECKPOINT_SUBDIRECTORY
-from skyrl_train.checkpoint_generation import resolve_checkpoint_payload
+from skyrl_train.checkpoint_generation import COMMIT_FILENAME, resolve_checkpoint_payload
 from skyrl_train.hf_export_schema import TRAINER_STATE_FILENAME
 from tests.checkpoint_parity_state import assert_state_equal, snapshot_value
 from tests.cpu.tiny_training.cpu_backend import CHECKPOINT_FILE_TEMPLATE, CausalLMPolicy
@@ -45,6 +47,7 @@ RESUMED_STEP = 1
 # A run takes under half a minute on an idle host. The margin absorbs slower CI hosts and concurrent pytest-xdist
 # workers, and stays above the experiment's admission stall timeout so a stall reports its own error.
 RUN_TIMEOUT_SECONDS = 300
+CHECKPOINT_OBSERVATIONS_FILENAME = "checkpoint_observations.jsonl"
 
 
 @register_callback("test_step_limit")
@@ -61,6 +64,12 @@ class _StepLimit(TrainerCallback):
         path = Path(trainer.cfg.trainer.export_path) / f"start-{state.global_step}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"checkpoint_path": trainer.loaded_checkpoint_path}))
+        if self.action == "storage_failure":
+            logger.add(
+                Path(trainer.cfg.trainer.export_path) / CHECKPOINT_OBSERVATIONS_FILENAME,
+                format="{message}",
+                filter=lambda record: record["message"].startswith("checkpoint_observation "),
+            )
         if self.action == "callback_stop" and trainer.loaded_checkpoint_path is not None:
             random.random()
             np.random.random()
@@ -93,11 +102,25 @@ def _run_limited_training(root: Path, model: Path, limits: tuple[int, ...], acti
         + [{"type": "checkpoint", "save_steps": 1}],
         force_add=True,
     )
-    if action == "save_failure":
-        with pytest.raises(OSError, match="injected checkpoint callback storage failure"):
+    with pytest.MonkeyPatch.context() as patch:
+        if action == "storage_failure":
+            replace = os.replace
+            failed = False
+            commit_path = root / "ckpts" / "global_step_1" / COMMIT_FILENAME
+
+            def fail_first_commit(source, destination):
+                nonlocal failed
+                if not failed and Path(destination) == commit_path:
+                    failed = True
+                    raise OSError("injected commit storage failure")
+                return replace(source, destination)
+
+            patch.setattr(os, "replace", fail_first_commit)
+        if action == "save_failure":
+            with pytest.raises(OSError, match="injected checkpoint callback storage failure"):
+                experiment.run_tiny_training(cfg)
+        else:
             experiment.run_tiny_training(cfg)
-    else:
-        experiment.run_tiny_training(cfg)
 
 
 @pytest.fixture(scope="module")
@@ -222,6 +245,7 @@ def test_async_training_resumes_with_committed_groups(runs: BaseContext, tmp_pat
         ("callback_stop", ((1,), (3, 4)), [1]),
         ("save_stop", ((3,),), [1]),
         ("save_failure", ((1,),), None),
+        ("storage_failure", ((1,),), [1]),
     ],
 )
 def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_policy, action, phases, expected_steps):
@@ -255,6 +279,16 @@ def test_checkpointed_training_obeys_callback_controls(runs, tmp_path, tiny_poli
     for row in checkpoint_metrics:
         assert row["timing/step_wall/checkpoint_work"] >= row["timing/save_checkpoints"] > 0
         assert row["timing/step"] >= row["timing/step_wall/checkpoint_work"]
+    if action == "storage_failure":
+        observations = [
+            json.loads(line.partition(" ")[2])
+            for line in (tmp_path / "exports" / CHECKPOINT_OBSERVATIONS_FILENAME).read_text().splitlines()
+        ]
+        assert [row["outcome"] for row in observations if row["phase"] == "checkpoint_foreground_pause"] == [
+            "failure",
+            "success",
+        ]
+        assert any(row.get("trainer/checkpoint_save_failures") == 1 for row in checkpoint_metrics)
 
 
 def test_one_step_is_independent_of_micro_batch_size(runs: BaseContext, tmp_path: Path, tiny_policy: Path):
