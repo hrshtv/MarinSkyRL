@@ -198,7 +198,7 @@ async def test_trial_session_cancellation_finishes_trial_cleanup():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 async def test_trial_session_context_limit_releases_request_and_preserves_verification(stream):
-    async def tokenize(payload):
+    async def tokenize(_payload):
         return {"tokens": [2], "count": 1, "max_model_len": 32}
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0})))
