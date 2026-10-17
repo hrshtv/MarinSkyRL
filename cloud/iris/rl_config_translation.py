@@ -36,7 +36,16 @@ from marinskyrl.entrypoints import RL_ENTRYPOINTS
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
 RL_CONFIG_TASK_DIR = "/tmp/marin-rl-configs"
 RL_CONFIG_PAYLOAD_ENV = "MARIN_RL_CONFIG_B64"
-TRAINER_NON_PATH_KEYS = frozenset({"policy.model.path", "callbacks.metric_groups", "callbacks.additional_evaluations"})
+RESOLVED_HARBOR_CONFIG_KEY = "terminal_bench_config"
+TRAINER_NON_PATH_KEYS = frozenset(
+    {
+        "policy.model.path",
+        "callbacks.metric_groups",
+        "callbacks.additional_evaluations",
+        # Harbor resolves task paths against the pinned dataset repository, not the launcher installation.
+        "callbacks.cohorts.job.tasks.path",
+    }
+)
 
 
 CHECKPOINT_EXPORT_ENTRYPOINT = CHECKPOINT_EXPORT_MODULE
@@ -205,6 +214,11 @@ def parse_rl_config(config_path: str, model_override: str | None = None) -> Pars
     raw = OmegaConf.to_container(load_rl_recipe(str(path)), resolve=False) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: RL config must contain a mapping at the document root")
+    if RESOLVED_HARBOR_CONFIG_KEY in raw:
+        raise ValueError(
+            f"{path}: {RESOLVED_HARBOR_CONFIG_KEY} is a resolved-config key; use terminal_bench in source recipes"
+        )
+
     config_groups = raw.get("config_groups", {})
     if "algorithm_recipe" in config_groups:
         group = _compose_config_groups({"algorithm_recipe": config_groups["algorithm_recipe"]}, config_name=None)
@@ -464,7 +478,7 @@ def _skyrl_config_sections(
         if parsed.raw.get(section):
             sections[section] = copy.deepcopy(parsed.raw[section])
     if terminal_bench is not None:
-        sections["terminal_bench_config"] = terminal_bench
+        sections[RESOLVED_HARBOR_CONFIG_KEY] = terminal_bench
     return sections
 
 
@@ -486,8 +500,8 @@ def _schema_admission() -> tuple[frozenset[str], frozenset[str]]:
                 visit(child, path)
 
     visit(SkyRLRecipe, "")
-    paths = {"terminal_bench_config" if path == "terminal_bench" else path for path in paths}
-    mappings = {"terminal_bench_config" if path == "terminal_bench" else path for path in mappings}
+    paths = {RESOLVED_HARBOR_CONFIG_KEY if path == "terminal_bench" else path for path in paths}
+    mappings = {RESOLVED_HARBOR_CONFIG_KEY if path == "terminal_bench" else path for path in mappings}
     return frozenset(paths), frozenset(mappings)
 
 
