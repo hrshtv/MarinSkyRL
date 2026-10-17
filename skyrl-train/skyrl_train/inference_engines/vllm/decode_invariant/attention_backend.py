@@ -75,7 +75,7 @@ class DecodeInvariantMetadataBuilder(FlashAttentionMetadataBuilder):
         self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
     ) -> DecodeInvariantMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        if metadata.use_cascade or metadata.dcp_context_kv_lens is not None or metadata.causal is not True:
+        if metadata.dcp_context_kv_lens is not None or metadata.causal is not True:
             raise NotImplementedError("a decode-invariant engine runs plain causal FA3 varlen steps only")
         metadata.max_num_splits = FA3_INVARIANT_SPLITS
         return DecodeInvariantMetadata(**{item.name: getattr(metadata, item.name) for item in fields(metadata)})
