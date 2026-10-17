@@ -5,8 +5,9 @@ class EvaluationLifecycle:
     def __init__(self):
         self.events = []
 
-    async def pause_and_drain(self):
+    async def pause_and_drain(self, timeout):
         self.events.append("drained")
+        return 0
 
     def resume(self):
         self.events.append("resumed")

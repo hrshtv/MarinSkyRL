@@ -110,16 +110,28 @@ class _SessionWorker(_Worker):
 
 @ray.remote
 class _BlockingWorker:
-    def __init__(self):
+    def __init__(self, *, hold_cleanup: bool = False):
         self._started = asyncio.Event()
         self._cleaned = asyncio.Event()
+        self._cleanup_started = asyncio.Event()
+        self._allow_cleanup = asyncio.Event()
+        if not hold_cleanup:
+            self._allow_cleanup.set()
 
     async def run(self, *_args):
         self._started.set()
         try:
             await asyncio.Event().wait()
         finally:
+            self._cleanup_started.set()
+            await self._allow_cleanup.wait()
             self._cleaned.set()
+
+    async def wait_for_cleanup_start(self):
+        await self._cleanup_started.wait()
+
+    async def release_cleanup(self):
+        self._allow_cleanup.set()
 
     async def wait_for_start(self):
         await self._started.wait()
@@ -160,6 +172,7 @@ def _pool(workers: list[object], spec: _Spec, *, timeout: float = 1) -> RolloutW
             executor_threads=1,
             progress_timeout_seconds=timeout,
             start_interval_seconds=0,
+            cancellation_timeout_seconds=10,
         ),
     )
     pool._actors = list(workers)
@@ -371,7 +384,7 @@ async def test_stalled_worker_request_is_cancelled_remotely(ray_init, spec, monk
 @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_caller_cancellation_runs_remote_cleanup_without_pool_shutdown(ray_init, spec):
-    actor = _BlockingWorker.remote()
+    actor = _BlockingWorker.remote(hold_cleanup=True)
     pool = _pool([actor], spec, timeout=60)
     run = asyncio.create_task(pool.run(_request([TrajectoryID("a", 0)])))
     try:
@@ -380,6 +393,9 @@ async def test_caller_cancellation_runs_remote_cleanup_without_pool_shutdown(ray
 
         run.cancel()
         async with asyncio.timeout(10):
+            await actor.wait_for_cleanup_start.remote()
+            assert not run.done()
+            await actor.release_cleanup.remote()
             with pytest.raises(asyncio.CancelledError):
                 await run
             assert await actor.wait_for_cleanup.remote()

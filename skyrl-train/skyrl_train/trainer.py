@@ -1611,7 +1611,9 @@ class RayPPOTrainer:
     async def _evaluation_session(self):
         try:
             with Timer("eval_drain", self.all_timings if self.global_step else None):
-                await self.context.pause_and_drain()
+                self._eval_drain_discarded_groups = await self.context.pause_and_drain(
+                    self.cfg.trainer.eval_drain_timeout_seconds
+                )
             async with evaluation_session(
                 self.eval_trajectory_runner, self.cfg, self.global_step, self.eval_trajectory_sink
             ) as pool:
@@ -1630,6 +1632,7 @@ class RayPPOTrainer:
                     for callback in self.callback_handler.callbacks
                 ]
             eval_metrics = native.result()
+            eval_metrics["eval/drain_discarded_groups"] = self._eval_drain_discarded_groups
             for task in additional:
                 eval_metrics.update(task.result())
         self._control = await self.callback_handler.call_event_async(

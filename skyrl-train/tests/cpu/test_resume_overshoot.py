@@ -165,7 +165,7 @@ def test_train_end_runs_and_logs_the_requested_evaluation(
     assert [(row.step, row.values["eval/accuracy"]) for row in payloads if row.kind == "eval"] == expected_evaluations
     assert [row.values for row in payloads if row.kind == "train"] == [{"reward/raw_reward": 0.625}]
     assert tracked == [
-        ({"eval/accuracy": score}, {"step": step, "commit": commit})
+        ({"eval/accuracy": score, "eval/drain_discarded_groups": 0}, {"step": step, "commit": commit})
         for (step, score), commit in zip(expected_evaluations, expected_commits, strict=True)
     ]
     evaluation_values = delivered_telemetry.select("training_metric_value", payload_kind="eval", metric="eval/accuracy")

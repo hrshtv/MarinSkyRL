@@ -423,6 +423,7 @@ class RolloutBuffer:
         self._policy = async_rollout_policy(config)
         self._policy_step = 0
         self._leases: dict[str, RolloutLease] = {}
+        self._cancelled_leases: set[str] = set()
         # Committed groups not yet assigned to a batch; only groups restored before the first publish wait here.
         self._ready: list[ReadyRollout] = []
         self._admitted: collections.defaultdict[int, list[ReadyRollout]] = collections.defaultdict(list)
@@ -455,6 +456,9 @@ class RolloutBuffer:
     async def commit(self, lease_id: str, prompt: dict, verdict: RolloutVerdict, payload: PayloadReference) -> None:
         """Record a written group and release its lease."""
         async with self._changed:
+            if lease_id in self._cancelled_leases:
+                self._cancelled_leases.remove(lease_id)
+                return
             lease = self._leases.pop(lease_id)
             self._generated.append((lease.policy_step, verdict.work))
             self._ready.append(
@@ -464,6 +468,16 @@ class RolloutBuffer:
             )
             self._select()
             self._changed.notify_all()
+
+    async def cancel_leases(self, lease_ids: list[str]) -> list[str]:
+        """Revoke unfinished groups, preserving any that committed before cancellation."""
+        async with self._changed:
+            cancelled = [lease_id for lease_id in lease_ids if lease_id in self._leases]
+            for lease_id in cancelled:
+                del self._leases[lease_id]
+            self._cancelled_leases.update(cancelled)
+            self._changed.notify_all()
+            return cancelled
 
     async def publish(self, policy_step: int) -> None:
         """Acknowledge the taken batch, if any, and lease at the newly synced policy step."""

@@ -71,6 +71,7 @@ class RolloutWorkerResources:
     executor_threads: int
     progress_timeout_seconds: float
     start_interval_seconds: float
+    cancellation_timeout_seconds: float
 
     @classmethod
     def from_config(cls, config: DictConfig) -> RolloutWorkerResources:
@@ -81,6 +82,7 @@ class RolloutWorkerResources:
             executor_threads=int(workers.executor_threads),
             progress_timeout_seconds=float(workers.progress_timeout_seconds),
             start_interval_seconds=float(workers.start_interval_seconds),
+            cancellation_timeout_seconds=float(workers.cancellation_timeout_seconds),
         )
 
 
@@ -326,6 +328,13 @@ class RolloutWorkerPool:
                 return output
         except asyncio.CancelledError:
             ray.cancel(request, force=False, recursive=True)
+            # Local cancellation alone does not mean the remote runner stopped using
+            # inference. Acknowledge its cleanup before a caller switches weights.
+            try:
+                async with asyncio.timeout(self._resources.cancellation_timeout_seconds):
+                    await asyncio.shield(result)
+            except ray.exceptions.TaskCancelledError:
+                pass
             raise
         finally:
             # An abandoned request's result would otherwise surface later as an unretrieved error.
