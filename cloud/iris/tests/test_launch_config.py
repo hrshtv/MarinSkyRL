@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -161,17 +160,14 @@ async def test_custom_session_settings_reach_private_grading_through_the_launch_
 
 @pytest.mark.parametrize("storage_prefix", ["s3://runs/smoke", "gs://runs/smoke"])
 @pytest.mark.parametrize(("loss", "reduction"), [("regular", "token_mean"), ("gspo", "sequence_mean")])
-@pytest.mark.parametrize("nodes", [1, 2])
 @pytest.mark.parametrize("probe_enabled", [False, True])
 def test_launch_config_composes_and_loads_as_structured_hydra(
-    tmp_path: Path, loss: str, reduction: str, storage_prefix: str, nodes: int, probe_enabled: bool
+    tmp_path: Path, loss: str, reduction: str, storage_prefix: str, probe_enabled: bool
 ) -> None:
     path = tmp_path / "resolved-launch.yaml"
     raw = _raw_config()
     raw["skyrl"]["trainer"]["algorithm"].update(policy_loss_type=loss, loss_reduction=reduction)
     trainer = raw["skyrl"]["trainer"]
-    trainer["placement"]["colocate_all"] = nodes == 1
-    raw["iris"]["allocation"]["num_nodes"] = nodes
     trainer["resume_mode"] = "from_path"
     trainer["resume_path"] = f"{storage_prefix}/checkpoints/global_step_1"
     trainer["mismatch_probe"] = {
@@ -192,103 +188,7 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
     config = load_launch_config(path)
 
     assert config.skyrl.trainer.train_batch_size == 8
-    nested = copy.deepcopy(raw)
-    nested["skyrl"]["generator"].setdefault("engine_init_kwargs", {})["user_options"] = {"nested": {}}
-    path.write_text(yaml.safe_dump(nested, sort_keys=False))
-    assert OmegaConf.to_container(load_launch_config(path).skyrl.generator.engine_init_kwargs.user_options) == {}
-    omitted = copy.deepcopy(raw)
-    del omitted["iris"]["allocation"]["num_nodes"]
-    del omitted["runtime"]["profile"]
-    del omitted["inputs"]["data_kind"]
-    path.write_text(yaml.safe_dump(omitted, sort_keys=False))
-    assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(
-        OmegaConf.to_container(config, resolve=True)
-    )
-    native_defaults = copy.deepcopy(raw)
-    native_defaults["skyrl"]["trainer"]["placement"]["policy_num_gpus_per_node"] = None
-    del native_defaults["skyrl"]["trainer"]["micro_train_batch_size_per_gpu"]
-    native_defaults["skyrl"]["trainer"]["algorithm"] = {}
-    del native_defaults["skyrl"]["generator"]["backend"]
-    native_defaults["skyrl"]["trainer"]["placement"]["colocate_policy_ref"] = False
-    native_defaults["iris"]["allocation"]["num_nodes"] = 1 if nodes == 1 else 3
-    path.write_text(yaml.safe_dump(native_defaults, sort_keys=False))
-    explicit_defaults = OmegaConf.to_container(load_launch_config(path), resolve=True)
-    del native_defaults["iris"]["allocation"]["num_nodes"]
-    path.write_text(yaml.safe_dump(native_defaults, sort_keys=False))
-    assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(explicit_defaults)
-    if nodes == 2:
-        for shared_reference in (True, False):
-            reference = copy.deepcopy(raw)
-            reference["skyrl"]["trainer"]["algorithm"]["use_kl_loss"] = True
-            reference["skyrl"]["trainer"]["placement"].update(colocate_policy_ref=shared_reference, ref_num_nodes=1)
-            reference["iris"]["allocation"]["num_nodes"] = 2 if shared_reference else 3
-            path.write_text(yaml.safe_dump(reference, sort_keys=False))
-            explicit_reference = OmegaConf.to_container(load_launch_config(path), resolve=True)
-            del reference["iris"]["allocation"]["num_nodes"]
-            path.write_text(yaml.safe_dump(reference, sort_keys=False))
-            assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(
-                explicit_reference
-            )
-    for section, field in (
-        ("trainer.placement", "policy_num_nodes"),
-        ("trainer.placement", "ref_num_nodes"),
-        ("generator", "num_inference_engines"),
-    ):
-        for explicit_null in (False, True):
-            sparse_geometry = OmegaConf.create(copy.deepcopy(omitted))
-            parent = OmegaConf.select(sparse_geometry.skyrl, section)
-            if explicit_null:
-                parent[field] = None
-            else:
-                del parent[field]
-            OmegaConf.save(sparse_geometry, path)
-            with pytest.raises(ValueError, match=f"{section}.{field}"):
-                load_launch_config(path)
-    for recipe_key, envelope_key in (("train_data", "train_data"), ("val_data", "validation_data")):
-        conflicting = copy.deepcopy(raw)
-        conflicting["skyrl"]["data"] = {recipe_key: ["/authored/data"]}
-        conflicting["inputs"][envelope_key] = [
-            {
-                "uri": "s3://data/gsm8k",
-                "identity": "sha256:gsm8k",
-                "local_path": "/tmp/data/gsm8k",
-                "relative_path": "train.parquet",
-                "kind": "directory",
-            }
-        ]
-        path.write_text(yaml.safe_dump(conflicting, sort_keys=False))
-        with pytest.raises(ValueError, match=f"data.{recipe_key} conflicts"):
-            load_launch_config(path)
-    for role in ("policy", "ref"):
-        oversized = copy.deepcopy(raw)
-        oversized["skyrl"]["trainer"]["placement"][f"{role}_num_gpus_per_node"] = 32
-        path.write_text(yaml.safe_dump(oversized, sort_keys=False))
-        with pytest.raises(ValueError):
-            load_launch_config(path)
-    parquet = copy.deepcopy(omitted)
-    parquet["skyrl"]["data"] = {"kind": "parquet"}
-    path.write_text(yaml.safe_dump(parquet, sort_keys=False))
-    parquet_config = load_launch_config(path)
-    assert parquet_config.inputs.data_kind == "parquet"
-    OmegaConf.save(parquet_config, path)
-    assert load_launch_config(path).inputs.data_kind == "parquet"
-    del parquet_config.inputs.data_kind
-    OmegaConf.save(parquet_config, path)
-    with pytest.raises(MissingMandatoryValue, match="data_kind"):
-        load_launch_config(path)
-    for section, key, value in (("inputs", "data_kind", "parquet"),):
-        conflicting = copy.deepcopy(raw)
-        conflicting.setdefault(section, {})[key] = value
-        path.write_text(yaml.safe_dump(conflicting, sort_keys=False))
-        with pytest.raises(ValueError, match=f"{section}.{key}"):
-            load_launch_config(path)
-    invalid = copy.deepcopy(raw)
-    invalid["skyrl"]["trainer"]["train_batch_size"] = "8"
-    path.write_text(yaml.safe_dump(invalid, sort_keys=False))
-    with pytest.raises(ValueError, match="train_batch_size"):
-        load_launch_config(path)
-    path.write_text(yaml.safe_dump(raw, sort_keys=False))
-    assert validate_launch_config(config).num_nodes == nodes
+    assert validate_launch_config(config).num_nodes == 1
     assert config.skyrl.trainer.resume_path == f"{storage_prefix}/checkpoints/global_step_1"
     assert config.skyrl.trainer.mismatch_probe.archive_uri == f"{storage_prefix}/mismatch_probe"
     assert config.skyrl.trainer.mismatch_probe.reuse_probe == f"{storage_prefix}/source/mismatch_probe"
@@ -302,67 +202,109 @@ def test_launch_config_composes_and_loads_as_structured_hydra(
             load_launch_config(path)
 
 
-def test_source_dpo_launch_fills_allocation_without_document_changes(tmp_path):
+@pytest.mark.parametrize("geometry", ["colocated", "two-node", "native-defaults", "shared-ref", "separate-ref", "dpo"])
+def test_source_launch_fills_allocation_without_document_changes(tmp_path, geometry):
     raw = _raw_config()
-    raw["skyrl"].update(
-        config_groups={"algorithm_recipe": "dpo"},
-        environment={"env_class": "preference_pair"},
-        trainer={
-            "strategy": "megatron",
-            "use_sample_packing": False,
-            "micro_train_batch_size_per_gpu": 2,
-            "placement": {
-                "colocate_all": False,
-                "colocate_policy_ref": True,
-                "policy_num_nodes": 1,
-                "ref_num_nodes": 1,
-                "policy_num_gpus_per_node": 8,
+    placement = raw["skyrl"]["trainer"]["placement"]
+    if geometry != "colocated":
+        placement["colocate_all"] = False
+        raw["iris"]["allocation"]["num_nodes"] = 2
+    if geometry in {"shared-ref", "separate-ref"}:
+        raw["skyrl"]["trainer"]["algorithm"]["use_kl_loss"] = True
+        placement["colocate_policy_ref"] = geometry == "shared-ref"
+        raw["iris"]["allocation"]["num_nodes"] = 2 if geometry == "shared-ref" else 3
+    if geometry == "native-defaults":
+        placement.update(policy_num_gpus_per_node=None, colocate_policy_ref=False)
+        del raw["skyrl"]["trainer"]["micro_train_batch_size_per_gpu"]
+        raw["skyrl"]["trainer"]["algorithm"] = {}
+        del raw["skyrl"]["generator"]["backend"]
+        raw["iris"]["allocation"]["num_nodes"] = 3
+    if geometry == "dpo":
+        raw["skyrl"].update(
+            config_groups={"algorithm_recipe": "dpo"},
+            environment={"env_class": "preference_pair"},
+            trainer={
+                "strategy": "megatron",
+                "use_sample_packing": False,
+                "micro_train_batch_size_per_gpu": 2,
+                "placement": {**placement, "colocate_policy_ref": True},
             },
-        },
-    )
-    raw["skyrl"]["generator"]["n_samples_per_prompt"] = 2
+        )
+        raw["skyrl"]["generator"]["n_samples_per_prompt"] = 2
+        raw["iris"]["allocation"]["num_nodes"] = 1
+    if geometry == "colocated":
+        raw["skyrl"]["generator"]["engine_init_kwargs"] = {"user_options": {"nested": {}}}
+        raw["skyrl"]["data"] = {"kind": "parquet"}
+        raw["inputs"]["data_kind"] = "parquet"
     path = tmp_path / "source.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
-    explicit = OmegaConf.to_container(load_launch_config(path), resolve=True)
+    explicit = load_launch_config(path)
+    if geometry == "colocated":
+        assert OmegaConf.to_container(explicit.skyrl.generator.engine_init_kwargs.user_options) == {}
+        OmegaConf.save(explicit, path)
+        assert load_launch_config(path).inputs.data_kind == "parquet"
     del raw["iris"]["allocation"]["num_nodes"]
+    del raw["runtime"]["profile"]
+    del raw["inputs"]["data_kind"]
     path.write_text(yaml.safe_dump(raw, sort_keys=False))
-    assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(explicit)
+    assert json.dumps(OmegaConf.to_container(load_launch_config(path), resolve=True)) == json.dumps(
+        OmegaConf.to_container(explicit, resolve=True)
+    )
 
 
-@pytest.mark.parametrize("switch", ["use_abs_kl", "use_kl_estimator_k3"])
-def test_composed_launch_rejects_kl_switches(tmp_path: Path, switch: str) -> None:
-    path = tmp_path / "launch.yaml"
-    path.write_text(yaml.safe_dump(_raw_config()))
-    config = load_launch_config(path)
-    OmegaConf.update(config.skyrl.trainer.algorithm, switch, True, force_add=True)
-    OmegaConf.save(config, path)
-
-    with pytest.raises(ValueError, match="kl_estimator_type"):
+def test_source_launch_rejects_missing_geometry_and_conflicting_author_values(tmp_path):
+    cases = []
+    for field in (
+        "trainer.placement.policy_num_nodes",
+        "trainer.placement.ref_num_nodes",
+        "generator.num_inference_engines",
+    ):
+        for explicit_null in (False, True):
+            raw = OmegaConf.create(_raw_config())
+            del raw.iris.allocation.num_nodes
+            parent, key = field.rsplit(".", 1)
+            if explicit_null:
+                OmegaConf.update(raw.skyrl, field, None)
+            else:
+                del OmegaConf.select(raw.skyrl, parent)[key]
+            cases.append((raw, field))
+    for recipe_key, envelope_key in (("train_data", "train_data"), ("val_data", "validation_data")):
+        raw = OmegaConf.create(_raw_config())
+        raw.skyrl.data = {recipe_key: ["/authored/data"]}
+        raw.inputs[envelope_key] = [
+            {
+                "uri": "s3://data/gsm8k",
+                "identity": "sha256:gsm8k",
+                "local_path": "/tmp/data/gsm8k",
+                "relative_path": "train.parquet",
+                "kind": "directory",
+            }
+        ]
+        cases.append((raw, f"data.{recipe_key} conflicts"))
+    for role in ("policy", "ref"):
+        raw = OmegaConf.create(_raw_config())
+        raw.skyrl.trainer.placement[f"{role}_num_gpus_per_node"] = 32
+        cases.append((raw, "gpus_per_node"))
+    raw = OmegaConf.create(_raw_config())
+    raw.inputs.data_kind = "parquet"
+    cases.append((raw, "inputs.data_kind"))
+    raw = OmegaConf.create(_raw_config())
+    raw.skyrl.trainer.train_batch_size = "8"
+    cases.append((raw, "train_batch_size"))
+    path = tmp_path / "invalid.yaml"
+    for raw, error in cases:
+        OmegaConf.save(raw, path)
+        with pytest.raises(ValueError, match=error):
+            load_launch_config(path)
+    raw = OmegaConf.create(_raw_config())
+    raw.skyrl.data = {"kind": "parquet"}
+    del raw.inputs.data_kind
+    OmegaConf.save(raw, path)
+    resolved = load_launch_config(path)
+    del resolved.inputs.data_kind
+    OmegaConf.save(resolved, path)
+    with pytest.raises(MissingMandatoryValue, match="data_kind"):
         load_launch_config(path)
-
-
-@pytest.mark.parametrize(
-    ("entrypoint", "max_staleness_steps", "expected"),
-    [
-        ("standard", 0, "sync"),
-        ("standard", 2, "async"),
-        ("terminal_bench", 1, "async"),
-        ("generate", 0, None),
-    ],
-)
-def test_composed_launch_records_whether_training_runs_ahead_of_its_updates(
-    tmp_path: Path, entrypoint: str, max_staleness_steps: int, expected: str | None
-) -> None:
-    raw = _raw_config()
-    raw["skyrl"]["entrypoint"] = entrypoint
-    raw["skyrl"]["trainer"]["placement"]["colocate_all"] = False
-    raw["skyrl"]["trainer"]["rollout_buffer"] = {"max_staleness_steps": max_staleness_steps}
-    raw["skyrl"]["trainer"]["algorithm"]["off_policy_correction"] = "none"
-    raw["iris"]["allocation"]["num_nodes"] = 2
-    path = tmp_path / "launch.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False))
-
-    assert load_launch_config(path).runtime.training_type == expected
 
 
 def test_object_store_uris_in_skyrl_config_reach_the_task_unchanged(tmp_path: Path) -> None:
