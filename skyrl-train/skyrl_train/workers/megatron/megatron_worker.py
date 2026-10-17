@@ -457,7 +457,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if for_training and str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() == "muonh":
             ddp_config = dict(ddp_config)
             if ddp_config.get("use_distributed_optimizer", False):
-                raise ValueError("Hero MuonH needs unsharded Megatron DDP gradient buffers")
+                raise ValueError("Grug MuonH needs unsharded Megatron DDP gradient buffers")
             ddp_config["use_distributed_optimizer"] = False
             ddp_config["overlap_param_gather"] = False
 
@@ -606,6 +606,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 if len(micro_buffer) == micro_batches_per_mini_batch:
                     if experience.ftpo is not None:
                         active = torch.stack([micro.loss_mask.sum() for micro in micro_buffer]).sum()
+                        for micro in micro_buffer:
+                            if micro.ftpo.weights is not None:
+                                active = active + micro.ftpo.weights.sum()
                         torch.distributed.all_reduce(
                             active, group=mpu.get_data_parallel_group(with_context_parallel=False)
                         )
@@ -827,7 +830,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
     def grug_optimizer_route_snapshot(self):
         """Return this rank and the optimizer route for each named parameter."""
         if str(self.cfg.trainer.policy.optimizer_config.optimizer).lower() != "muonh":
-            raise ValueError("Optimizer route snapshot requires Hero MuonH")
+            raise ValueError("Optimizer route snapshot requires Grug MuonH")
         names = {id(parameter): name for chunk in self.actor_module for name, parameter in chunk.named_parameters()}
         optimizers = (
             self.optimizer.chained_optimizers if isinstance(self.optimizer, ChainedOptimizer) else [self.optimizer]

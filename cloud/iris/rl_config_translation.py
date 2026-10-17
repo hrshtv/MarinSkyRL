@@ -34,7 +34,16 @@ from marinskyrl.rollout_grading import validate_nemotron_ultra_grading
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
 RL_CONFIG_TASK_DIR = "/tmp/marin-rl-configs"
 RL_CONFIG_PAYLOAD_ENV = "MARIN_RL_CONFIG_B64"
-TRAINER_NON_PATH_KEYS = frozenset({"policy.model.path", "callbacks.metric_groups", "callbacks.additional_evaluations"})
+RESOLVED_HARBOR_CONFIG_KEY = "terminal_bench_config"
+TRAINER_NON_PATH_KEYS = frozenset(
+    {
+        "policy.model.path",
+        "callbacks.metric_groups",
+        "callbacks.additional_evaluations",
+        # Harbor resolves task paths against the pinned dataset repository, not the launcher installation.
+        "callbacks.cohorts.job.tasks.path",
+    }
+)
 
 
 class RLEntrypoint(StrEnum):
@@ -524,6 +533,10 @@ def parse_rl_config(
     raw = OmegaConf.to_container(load_rl_recipe(str(path)), resolve=False) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: RL config must contain a mapping at the document root")
+    if RESOLVED_HARBOR_CONFIG_KEY in raw:
+        raise ValueError(
+            f"{path}: {RESOLVED_HARBOR_CONFIG_KEY} is a resolved-config key; use terminal_bench in source recipes"
+        )
 
     config_groups = raw.get("config_groups", {})
     if "algorithm_recipe" in config_groups:
@@ -806,11 +819,11 @@ def _skyrl_config_sections(
         if parsed.raw.get(section):
             sections[section] = copy.deepcopy(parsed.raw[section])
     if terminal_bench is not None:
-        sections["terminal_bench_config"] = terminal_bench
+        sections[RESOLVED_HARBOR_CONFIG_KEY] = terminal_bench
     return sections
 
 
-_OPEN_CONFIG_ROOTS = frozenset({"teachers", "teacher_routing", "terminal_bench_config"})
+_OPEN_CONFIG_ROOTS = frozenset({"teachers", "teacher_routing", RESOLVED_HARBOR_CONFIG_KEY})
 _FTPO_CONFIG_PATHS = frozenset(f"trainer.algorithm.ftpo.{item.name}" for item in fields(FTPOConfig))
 
 
