@@ -332,10 +332,11 @@ class Ftpo(Section):
     rejected_balance_strength: int | float = unset_field()
     chosen_balance_strength: int | float = unset_field()
     early_stopping_chosen_win: int | float | None = unset_field()
-    boundary: Literal["tail_loop", "repeated_tool_opener", "verified_closure", "verified_closure_and_continuation"] = (
-        unset_field()
-    )
+    boundary: Literal[
+        "tail_loop", "repeated_tool_opener", "verified_closure", "verified_closure_and_continuation", "mixed"
+    ] = unset_field()
     repair_sft_weight: int | float | None = unset_field()
+    auxiliary_weight: int | float | None = unset_field()
 
 
 class Dpo(Section):
@@ -434,7 +435,7 @@ class Algorithm(Section):
         "importance_sampling",
     ] = field("regular")
     ftpo: Ftpo = Field(default_factory=Ftpo)
-    "FTPOConfig owns the defaults; set policy_loss_type=ftpo to activate."
+    "FTPOConfig owns the defaults. policy_loss_type=ftpo selects standalone\nsupervision; ftpo.auxiliary_weight adds it to a task-reward policy loss."
     dpo: Dpo = Field(default_factory=Dpo)
     "DPO pairing parameters; set policy_loss_type=dpo (and loss_reduction=pair_mean,\nenvironment.env_class=preference_pair) to activate."
     loss_reduction: Literal[
@@ -822,6 +823,8 @@ class Environment(Section):
     task_sessions: OpenMap = field(
         {
             "max_verifier_workers": 32,
+            "remote_judge": None,
+            "daytona": None,
             "session": {
                 "max_turns": "${generator.max_turns}",
                 "model_turn_timeout": None,
@@ -831,6 +834,7 @@ class Environment(Section):
                 "attempt_timeout": None,
                 "verifier_timeout": None,
                 "cleanup_timeout": "${trajectory_runner.cleanup_timeout}",
+                "max_total_tokens": None,
             },
             "lcb": {
                 "machine": {

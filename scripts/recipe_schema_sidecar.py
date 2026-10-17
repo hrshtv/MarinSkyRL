@@ -217,10 +217,11 @@ UNDECLARED = {
     "generator.speculative_decoding.training.max_validation_agreement_decrease": ("int | float", Ellipsis),
     "generator.speculative_decoding.training.reserved_gpu_memory_gib": ("int | float", Ellipsis),
     "trainer.algorithm.ftpo.boundary": (
-        'Literal["tail_loop", "repeated_tool_opener", "verified_closure", "verified_closure_and_continuation"]',
+        'Literal["tail_loop", "repeated_tool_opener", "verified_closure", "verified_closure_and_continuation", "mixed"]',
         Ellipsis,
     ),
     "trainer.algorithm.ftpo.repair_sft_weight": ("int | float | None", Ellipsis),
+    "trainer.algorithm.ftpo.auxiliary_weight": ("int | float | None", Ellipsis),
 }
 
 NAMES = {
