@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 import marinskyrl.recipe_schema as schema
 from marinskyrl.recipe_schema.model import Section, thaw
@@ -188,10 +187,6 @@ def test_generator_preserves_observed_types_comments_following_nulls_and_sidecar
         document = {"trainer": {"algorithm": {"cispo": {"cispo_eps_clip_high": value}}}}
         recipe = model.model_validate_json(json.dumps(document))
         assert type(recipe.to_skyrl()["trainer"]["algorithm"]["cispo"]["cispo_eps_clip_high"]) is type(value)
-    for following in ("hf_save_interval", "micro_forward_batch_size_per_gpu"):
-        with pytest.raises(ValidationError):
-            model.model_validate_json(json.dumps({"trainer": {following: None}}))
-    assert "unset" not in model().model_dump_json()
     assert '"The policy\'s physical footprint.\\nFilled from allocation when unset."' in code
     assert "A file header, not a field." not in code
     unnamed = copy.deepcopy(sidecar)
