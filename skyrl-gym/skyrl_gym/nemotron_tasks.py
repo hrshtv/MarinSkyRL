@@ -96,6 +96,13 @@ class LeanAttempt:
     correction: str | None
 
 
+def chat_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    """Nest a Responses API tool, the form Nemotron Ultra requests carry, as chat serving takes it."""
+    if tool.get("type") != "function":
+        raise ValueError(f"Unsupported Nemotron Ultra tool type: {tool.get('type')!r}")
+    return {"type": "function", "function": {key: value for key, value in tool.items() if key != "type"}}
+
+
 class NemotronTaskSession:
     """Keep row-specific task state and execute tools through the supplied Shellbox machine."""
 
@@ -144,6 +151,8 @@ class NemotronTaskSession:
         if self.python is not None:
             await self.python.start()
         options = {key: value for key, value in self.request.items() if key != "input"}
+        if "tools" in options:
+            options["tools"] = [chat_tool(tool) for tool in options["tools"]]
         start = session_start(self.task, shell_tool=None)
         return SessionStart(start.messages, {**start.options, **options})
 

@@ -334,6 +334,24 @@ async def test_per_agent_pivot_reward_rejects_components_the_agent_lacks(nemotro
         await nemotron_session(SWE_PIVOT_AGENT, SWE_PIVOT_RECORD, {"pivot_reward": pivot_reward})
 
 
+@pytest.mark.asyncio
+async def test_request_tools_reach_the_model_nested_as_chat_tools(nemotron_session):
+    tool = {"type": "function", "name": "bash", "description": "Run.", "parameters": {"type": "object"}, "strict": True}
+    session = await nemotron_session(
+        SWE_PIVOT_AGENT, SWE_PIVOT_RECORD, request={"tools": [tool], "parallel_tool_calls": False}
+    )
+
+    start = await session.prepare()
+
+    assert start.options["tools"] == [
+        {
+            "type": "function",
+            "function": {"name": "bash", "description": "Run.", "parameters": {"type": "object"}, "strict": True},
+        }
+    ]
+    assert start.options["parallel_tool_calls"] is False
+
+
 def test_tool_call_reward_accepts_any_text_when_a_message_is_expected():
     expected = {"type": "message", "content": "the reference text is intentionally not compared"}
 
