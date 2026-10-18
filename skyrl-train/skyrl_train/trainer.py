@@ -1480,12 +1480,30 @@ class RayPPOTrainer:
 
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
 
+        # avg_raw_reward is the optimization reward; under reward shaping it is no longer the
+        # task success rate, so the unshaped 0/1 outcome is logged beside it.
+        mean_outcome_reward = float(np.mean(get_outcome_rewards(trajectory_batch_for_metrics)))
         reward_metrics = {
             f"reward/avg_pass_at_{n_samples_per_prompt}": pass_at_n,
             "reward/avg_raw_reward": mean_reward,
+            "reward/avg_outcome_reward": mean_outcome_reward,
         }
+        token_shaping = trajectory_batch_for_metrics.get("token_level_shaping")
+        if token_shaping:
+            # Share of trajectories / response tokens carrying a per-token shaping term
+            # (turn penalties, PBS), so the channel's reach is visible per step.
+            shaped_tokens = sum(sum(1 for value in row if value) for row in token_shaping)
+            reward_metrics["reward/token_shaping_traj_fraction"] = float(
+                np.mean([any(row) for row in token_shaping])
+            )
+            reward_metrics["reward/token_shaping_token_fraction"] = shaped_tokens / max(
+                1, sum(len(row) for row in token_shaping)
+            )
         self.all_metrics.update(reward_metrics)
-        logger.info(f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, reward/avg_raw_reward: {mean_reward}")
+        logger.info(
+            f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, reward/avg_raw_reward: {mean_reward}, "
+            f"reward/avg_outcome_reward: {mean_outcome_reward}"
+        )
 
         # Opt-in diagnostics. Runs before the per-token reward reassignment below so the
         # dump can record response-level rewards. Never allowed to fail the step.

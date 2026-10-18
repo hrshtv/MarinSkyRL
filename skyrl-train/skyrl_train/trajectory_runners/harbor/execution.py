@@ -12,6 +12,7 @@ from skyrl_train.utils.algorithm_registry import rollout_logprobs_enabled
 from skyrl_train.trajectory_runners.base import TrajectoryBatch, TrajectoryRequestBatch
 from skyrl_train.trajectory_runners.trajectory_retention import TrajectorySink
 from skyrl_train.trajectory_runners.context_distillation import ContextDistillationConfig
+from skyrl_train.trajectory_runners.trajectory_processing import ServedContext
 
 
 class HarborRunner(Protocol):
@@ -117,6 +118,7 @@ class HarborRunnerSpec:
             rollout_logprobs_required=rollout_logprobs_enabled(algorithm),
             tito_full=algorithm.get("tito_full", None),
             tis_splice=bool(algorithm.tis_splice),
+            served_context=ServedContext(algorithm.served_context),
             tis_lcs_alert_threshold=float(algorithm.tis_lcs_alert_threshold),
             context_distillation=ContextDistillationConfig.from_algorithm_config(algorithm),
         )

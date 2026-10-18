@@ -148,7 +148,6 @@ class SkyRLGymTrajectoryRunner(TrajectoryRunner):
         else:
             self.env_executor = None
 
-        self._validate_cfg(trajectory_runner_cfg)
         self.collector.validate()
 
         # base_conversation is used when `use_conversation_multi_turn==True and custom_chat_template==None` to
@@ -179,12 +178,6 @@ class SkyRLGymTrajectoryRunner(TrajectoryRunner):
         # Optional callback to get trainer's current global_step (for accurate staleness tracking).
         # Set by the fully-async trainer before generation workers start.
         self.global_step_fn: Optional[Callable[[], int]] = None
-
-    def _validate_cfg(self, trajectory_runner_cfg: DictConfig):
-        if len(trajectory_runner_cfg.chat_template_kwargs) and trajectory_runner_cfg.batched:
-            raise ValueError(
-                "`chat_template_kwargs` is not compatible with `batched=True` since the chat templating is handled by the inference engine"
-            )
 
     async def _run_in_executor_if_available(self, func, *args, **kwargs):
         if (executor := self.env_executor) is not None:
@@ -551,8 +544,19 @@ class SkyRLGymTrajectoryRunner(TrajectoryRunner):
             init_prompts.append(init_prompt)
             envs.append(env)
 
-        # For single-turn generation, we can use text-in-token-out, since we do not need to re-tokenize.
-        engine_input = InferenceEngineInput(prompts=init_prompts, sampling_params=sampling_params)
+        # The prompt is rendered once, here, so `chat_template_kwargs` (e.g. the template's reasoning
+        # mode) apply and the engine generates from exactly the token ids the trainer will score.
+        # init_prompts is a BATCH (list of conversations), so this returns per-sample rows. On
+        # transformers 5.x a bare tokenize=True yields a BatchEncoding (mapping) rather than the list
+        # rows; normalize_token_ids is NOT used, its singleton-unwrap would corrupt a one-element batch.
+        prompt_encodings = self.tokenizer.apply_chat_template(
+            init_prompts,
+            add_generation_prompt=True,
+            tokenize=True,
+            **self.trajectory_runner_cfg.chat_template_kwargs,
+        )
+        prompt_token_ids = prompt_encodings["input_ids"] if hasattr(prompt_encodings, "keys") else prompt_encodings
+        engine_input = InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
         engine_output = await self.model_client.generate(engine_input)
         outputs = engine_output["responses"]
         responses = engine_output["response_ids"]
@@ -615,18 +619,6 @@ class SkyRLGymTrajectoryRunner(TrajectoryRunner):
             # Close the environment
             await self._run_in_executor_if_available(env.close)
 
-        # init_prompts is a BATCH (list of conversations), so this returns per-sample
-        # rows (list[list[int]]). On transformers 5.x a bare tokenize=True yields a
-        # BatchEncoding (mapping) rather than the list rows; extract input_ids in that
-        # case. normalize_token_ids is NOT used here — its singleton-unwrap would
-        # corrupt a one-element batch — and we key off the mapping interface (not
-        # return_dict) so a tokenizer/mock that already returns list rows is unchanged.
-        prompt_encodings = self.tokenizer.apply_chat_template(
-            init_prompts,
-            add_generation_prompt=True,
-            tokenize=True,
-        )
-        prompt_token_ids = prompt_encodings["input_ids"] if hasattr(prompt_encodings, "keys") else prompt_encodings
         rollout_metrics = get_rollout_metrics(
             responses,
             rewards,

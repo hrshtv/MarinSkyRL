@@ -129,6 +129,33 @@ def map_text_name_to_vlm_engine(name: str) -> str:
     return name
 
 
+def drop_vision_no_split_modules(text_model) -> None:
+    """Remove vision classes from a text-only model's ``_no_split_modules``.
+
+    ``get_fsdp_wrap_policy`` resolves every name in ``_no_split_modules`` against the
+    live module and raises "Could not find the transformer layer class to wrap in the
+    model" when one is absent. Both Qwen3.5 text towers inherit
+    ``["Qwen3_5DecoderLayer", "Qwen3_5VisionBlock"]`` from ``Qwen3_5PreTrainedModel``,
+    and the vision block does not exist once the policy is text-only.
+
+    This is needed on two different paths, so it lives here rather than inline:
+      * after :func:`unwrap_to_text_causal_lm` strips a ``*ForConditionalGeneration``
+        shell (the MoE checkpoints), and
+      * for the DENSE checkpoints, which never produce a shell at all --
+        ``AutoModelForCausalLM`` maps ``model_type`` ``qwen3_5`` straight to
+        ``Qwen3_5ForCausalLM`` ("VLM compatibility" in transformers' auto mapping), so
+        there is nothing to unwrap and the stale vision entry would otherwise survive.
+
+    transformers stores ``_no_split_modules`` as a per-instance *set* on the constructed
+    model (the class attribute is a list); the instance attribute is overwritten with a
+    plain list of the surviving text classes.
+    """
+    names = getattr(text_model, "_no_split_modules", None)
+    if not names:
+        return
+    text_model._no_split_modules = [name for name in names if "Vision" not in name]
+
+
 def unwrap_to_text_causal_lm(vlm_model):
     """Convert a loaded Qwen3.5/3.6 ``*ForConditionalGeneration`` shell into its
     text ``Qwen3_5MoeForCausalLM`` tower, reusing the already-loaded submodules.
@@ -177,15 +204,7 @@ def unwrap_to_text_causal_lm(vlm_model):
     # MoE topology rather than the VLM shell config.
     text_model.config = text_config
 
-    # Drop the vision class from `_no_split_modules` so the FSDP wrap auto-detect
-    # (get_fsdp_wrap_policy -> get_module_class_from_name) does not raise on a
-    # class (`Qwen3_5MoeVisionBlock`) that no longer exists in this text-only
-    # module. transformers stores `_no_split_modules` as a per-instance *set* on
-    # the constructed model (the class attribute is a list); we overwrite the
-    # instance attribute with a plain list of the surviving (text) classes.
-    nsm = getattr(text_model, "_no_split_modules", None)
-    if nsm:
-        text_model._no_split_modules = [c for c in nsm if "Vision" not in c]
+    drop_vision_no_split_modules(text_model)
 
     logger.info(
         "[qwen3_5_vlm] unwrapped %s -> %s (text tower); dropped vision + MTP head. _no_split_modules=%s",

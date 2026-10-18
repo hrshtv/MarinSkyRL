@@ -26,6 +26,8 @@ from skyrl_gym.verification import (
 
 from skyrl_train.metric_names import (
     IDENTITY_AWARE_REWARD_METRIC_PREFIX,
+    MULTI_TOOL_CALL_TRAJECTORIES_METRIC,
+    MULTI_TOOL_CALL_ZEROED_METRIC,
     TIS_ALIGNMENT_ALERT_METRIC,
     TIS_METRIC_PREFIX,
 )
@@ -82,6 +84,8 @@ from skyrl_train.trajectory_runners.trajectory_processing import (
     extract_token_ids_from_rollout_details,
     get_batch_failure_metrics,
     get_generation_prompt_ids,
+    ServedContext,
+    get_generation_prompt_ids,
     get_response_ids_and_loss_mask_from_messages,
     get_rollout_metrics,
     normalize_token_ids,
@@ -102,6 +106,7 @@ from skyrl_train.utils.reward_shaping import (
     verifier_test_collection,
 )
 from skyrl_train.utils.span_tagger import tag_response_spans
+from skyrl_train.utils.turn_penalty_shaping import compute_turn_penalty_shaping
 
 # Maximum restart attempts for orchestrator recovery
 MAX_ORCHESTRATOR_RESTART_ATTEMPTS = 3
@@ -176,7 +181,17 @@ _TASK_COMPLETE_PATTERNS = (
     re.compile(r"<task_complete>\s*true\s*</task_complete>", re.IGNORECASE),
     re.compile(r'["\']task_complete["\']\s*:\s*true', re.IGNORECASE),
     re.compile(r"mark_task_complete", re.IGNORECASE),
+    # mini-swe-agent's submit command, sent as a bash tool call.
+    re.compile(r"COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
 )
+
+
+def has_excess_tool_calls(messages, max_tool_calls_per_turn: int) -> bool:
+    """Whether any assistant message carries more than ``max_tool_calls_per_turn`` tool calls."""
+    return any(
+        isinstance(m, dict) and m.get("role") == "assistant" and len(m.get("tool_calls") or []) > max_tool_calls_per_turn
+        for m in messages or []
+    )
 
 
 def detect_termination_signals(
@@ -211,6 +226,8 @@ def detect_termination_signals(
             if isinstance(tool_calls, list):
                 tool_blob = " ".join(
                     str(tc.get("function_name") or (tc.get("function") or {}).get("name") or "")
+                    + " "
+                    + str((tc.get("function") or {}).get("arguments") or "")
                     for tc in tool_calls
                     if isinstance(tc, dict)
                 )
@@ -375,6 +392,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         tito_full: Optional[bool] = None,
         tis_splice: bool = True,
         context_distillation: Optional[ContextDistillationConfig] = None,
+        served_context: ServedContext = ServedContext.SAMPLED,
     ):
         """
         Args:
@@ -391,6 +409,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 selected objective does not already require behavior logprobs.
             context_distillation: ``trainer.algorithm.context_distillation`` — train on the
                 first user message with its guidance span removed. None means off.
+            served_context: ``trainer.algorithm.served_context`` — ``rerendered`` for an agent that
+                uses native tool calls, whose earlier turns reach later prompts through the chat template.
         """
         self.base_url = f"http://{trajectory_runner_cfg.http_endpoint_host}:{trajectory_runner_cfg.http_endpoint_port}"
         # Native controller-ingress for CLI-agent literal capture: when the runner stood up
@@ -445,6 +465,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         self._rollout_logprobs_required = rollout_logprobs_required
         self._tito_full = tito_full
         self._tis_splice = tis_splice
+        self._served_context = served_context
         self._tis_lcs_alert_threshold = tis_lcs_alert_threshold
         self._context_distillation = context_distillation or ContextDistillationConfig.disabled()
 
@@ -487,6 +508,11 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         self._pbs_gamma = float(self._reward_shaping_config.get("pbs_gamma", 1.0))
         self._pbs_max_total_shaping = float(self._reward_shaping_config.get("pbs_max_total_shaping", 0.3))
         self._pbs_potential_shape = str(self._reward_shaping_config.get("pbs_potential_shape", "linear"))
+        self._invalid_turn_penalty = float(self._reward_shaping_config.get("invalid_turn_penalty", 0.0))
+        self._repeated_turn_penalty = float(self._reward_shaping_config.get("repeated_turn_penalty", 0.0))
+        self._max_tool_calls_per_turn = int(self._reward_shaping_config.get("max_tool_calls_per_turn", 0))
+        if (self._invalid_turn_penalty or self._repeated_turn_penalty) and not self._enable_token_reward_channel:
+            raise ValueError("turn penalties need terminal_bench_config.harbor.enable_token_reward_channel=true")
 
         # Truncation penalty: penalize cap-truncated trials so they are
         # distinguishable from honest failures in the advantage signal. Default
@@ -1037,9 +1063,13 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         trial_configs: List[TrialConfig] = []
         trajectory_ids: List[TrajectoryID] = []
 
-        # Harbor expects hosted_vllm model names with exactly one '/'.
-        # Convert HuggingFace-style "org/model" to just "model" for the alias.
+        # Harbor expects a LiteLLM model name with exactly one '/', so a HuggingFace-style "org/model" becomes just
+        # "model" for the alias. The provider prefix decides which LiteLLM route serves the request, and that is not
+        # cosmetic: agents built around native OpenAI tool calls are written against `openai/`, and the
+        # MiniSweAgent every Grug eval used documents `openai/` as required and `hosted_vllm/` as wrong. Configurable
+        # via terminal_bench.harbor.litellm_provider, defaulting to the historical `hosted_vllm`.
         model_alias = self.model_name.split("/")[-1] if "/" in self.model_name else self.model_name
+        provider = self._harbor_config_builder.get_litellm_provider()
 
         for i in range(num_trials):
             prompt = input_batch["prompts"][i]
@@ -1051,7 +1081,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             trial_config = self._harbor_config_builder.build_trial_config(
                 task_path=prompt,
                 trials_dir=active_trials_dir,
-                model_name=f"hosted_vllm/{model_alias}",
+                model_name=f"{provider}/{model_alias}",
                 api_base=self._agent_api_base,
                 session_id=session_id,
                 timeout_override_sec=timeout_override,
@@ -1265,6 +1295,14 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             rollout_metrics["generate/truncation_penalty_applied"] = sum(
                 1 for o in successful_outputs if o.truncation_penalized
             )
+            if self._max_tool_calls_per_turn:
+                excess = [
+                    o for o in successful_outputs if has_excess_tool_calls(o.evidence.messages, self._max_tool_calls_per_turn)
+                ]
+                rollout_metrics[MULTI_TOOL_CALL_TRAJECTORIES_METRIC] = float(len(excess))
+                rollout_metrics[MULTI_TOOL_CALL_ZEROED_METRIC] = float(
+                    sum(1 for o in excess if (o.reward_result.unshaped_reward or 0.0) > 0.0)
+                )
             # Per-turn view of the cap: how many turns were cut at max_generate_length this
             # step, how many sampled tokens they hold, and how many of those tokens
             # generator.mask_truncated_turns removed from the loss.
@@ -1919,6 +1957,30 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             )
         )
 
+    def _initial_prompt_ids(self, result: "TrialResult", messages: List[Dict[str, Any]]) -> List[int]:
+        """Token ids of the prompt the engine served before the first turn.
+
+        A re-rendered context was served with the agent's tool schema in the prompt, which the trainer does not
+        hold, so the ids come from the first turn's served prompt with its generation prompt removed. Without
+        served ids the trajectory is declined by full-token assembly and only the prompt's length is used.
+        """
+        if self._served_context is ServedContext.SAMPLED:
+            return self._tokenize_prompt(messages)
+        served = extract_prompt_token_ids_from_rollout_details(
+            getattr(result.agent_result, "rollout_details", None)
+        )
+        if not served or not served[0]:
+            return self._tokenize_prompt(messages)
+        generation_prompt_ids = get_generation_prompt_ids(
+            self.tokenizer,
+            custom_chat_template=self.custom_chat_template_content,
+            chat_template_kwargs=self._chat_template_kwargs,
+        )
+        first_prompt = list(served[0])
+        if first_prompt[len(first_prompt) - len(generation_prompt_ids) :] != list(generation_prompt_ids):
+            return self._tokenize_prompt(messages)
+        return first_prompt[: len(first_prompt) - len(generation_prompt_ids)]
+
     def _training_context_prompt(
         self,
         rollout_prompt_ids: List[int],
@@ -2203,7 +2265,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         # Process successful trial
         # Prompt = system messages (if any) + first user message: the prompt the engine served
         # (rollout context). Its length sets the response budget below.
-        prompt_ids = self._tokenize_prompt(system_msgs + [conversation[0]])
+        prompt_ids = self._initial_prompt_ids(result, system_msgs + [conversation[0]])
         initial_prompt_length = len(prompt_ids)
         # Context distillation: the trainer's prompt is the first user message with its
         # guidance span removed; the served prompt rides along for the rollout-context forwards.
@@ -2274,6 +2336,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 rollout_logprobs_required=self._rollout_logprobs_required,
                 tito_full=self._tito_full,
                 tis_splice=self._tis_splice,
+                served_context=self._served_context,
             )
         else:
             response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
@@ -2288,6 +2351,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 rollout_logprobs_required=self._rollout_logprobs_required,
                 tito_full=self._tito_full,
                 tis_splice=self._tis_splice,
+                served_context=self._served_context,
             )
 
         # Prefer the agent's terminal reason when Harbor supplied one. The local
@@ -2322,6 +2386,14 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         reward, truncation_penalized = apply_truncation_penalty(
             reward, original_reward, turn_truncated, self._truncation_penalty
         )
+        if self._max_tool_calls_per_turn and reward != 0.0 and has_excess_tool_calls(
+            chat_history, self._max_tool_calls_per_turn
+        ):
+            logger.debug(
+                f"Trajectory {trajectory_id}: a turn carries more than {self._max_tool_calls_per_turn} tool calls, "
+                f"reward {reward:.3f} -> 0"
+            )
+            reward = 0.0
         if truncation_penalized:
             logger.debug(
                 f"Trajectory {trajectory_id}: truncation penalty applied "
@@ -2380,6 +2452,19 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 if len(pbs_vector) < len(token_level_shaping):
                     pbs_vector = pbs_vector + [0.0] * (len(token_level_shaping) - len(pbs_vector))
                 token_level_shaping = pbs_vector[: len(token_level_shaping)]
+
+            if self._invalid_turn_penalty or self._repeated_turn_penalty:
+                turn_penalties = compute_turn_penalty_shaping(
+                    response_messages,
+                    loss_mask,
+                    invalid_turn_penalty=self._invalid_turn_penalty,
+                    repeated_turn_penalty=self._repeated_turn_penalty,
+                )
+                token_level_shaping = [a + b for a, b in zip(token_level_shaping, turn_penalties.shaping, strict=True)]
+                logger.debug(
+                    f"TURN_PENALTY turns={turn_penalties.assistant_turns} invalid={turn_penalties.invalid_turns} "
+                    f"repeated={turn_penalties.repeated_turns} aligned={int(turn_penalties.aligned)}"
+                )
 
         # Truncate to maximum allowed length
         response_ids = response_ids[:max_response_tokens]

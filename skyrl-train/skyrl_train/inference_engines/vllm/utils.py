@@ -68,6 +68,19 @@ def pop_vllm_wrapper_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if tool_parser is not None:
         wrapper_kwargs["tool_parser"] = tool_parser
 
+    # Reasoning parser, the in-process equivalent of `vllm serve --reasoning-parser`. Without it a model that marks its
+    # thinking with special tokens returns the whole span as content, so an agent trained against a split
+    # reasoning_content sees a different history in RL than it did at eval. `reasoning_parser_plugin` is a path to a
+    # module that registers a parser with ReasoningParserManager on import (`--reasoning-parser-plugin`); it must be
+    # imported before the name can resolve.
+    reasoning_parser_plugin = engine_kwargs.pop("reasoning_parser_plugin", None)
+    if reasoning_parser_plugin is not None:
+        wrapper_kwargs["reasoning_parser_plugin"] = reasoning_parser_plugin
+
+    reasoning_parser = engine_kwargs.pop("reasoning_parser", None)
+    if reasoning_parser is not None:
+        wrapper_kwargs["reasoning_parser"] = reasoning_parser
+
     # Bound OpenAI-path completions at sampling_params.max_generate_length (see apply_openai_max_tokens_cap)
     cap_flag = engine_kwargs.pop("openai_max_tokens_cap", None)
     if cap_flag is not None:

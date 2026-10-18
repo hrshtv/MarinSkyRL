@@ -517,13 +517,23 @@ class HFModelWrapper(nn.Module):
             # weight-sync prefix. We re-point the already-loaded text tower +
             # lm_head into a plain ``Qwen3_5MoeForCausalLM`` (no re-download; the
             # text weights map 1:1) and drop vision/MTP.
+            # The DENSE Qwen3.5 checkpoints never reach the unwrap: transformers maps
+            # ``model_type`` ``qwen3_5`` directly to ``Qwen3_5ForCausalLM`` ("VLM
+            # compatibility" in its auto mapping), so ``from_pretrained`` already returns
+            # the text tower with the text config. There is nothing to unwrap, but the
+            # inherited ``_no_split_modules`` still names a vision block that the
+            # text-only module does not contain, which fails the FSDP wrap-policy lookup.
             from skyrl_train.models.qwen3_5_vlm import (
+                drop_vision_no_split_modules,
+                is_qwen3_5_text_tower,
                 is_qwen3_5_vlm_shell,
                 unwrap_to_text_causal_lm,
             )
 
             if is_qwen3_5_vlm_shell(self.model.config):
                 self.model = unwrap_to_text_causal_lm(self.model)
+            elif is_qwen3_5_text_tower(self.model.config):
+                drop_vision_no_split_modules(self.model)
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):

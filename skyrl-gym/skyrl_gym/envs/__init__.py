@@ -13,6 +13,16 @@ register(
 )
 
 register(
+    id="nemotron_if",
+    entry_point="skyrl_gym.envs.nemotron_if.env:NemotronIFEnv",
+)
+
+register(
+    id="nemotron_if_json",
+    entry_point="skyrl_gym.envs.nemotron_if.env:NemotronIFJsonEnv",
+)
+
+register(
     id="gsm8k",
     entry_point="skyrl_gym.envs.gsm8k.env:GSM8kEnv",
 )

@@ -21,3 +21,14 @@ aime:
   truncated_penalty: -2.0
   min_response_length: 16
   max_gen_length: 0
+
+nemotron_if:
+  # Tokenizer used to decode the answer tokens that follow the end-of-thinking token (required).
+  tokenizer_path: null
+  # Minimum tokens inside a closed thinking block for a response to be rewarded; 0 = no requirement.
+  min_thinking_tokens: 0
+
+# nemotron_if under a harness-style prompt: the answer is one JSON object and `response` is checked.
+nemotron_if_json:
+  tokenizer_path: null
+  min_thinking_tokens: 0

@@ -33,6 +33,19 @@ import ray.exceptions
 from dataclasses import dataclass, field
 from http import HTTPStatus
 
+
+_ENGINE_DEAD_MARKERS = (
+    "EngineCore encountered an issue",
+    "EngineDeadError",
+    "engine is dead",
+    "Engine core initialization failed",
+)
+
+
+def _is_engine_dead_error(error_msg: str) -> bool:
+    """True for vLLM's "the engine process is gone" errors, which never recover within a job."""
+    return any(marker in error_msg for marker in _ENGINE_DEAD_MARKERS)
+
 ABORT_GENERATION_GRACE_PERIOD_SECONDS = 5
 ABORT_FINISH_REASON = "abort"
 
@@ -557,6 +570,25 @@ class InferenceEngineClient(InferenceEngineInterface):
                     response_role = None
                     continue
 
+                # A vLLM EngineCore that has crashed (e.g. a CUDA illegal memory access)
+                # keeps its Ray actor alive but answers every request with this error
+                # for the rest of the job. Treat it like an actor death: retire the
+                # engine and move the request to a live one, so the trial gets a real
+                # completion instead of an HTTP 500 that harbor scores as reward 0.
+                if _is_engine_dead_error(error_msg):
+                    self._mark_engine_dead(engine_idx, RuntimeError(error_msg))
+                    fallback = self._pick_fallback_engine(engine_idx)
+                    if fallback is None:
+                        raise RuntimeError("All inference engines have died")
+                    logger.warning(f"Inference engine {engine_idx} is dead; retrying the request on engine {fallback}")
+                    await self._wait_for_generation_to_resume()
+                    engine_idx = fallback
+                    accum = AccumulatedResponse()
+                    base_response = None
+                    response_role = None
+                    finish_reason = ABORT_FINISH_REASON
+                    continue
+
                 # Return the error response dict instead of raising, so that
                 # the HTTP endpoint can forward it with the correct status code
                 # (e.g., 400 for context length errors). Raising RuntimeError here
@@ -577,6 +609,14 @@ class InferenceEngineClient(InferenceEngineInterface):
 
             # 1.4. Aborted without generating tokens, so partial_response is useless.
             if aborted_without_generating:
+                continue
+
+            # A request with tools cannot be continued: the server parses the completion into reasoning and tool
+            # calls, and continue_final_message resumes from message content alone, so the resumed turn would drop
+            # its reasoning and return token ids that no longer match its message. Sample the turn again.
+            if finish_reason == ABORT_FINISH_REASON and original_request_json.get("tools"):
+                accum = AccumulatedResponse()
+                response_role = None
                 continue
 
             # At this point, either some tokens were generated and/or request completed with a non-"abort" finish_reason
@@ -1141,7 +1181,11 @@ def _parse_partial_response_and_inplace_update_accum(
     choice = partial_response["choices"][0]
     finish_reason: str = choice["finish_reason"]
     stop_reason: Optional[str] = choice.get("stop_reason", None)
-    new_content: str = choice["message"]["content"]
+    # A tool-call-only completion has content=None per the OpenAI schema, and accumulating it raised
+    # TypeError on every request from an agent that uses native tool calls. Terminus-2 never hit this because it
+    # returns plain text and never sets tool_calls. tool_calls and reasoning_content are untouched here: the final
+    # response is the last base response and only content/logprobs/token_ids are overwritten.
+    new_content: str = choice["message"].get("content") or ""
 
     assert partial_response["usage"] is not None and partial_response["usage"]["completion_tokens"] is not None, (
         "partial_response['usage']['completion_tokens'] must be present"

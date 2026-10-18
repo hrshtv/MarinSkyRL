@@ -1297,7 +1297,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     ) -> None:
         rejected = self._groups_rejected_since_step
         inspected = self._groups_inspected_since_step
-        assert inspected > 0, "An admitted training batch requires at least one inspected completed group"
+        if inspected == 0:
+            # Right after a resume the first batch can consist entirely of generation groups restored from the
+            # checkpoint, which the previous process inspected and admitted: this step has no admission
+            # statistics of its own. (Seen 2026-10-08 at step 41: 32 restored admitted groups = one full batch.)
+            self._groups_rejected_since_step = 0
+            self._rejection_reasons_since_step = collections.Counter()
+            return
         reason_counts = self._rejection_reasons_since_step
         self._groups_rejected_since_step = 0
         self._rejection_reasons_since_step = collections.Counter()

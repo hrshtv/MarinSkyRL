@@ -92,6 +92,12 @@ AGENT_SCHEMA = SectionSchema(
     fields={
         # Direct fields on AgentConfig
         "name": FieldMapping("name", default=DEFAULT_HARBOR_AGENT_NAME),  # Maps to AgentConfig.name (Harbor AgentName)
+        # A dotted "module:Class" for an agent Harbor does not ship. Named agent_import_path because the flat harbor
+        # namespace already gives `import_path` to the ENVIRONMENT schema, and the launcher validates that one against
+        # its known environment classes. AgentConfig accepts name OR import_path, and
+        # Harbor has no mini-swe-agent implementation, so RL on the same agent an eval used can only be expressed this
+        # way. The module must be importable in the rollout process (PYTHONPATH via the recipe's extra_env).
+        "agent_import_path": FieldMapping("import_path"),
         # Agent-log push-back control (direct field on AgentConfig, read by Trial._upload_agent_logs).
         # DEFAULT True (preserves current behavior). Set false to SKIP the best-effort re-upload of
         # host-side agent logs BACK into the (non-mounted) sandbox after the agent phase — those pushed-back
@@ -105,6 +111,13 @@ AGENT_SCHEMA = SectionSchema(
         "max_timeout_sec": FieldMapping("max_timeout_sec"),
         # Kwargs fields (passed to agent.kwargs)
         "max_turns": FieldMapping("max_turns", field_type="kwargs", default=16),
+        # Kwargs of the MiniSweAgent used for every Grug eval. No defaults: absent means not forwarded, so the agent's
+        # own defaults apply and no config that omits them changes behaviour. They must be settable from a recipe or an
+        # RL run cannot reproduce the agent an eval measured.
+        "max_steps": FieldMapping("max_steps", field_type="kwargs"),
+        "max_format_errors": FieldMapping("max_format_errors", field_type="kwargs"),
+        "keep_reasoning_in_history": FieldMapping("keep_reasoning_in_history", field_type="kwargs"),
+        "command_timeout": FieldMapping("command_timeout", field_type="kwargs"),
         "enable_summarize": FieldMapping("enable_summarize", field_type="kwargs", default=True),
         "store_all_messages": FieldMapping("store_all_messages", field_type="kwargs", default=True),
         # Thinking/reasoning settings
@@ -331,6 +344,17 @@ REWARD_SHAPING_SCHEMA = SectionSchema(
         # -truncation_penalty (below the zero floor) so it is distinguishable
         # from an honest failure in the advantage signal.
         "truncation_penalty": FieldMapping("truncation_penalty", default=0.0),
+        # Per-turn behaviour penalties on the token reward channel (see
+        # skyrl_train.utils.turn_penalty_shaping). Magnitudes subtracted from the advantage of
+        # every token of an unparsed turn / a turn repeating the previous keystrokes.
+        # 0.0 == off. Require enable_token_reward_channel and the rloo_n_pbs estimator.
+        "invalid_turn_penalty": FieldMapping("invalid_turn_penalty", default=0.0),
+        "repeated_turn_penalty": FieldMapping("repeated_turn_penalty", default=0.0),
+        # A trajectory in which any assistant turn carries more tool calls than this gets optimization reward 0.
+        # 0 = off. The mini-swe-agent harness executes only the first call of a turn and says nothing about the
+        # rest, so under RL the extra calls were free tokens rewarded whenever the trajectory passed: their share
+        # of turns rose from 1.3 % to 8.5 % in six steps of grug0921_run7_band_rl_msa.
+        "max_tool_calls_per_turn": FieldMapping("max_tool_calls_per_turn", default=0),
     }
 )
 
@@ -515,7 +539,9 @@ class HarborConfigBuilder:
     # (so the schema validator doesn't flag them as "unknown"). PRM lives here
     # because it's consumed directly by _build_prm_turn_callback to construct
     # a turn_callback, not by the schema-based field-mapping pipeline.
-    SKYRL_EXTENSION_KEYS = frozenset({"prm"})
+    # SkyRL-only keys: read by dedicated accessors rather than mapped onto a Harbor field.
+    # litellm_provider selects the rollout's LiteLLM route (see get_litellm_provider).
+    SKYRL_EXTENSION_KEYS = frozenset({"prm", "litellm_provider"})
 
     def _validate_config(self) -> None:
         """Validate config and issue warnings for unknown/unsupported fields."""
@@ -848,6 +874,16 @@ class HarborConfigBuilder:
                 return int(value)
         return default
 
+    def get_litellm_provider(self, default: str = "hosted_vllm") -> str:
+        """The LiteLLM provider prefix for the rollout's model name.
+
+        The prefix selects the LiteLLM route, which decides how `tools` are sent and how tool calls and reasoning come
+        back. Agents built on native OpenAI tool calls need ``openai``; the historical default stays ``hosted_vllm`` so
+        no existing config changes behaviour.
+        """
+        value = self._harbor_cfg.get("litellm_provider")
+        return str(value) if value else default
+
     def get_collect_rollout_details(self, default: bool = False) -> bool:
         """
         Check if rollout details collection is enabled (for TIS in async training).
@@ -922,9 +958,7 @@ class HarborConfigBuilder:
         # kwargs win over the trainer values.
         if sampling_params:
             if sampling_params.get("temperature") is not None:
-                agent_kwargs.setdefault(
-                    "temperature", float(sampling_params["temperature"])
-                )
+                agent_kwargs.setdefault("temperature", float(sampling_params["temperature"]))
             if sampling_params.get("top_p") is not None:
                 call_kwargs = dict(agent_kwargs.get("llm_call_kwargs") or {})
                 call_kwargs.setdefault("top_p", float(sampling_params["top_p"]))
@@ -941,6 +975,15 @@ class HarborConfigBuilder:
         # Get agent name from harbor config (defaults to "terminus-2")
         # This is the Harbor AgentName value directly (e.g., "terminus-2", "oracle")
         agent_name = agent_direct_fields.pop("name", DEFAULT_HARBOR_AGENT_NAME)
+        # Harbor resolves a known agent name before it looks at import_path, so an agent loaded by import path
+        # must reach it without a name: with the default name left in, terminus-2 runs and import_path is ignored.
+        if agent_direct_fields.get("import_path"):
+            if agent_name != DEFAULT_HARBOR_AGENT_NAME:
+                raise ValueError(
+                    f"harbor config sets both name={agent_name!r} and "
+                    f"agent_import_path={agent_direct_fields['import_path']!r}; set one"
+                )
+            agent_name = None
 
         # Apply timeout override if provided (e.g., for eval runs)
         if timeout_override_sec is not None:

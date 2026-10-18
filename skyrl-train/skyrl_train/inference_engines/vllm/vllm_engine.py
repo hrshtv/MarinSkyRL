@@ -63,6 +63,33 @@ from uuid import uuid4
 import warnings
 
 
+def _load_reasoning_parser_plugin(plugin: str) -> None:
+    """Import a reasoning-parser plugin so its ``@ReasoningParserManager.register_module`` decorator runs.
+
+    Mirrors ``vllm serve --reasoning-parser-plugin``: ``plugin`` is a path to a Python file, or a dotted module path.
+    Raised rather than warned on failure — a parser that silently fails to register leaves every thinking span in the
+    content channel, which is a wrong rollout rather than a slower one.
+    """
+    import importlib.util  # noqa: PLC0415 - optional serving path, not needed for training-only engines
+    import sys  # noqa: PLC0415
+
+    if plugin.endswith(".py"):
+        # ReasoningParserManager registers the parser LAZILY, keyed by the class's ``__module__``, and re-imports that
+        # module by name on first resolution. A module executed from a file path is absent from sys.modules, so that
+        # re-import raises ModuleNotFoundError and the parser name never resolves. Insert it under the name the
+        # decorator will record, which is the file's stem.
+        module_name = os.path.splitext(os.path.basename(plugin))[0]
+        spec = importlib.util.spec_from_file_location(module_name, plugin)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load reasoning parser plugin from {plugin}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    else:
+        importlib.import_module(plugin)
+    logger.info(f"loaded reasoning parser plugin: {plugin}")
+
+
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,
     InferenceEngineInput,
@@ -1687,6 +1714,12 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # receives them as before.
         enable_auto_tools = wrapper_kwargs.pop("enable_auto_tools", False)
         tool_parser = wrapper_kwargs.pop("tool_parser", None)
+
+        # A reasoning-parser plugin registers its parser with ReasoningParserManager as an import side effect, exactly
+        # as `vllm serve --reasoning-parser-plugin` does, so it must be loaded before the parser name is resolved.
+        reasoning_parser_plugin = wrapper_kwargs.pop("reasoning_parser_plugin", None)
+        if reasoning_parser_plugin is not None:
+            _load_reasoning_parser_plugin(reasoning_parser_plugin)
 
         openai_serving_render = None
         self.openai_serving_tokenization = None
