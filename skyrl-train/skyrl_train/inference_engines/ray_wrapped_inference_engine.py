@@ -443,8 +443,11 @@ def create_ray_wrapped_inference_engines_with_retry(
 
     RunAI's S3 streamer reports a transient object-store read failure only after
     the EngineCore processes have exited, so the parent sees an ``ActorDiedError``
-    without the underlying status code. A data-parallel pool must restart as a
-    gang: retrying one rank would leave it on a different coordinator generation.
+    without the underlying status code. A data-parallel coordinator that loses
+    its reserved rendezvous port to another listener fails the same way, whatever
+    the model source; each attempt reserves fresh ports. A data-parallel pool must
+    restart as a gang: retrying one rank would leave it on a different coordinator
+    generation.
     """
     started = time.monotonic()
 

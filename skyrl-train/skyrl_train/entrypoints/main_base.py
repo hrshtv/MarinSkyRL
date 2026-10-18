@@ -244,7 +244,7 @@ def create_ray_wrapped_inference_engines_from_config(
             )
             engine_kwargs["enforce_eager"] = False
 
-    if policy_source_uri is not None and rollout_model_path.startswith("s3://") and cfg.generator.backend == "vllm":
+    if cfg.generator.backend == "vllm":
         retry = cfg.trainer.model_load_retry
 
         def create_engines(remaining_timeout_seconds: float):

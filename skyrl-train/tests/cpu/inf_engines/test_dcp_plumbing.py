@@ -170,7 +170,9 @@ def test_from_config_streams_object_store_policy_weights(monkeypatch):
     assert "revision" not in captured["engine_init_kwargs"]
 
 
-def test_from_config_retries_s3_engine_gang_after_actor_startup_failure(monkeypatch):
+@pytest.mark.parametrize("source_uri", ["s3://models/policy", None])
+def test_from_config_retries_engine_gang_after_actor_startup_failure(monkeypatch, source_uri):
+    # A data-parallel coordinator losing its rendezvous port kills the actor whatever the model source.
     attempts = []
 
     def fake_create(**kwargs):
@@ -181,9 +183,10 @@ def test_from_config_retries_s3_engine_gang_after_actor_startup_failure(monkeypa
 
     monkeypatch.setattr(rwie, "create_ray_wrapped_inference_engines", fake_create)
     cfg = get_default_config()
-    cfg.trainer.policy.model.path = "/tmp/model-metadata"
-    cfg.trainer.policy.model.source_uri = "s3://models/policy"
-    cfg.trainer.policy.model.source_identity = "sha256:" + "a" * 64
+    if source_uri is not None:
+        cfg.trainer.policy.model.path = "/tmp/model-metadata"
+        cfg.trainer.policy.model.source_uri = source_uri
+        cfg.trainer.policy.model.source_identity = "sha256:" + "a" * 64
     cfg.trainer.model_load_retry.max_retries = 1
     cfg.trainer.model_load_retry.backoff_base_seconds = 0.001
     cfg.trainer.model_load_retry.backoff_cap_seconds = 0.001
