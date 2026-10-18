@@ -139,11 +139,7 @@ def compute_group_diagnostics(
         )
         if loss_masks is not None:
             # generator.mask_length_stops: length-stopped samples whose loss mask was zeroed.
-            masked = sum(
-                1
-                for s, m in zip(stop_reasons, loss_masks)
-                if s == TRUNCATED_STOP_REASON and not any(m)
-            )
+            masked = sum(1 for s, m in zip(stop_reasons, loss_masks) if s == TRUNCATED_STOP_REASON and not any(m))
             metrics[f"{p}/length_stop_masked_fraction"] = masked / len(stop_reasons)
     else:
         metrics[f"{p}/truncated_fraction"] = 0.0

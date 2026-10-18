@@ -26,6 +26,8 @@ from skyrl_gym.verification import (
 
 from skyrl_train.metric_names import (
     IDENTITY_AWARE_REWARD_METRIC_PREFIX,
+    MULTI_TOOL_CALL_TRAJECTORIES_METRIC,
+    MULTI_TOOL_CALL_ZEROED_METRIC,
     TIS_ALIGNMENT_ALERT_METRIC,
     TIS_METRIC_PREFIX,
 )
@@ -180,6 +182,14 @@ _TASK_COMPLETE_PATTERNS = (
     # mini-swe-agent's submit command, sent as a bash tool call.
     re.compile(r"COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
 )
+
+
+def has_excess_tool_calls(messages, max_tool_calls_per_turn: int) -> bool:
+    """Whether any assistant message carries more than ``max_tool_calls_per_turn`` tool calls."""
+    return any(
+        isinstance(m, dict) and m.get("role") == "assistant" and len(m.get("tool_calls") or []) > max_tool_calls_per_turn
+        for m in messages or []
+    )
 
 
 def detect_termination_signals(
@@ -502,6 +512,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         # 0.0 -> no-op (byte-identical). Applied post-shaping to trials with
         # stop_reason == "length" and original_reward == 0.
         self._truncation_penalty = float(self._reward_shaping_config.get("truncation_penalty", 0.0))
+        self._max_tool_calls_per_turn = int(self._reward_shaping_config.get("max_tool_calls_per_turn", 0))
 
         # Error handling config (for RLOO-N advantage estimator)
         self._error_handling_config = self._harbor_config_builder.get_error_handling_config()
@@ -1278,6 +1289,14 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             rollout_metrics["generate/truncation_penalty_applied"] = sum(
                 1 for o in successful_outputs if o.truncation_penalized
             )
+            if self._max_tool_calls_per_turn:
+                excess = [
+                    o for o in successful_outputs if has_excess_tool_calls(o.evidence.messages, self._max_tool_calls_per_turn)
+                ]
+                rollout_metrics[MULTI_TOOL_CALL_TRAJECTORIES_METRIC] = float(len(excess))
+                rollout_metrics[MULTI_TOOL_CALL_ZEROED_METRIC] = float(
+                    sum(1 for o in excess if (o.reward_result.unshaped_reward or 0.0) > 0.0)
+                )
             # Per-turn view of the cap: how many turns were cut at max_generate_length this
             # step, how many sampled tokens they hold, and how many of those tokens
             # generator.mask_truncated_turns removed from the loss.
@@ -2359,6 +2378,14 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         reward, truncation_penalized = apply_truncation_penalty(
             reward, original_reward, turn_truncated, self._truncation_penalty
         )
+        if self._max_tool_calls_per_turn and reward != 0.0 and has_excess_tool_calls(
+            chat_history, self._max_tool_calls_per_turn
+        ):
+            logger.debug(
+                f"Trajectory {trajectory_id}: a turn carries more than {self._max_tool_calls_per_turn} tool calls, "
+                f"reward {reward:.3f} -> 0"
+            )
+            reward = 0.0
         if truncation_penalized:
             logger.debug(
                 f"Trajectory {trajectory_id}: truncation penalty applied "

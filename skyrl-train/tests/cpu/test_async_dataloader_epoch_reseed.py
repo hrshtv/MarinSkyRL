@@ -31,7 +31,9 @@ class _Tracker:
 def _loader(seed, n=40):
     g = torch.Generator()
     g.manual_seed(seed)
-    return StatefulDataLoader(_Rows(n), batch_size=1, shuffle=True, collate_fn=_Rows.collate_fn, num_workers=0, drop_last=True, generator=g)
+    return StatefulDataLoader(
+        _Rows(n), batch_size=1, shuffle=True, collate_fn=_Rows.collate_fn, num_workers=0, drop_last=True, generator=g
+    )
 
 
 async def _drain(dl):

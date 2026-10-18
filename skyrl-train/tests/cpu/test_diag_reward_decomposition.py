@@ -33,7 +33,12 @@ def test_reward_given_done_is_zero_when_nothing_declared():
 
 def test_length_stop_masked_fraction_counts_only_zeroed_length_stops():
     stops = ["length", "length", "task_complete", "complete"]
-    masks = [[0, 0, 0], [1, 1, 0], [0, 0, 0], [1, 1]]  # second length stop still trainable; the zeroed task_complete does not count
+    masks = [
+        [0, 0, 0],
+        [1, 1, 0],
+        [0, 0, 0],
+        [1, 1],
+    ]  # second length stop still trainable; the zeroed task_complete does not count
     m = _diag(stops, [False, False, True, False], loss_masks=masks)
     assert m["diag/length_stop_masked_fraction"] == 0.25
     assert "diag/length_stop_masked_fraction" not in _diag(stops, [False] * 4)

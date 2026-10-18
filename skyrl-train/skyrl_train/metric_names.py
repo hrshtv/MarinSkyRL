@@ -25,6 +25,12 @@ TIS_RERENDERED_TOKENS_METRIC = "generate/tis/rerendered_tokens"
 TIS_RERENDERED_TURN_FRACTION_METRIC = "generate/tis/rerendered_turn_fraction"
 TIS_RERENDERED_TOKEN_FRACTION_METRIC = "generate/tis/rerendered_token_fraction"
 
+# Trajectory-level reward rules applied by the harbor runner (terminal_bench_config.harbor.max_tool_calls_per_turn).
+# Counts per batch; summed across coordinators by concatenate_trajectory_batches.
+REWARD_RULE_METRIC_PREFIX = "generate/reward_rules/"
+MULTI_TOOL_CALL_TRAJECTORIES_METRIC = REWARD_RULE_METRIC_PREFIX + "multi_tool_call_trajectories"
+MULTI_TOOL_CALL_ZEROED_METRIC = REWARD_RULE_METRIC_PREFIX + "multi_tool_call_rewards_zeroed"
+
 # Context distillation (trainer.algorithm.context_distillation): per-batch counts from the
 # runner, summed across groups by concatenate_trajectory_batches.
 CONTEXT_DISTILLATION_METRIC_PREFIX = "generate/context_distillation/"

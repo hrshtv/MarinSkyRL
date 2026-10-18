@@ -344,6 +344,11 @@ REWARD_SHAPING_SCHEMA = SectionSchema(
         # -truncation_penalty (below the zero floor) so it is distinguishable
         # from an honest failure in the advantage signal.
         "truncation_penalty": FieldMapping("truncation_penalty", default=0.0),
+        # A trajectory in which any assistant turn carries more tool calls than this gets optimization reward 0.
+        # 0 = off. The mini-swe-agent harness executes only the first call of a turn and says nothing about the
+        # rest, so under RL the extra calls were free tokens rewarded whenever the trajectory passed: their share
+        # of turns rose from 1.3 % to 8.5 % in six steps of grug0921_run7_band_rl_msa.
+        "max_tool_calls_per_turn": FieldMapping("max_tool_calls_per_turn", default=0),
     }
 )
 
